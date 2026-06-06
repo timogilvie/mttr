@@ -1,0 +1,18 @@
+{
+  "planner": "gpt-5.5",
+  "coder": "gpt-5.4",
+  "reviewer": "claude-sonnet-4-6",
+  "planDepth": "deep",
+  "codeDepth": "deep",
+  "reviewMode": "static+llm",
+  "reviewRecommended": "static+llm",
+  "provenance": {
+    "source": "bootstrap",
+    "inputKind": "issue",
+    "inputPath": "features/basic-monitoring-framework-mttr/selected-task.json",
+    "inputHash": "",
+    "routedAt": "2026-06-06T20:03:44Z",
+    "routerMode": "normal"
+  },
+  "maxCostUsd": 25
+}

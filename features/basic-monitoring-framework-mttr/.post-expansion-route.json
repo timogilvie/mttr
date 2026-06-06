@@ -1,0 +1,60 @@
+{
+  "planner": "gpt-5.5",
+  "coder": "gpt-5.4",
+  "reviewer": "claude-sonnet-4-6",
+  "planDepth": "deep",
+  "codeDepth": "deep",
+  "reviewRecommended": "static+llm",
+  "expectedSuccess": 0.4,
+  "confidence": 0.41,
+  "expectedCostPlan": 1.89,
+  "expectedCostCode": 12.19,
+  "expectedCostReview": 0.92,
+  "reasoning": [
+    "Task classified as bugfix with long prompt length.",
+    "Risk score 17 from complexity, scope, and repo-surface keywords.",
+    "Coder baseline uses gpt-5.4 from heuristic eval routing.",
+    "Review mode static+llm chosen to match expected change risk.",
+    "DeepSeek models were ignored because providers.deepseek.enabled is not true."
+  ],
+  "signals": {
+    "taskType": "bugfix",
+    "promptLength": "long",
+    "complexityScore": 4,
+    "fileTypes": [
+      ".py",
+      ".md",
+      ".json"
+    ],
+    "riskScore": 17
+  },
+  "constraints": {
+    "maxCostUsd": 25
+  },
+  "routingMode": "heuristic-fallback",
+  "neighborCount": 0,
+  "neighborSimilarityRange": [
+    0,
+    0
+  ],
+  "expectedCost": 15,
+  "challengeRecommendation": {
+    "shouldChallenge": true,
+    "reason": "low-confidence",
+    "defaultModel": "gpt-5.4",
+    "challengerModel": "claude-sonnet-4-6",
+    "priority": 300
+  },
+  "maxCostUsd": 25,
+  "provenance": {
+    "source": "expanded",
+    "inputKind": "task-packet",
+    "inputPath": "/Users/timothyogilvie/Dropbox/Hokusai/mttr/../worktrees/basic-monitoring-framework-mttr/features/basic-monitoring-framework-mttr/task-packet.md",
+    "inputHash": "c7334fdb607f564ecd9f484edbb3ee54681874f654b103dcf0333fde6df56aeb",
+    "routedAt": "2026-06-06T21:33:42.874Z",
+    "routerMode": "normal"
+  },
+  "cache_hit": false,
+  "route_source": "single",
+  "packet_hash": "d7ce81f343f5c2cc2d4ceae9c99db3607dcbde63cd5fa7d56cb34c4ab555b415"
+}
