@@ -15,7 +15,8 @@ function stripMarkdownFences(text: string): string {
 async function attemptParse(
   responseText: string,
   config: Config,
-  isRetry: boolean
+  isRetry: boolean,
+  originalPrompt?: string
 ): Promise<ClassificationResult | null> {
   try {
     const cleaned = stripMarkdownFences(responseText);
@@ -29,7 +30,8 @@ async function attemptParse(
 
     console.warn('[Classify] Initial response invalid, attempting repair retry', error);
 
-    const repairPrompt = `The previous response was invalid JSON or did not match the required schema. Please return a valid JSON object matching the exact schema specified in the instructions.`;
+    const repairInstruction = `\n\nThe previous response was invalid JSON or did not match the required schema. Please return a valid JSON object matching the exact schema specified in the instructions.`;
+    const repairPrompt = (originalPrompt ?? '') + repairInstruction;
 
     try {
       const retryResponse = await callOpenRouter(
@@ -77,7 +79,7 @@ export async function run(_input: StageInput, config: Config): Promise<StageResu
       config.timeouts.llmMs
     );
 
-    const classificationResult = await attemptParse(llmResponse, config, false);
+    const classificationResult = await attemptParse(llmResponse, config, false, prompt);
 
     if (!classificationResult) {
       const fallback = createFallbackResult('LLM returned invalid JSON after retry');

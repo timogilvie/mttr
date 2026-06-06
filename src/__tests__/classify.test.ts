@@ -56,6 +56,12 @@ describe('classify stage', () => {
     expect(result.status).toBe('success');
     expect(result.stage).toBe('Classify');
     expect(result.data).toBeDefined();
+
+    const data = result.data as { summary: string; overall_severity: string; incidents: unknown[]; findings: unknown[] };
+    expect(data.summary).toBe('No actionable incidents detected.');
+    expect(data.overall_severity).toBe('NONE');
+    expect(data.incidents).toEqual([]);
+    expect(data.findings).toEqual([]);
   });
 
   it('strips markdown fences from response', async () => {
