@@ -1,0 +1,19 @@
+{
+  "planning": {
+    "model": "gpt-5.5",
+    "agent": "codex",
+    "depth": "deep"
+  },
+  "coding": {
+    "model": "gpt-5.4",
+    "agent": "codex",
+    "depth": "deep"
+  },
+  "review": {
+    "model": "claude-sonnet-4-6",
+    "agent": "claude",
+    "mode": "static+llm"
+  },
+  "resolvedAt": "2026-06-06T21:34:10Z",
+  "forceModel": null
+}

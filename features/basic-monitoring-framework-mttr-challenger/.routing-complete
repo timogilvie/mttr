@@ -1,0 +1,64 @@
+{
+  "planner": "gpt-5.5",
+  "coder": "gpt-5.4",
+  "reviewer": "claude-sonnet-4-6",
+  "planDepth": "deep",
+  "codeDepth": "deep",
+  "reviewMode": "static+llm",
+  "reviewRecommended": "static+llm",
+  "provenance": {
+    "source": "expanded",
+    "inputKind": "task-packet",
+    "inputPath": "/Users/timothyogilvie/Dropbox/Hokusai/mttr/../worktrees/basic-monitoring-framework-mttr-challenger/features/basic-monitoring-framework-mttr-challenger/task-packet.md",
+    "inputHash": "d100679bdf197eaa58dd3cd4b39dd7f432f02e7cb4a3ad25774b35b16de832c8",
+    "routedAt": "2026-06-06T21:34:10.493Z",
+    "routerMode": "normal",
+    "appliedFrom": "/Users/timothyogilvie/Dropbox/Hokusai/mttr/../worktrees/basic-monitoring-framework-mttr-challenger/features/basic-monitoring-framework-mttr-challenger/.post-expansion-route.json",
+    "appliedAt": "2026-06-06T21:34:10Z"
+  },
+  "maxCostUsd": 25,
+  "expectedSuccess": 0.37,
+  "confidence": 0.39,
+  "expectedCostPlan": 1.89,
+  "expectedCostCode": 12.19,
+  "expectedCostReview": 0.92,
+  "reasoning": [
+    "Task classified as bugfix with long prompt length.",
+    "Risk score 18 from complexity, scope, and repo-surface keywords.",
+    "Coder baseline uses gpt-5.4 from heuristic eval routing.",
+    "Review mode static+llm chosen to match expected change risk.",
+    "DeepSeek models were ignored because providers.deepseek.enabled is not true."
+  ],
+  "signals": {
+    "taskType": "bugfix",
+    "promptLength": "long",
+    "complexityScore": 6,
+    "fileTypes": [
+      ".json",
+      ".ts",
+      ".md",
+      ".js"
+    ],
+    "riskScore": 18
+  },
+  "constraints": {
+    "maxCostUsd": 25
+  },
+  "routingMode": "heuristic-fallback",
+  "neighborCount": 0,
+  "neighborSimilarityRange": [
+    0,
+    0
+  ],
+  "expectedCost": 15,
+  "challengeRecommendation": {
+    "shouldChallenge": true,
+    "reason": "low-confidence",
+    "defaultModel": "gpt-5.4",
+    "challengerModel": "claude-sonnet-4-6",
+    "priority": 300
+  },
+  "cache_hit": false,
+  "route_source": "single",
+  "packet_hash": "463babcb57e005eafebb21626dbce172a68aaf2dcdf9cae1e730ed58c2c94acf"
+}
