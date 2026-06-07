@@ -6,6 +6,7 @@ import type { ZodType } from 'zod';
  */
 export interface ToolContext {
   region: string;
+  maxAttempts: number;
   timeoutMs: number;
   maxResultChars: number;
   defaultLookbackMinutes: number;
