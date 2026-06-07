@@ -10,12 +10,31 @@ const mockConfig: Config = {
     apiKey: 'test-key',
     model: 'test-model',
     baseUrl: 'https://test.com',
+    maxRetries: 4,
+    backoffBaseMs: 1000,
+    backoffMaxMs: 30000,
+  },
+  investigate: {
+    model: 'test-investigate-model',
+    modelFallback: 'test-fallback-model',
+    maxToolIterations: 6,
+    maxToolCalls: 12,
+    consecutiveFailureLimit: 3,
+    llmTimeoutMs: 120000,
+  },
+  tools: {
+    timeoutMs: 20000,
+    resultMaxChars: 8000,
+    defaultLookbackMinutes: 60,
+    maxLookbackMinutes: 1440,
+    maxConcurrency: 2,
   },
   healthReport: {
     s3Uri: 's3://test/report.md',
   },
   aws: {
     region: 'us-east-1',
+    maxAttempts: 5,
   },
   monitoring: {
     intervalMs: 1000,
