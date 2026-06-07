@@ -6,6 +6,7 @@ import type { ToolContext, ToolDefinition } from '../../tools/types.js';
 
 const ctx: ToolContext = {
   region: 'us-east-1',
+  maxAttempts: 3,
   timeoutMs: 1000,
   maxResultChars: 20,
   defaultLookbackMinutes: 60,
