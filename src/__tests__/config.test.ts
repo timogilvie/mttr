@@ -29,6 +29,72 @@ describe('config', () => {
     expect(config.timeouts.s3Ms).toBe(15000);
   });
 
+  it('applies investigate, tools, and rate-limit defaults when unset', () => {
+    process.env['OPENROUTER_API_KEY'] = 'test-key';
+    for (const key of [
+      'INVESTIGATE_MODEL',
+      'INVESTIGATE_MODEL_FALLBACK',
+      'INVESTIGATE_MAX_TOOL_ITERATIONS',
+      'INVESTIGATE_MAX_TOOL_CALLS',
+      'INVESTIGATE_CONSECUTIVE_FAILURE_LIMIT',
+      'INVESTIGATE_LLM_TIMEOUT_MS',
+      'TOOL_TIMEOUT_MS',
+      'TOOL_RESULT_MAX_CHARS',
+      'TOOL_DEFAULT_LOOKBACK_MINUTES',
+      'TOOL_MAX_LOOKBACK_MINUTES',
+      'TOOL_MAX_CONCURRENCY',
+      'OPENROUTER_MAX_RETRIES',
+      'OPENROUTER_BACKOFF_BASE_MS',
+      'OPENROUTER_BACKOFF_MAX_MS',
+      'AWS_MAX_ATTEMPTS',
+    ]) {
+      delete process.env[key];
+    }
+
+    const config = loadConfig();
+
+    expect(config.investigate.model).toBe('openai/gpt-5.4');
+    expect(config.investigate.modelFallback).toBe('anthropic/claude-3.5-sonnet');
+    expect(config.investigate.maxToolIterations).toBe(6);
+    expect(config.investigate.maxToolCalls).toBe(12);
+    expect(config.investigate.consecutiveFailureLimit).toBe(3);
+    expect(config.investigate.llmTimeoutMs).toBe(120000);
+    expect(config.tools.timeoutMs).toBe(20000);
+    expect(config.tools.resultMaxChars).toBe(8000);
+    expect(config.tools.defaultLookbackMinutes).toBe(60);
+    expect(config.tools.maxLookbackMinutes).toBe(1440);
+    expect(config.tools.maxConcurrency).toBe(2);
+    expect(config.openrouter.maxRetries).toBe(4);
+    expect(config.openrouter.backoffBaseMs).toBe(1000);
+    expect(config.openrouter.backoffMaxMs).toBe(30000);
+    expect(config.aws.maxAttempts).toBe(5);
+  });
+
+  it('reads investigate model overrides from env', () => {
+    process.env['OPENROUTER_API_KEY'] = 'test-key';
+    process.env['INVESTIGATE_MODEL'] = 'custom/model';
+    process.env['INVESTIGATE_MODEL_FALLBACK'] = 'custom/fallback';
+
+    const config = loadConfig();
+
+    expect(config.investigate.model).toBe('custom/model');
+    expect(config.investigate.modelFallback).toBe('custom/fallback');
+  });
+
+  it('non-numeric investigate budget throws with variable name', () => {
+    process.env['OPENROUTER_API_KEY'] = 'test-key';
+    process.env['INVESTIGATE_MAX_TOOL_CALLS'] = 'lots';
+
+    expect(() => loadConfig()).toThrow('INVESTIGATE_MAX_TOOL_CALLS');
+  });
+
+  it('non-numeric AWS_MAX_ATTEMPTS throws with variable name', () => {
+    process.env['OPENROUTER_API_KEY'] = 'test-key';
+    process.env['AWS_MAX_ATTEMPTS'] = 'five';
+
+    expect(() => loadConfig()).toThrow('AWS_MAX_ATTEMPTS');
+  });
+
   it('missing OPENROUTER_API_KEY throws', () => {
     delete process.env['OPENROUTER_API_KEY'];
 
