@@ -4,13 +4,7 @@ import { fetchReport } from '../report/fetchReport.js';
 import { buildClassifyPrompt } from '../prompts/classifyPrompt.js';
 import { callOpenRouter } from '../llm/openrouter.js';
 import { parseClassification } from '../validation/classificationSchema.js';
-
-function stripMarkdownFences(text: string): string {
-  const trimmed = text.trim();
-  const codeBlockPattern = /^```(?:json)?\s*\n?([\s\S]*?)\n?```$/;
-  const match = codeBlockPattern.exec(trimmed);
-  return match ? match[1]!.trim() : trimmed;
-}
+import { stripMarkdownFences } from '../llm/json.js';
 
 async function attemptParse(
   responseText: string,
