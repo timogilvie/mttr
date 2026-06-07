@@ -1,10 +1,12 @@
 import type { Config } from './config.js';
-import type { StageInput } from './types.js';
+import type { StageInput, ClassificationResult, InvestigationResult } from './types.js';
 import * as classifyStage from './stages/classify.js';
+import * as investigateStage from './stages/investigate.js';
 
 export class Orchestrator {
   private intervalId: NodeJS.Timeout | null = null;
   private classifyInFlight = false;
+  private investigateInFlight = false;
 
   constructor(private readonly config: Config) {}
 
@@ -58,6 +60,16 @@ export class Orchestrator {
       if (result.status === 'success' && result.data) {
         console.log('[Orchestrator] Classify stage completed successfully');
         console.log(JSON.stringify(result.data, null, 2));
+
+        const classification = result.data as ClassificationResult;
+        const actionable =
+          classification.incidents.length > 0 || classification.findings.length > 0;
+
+        if (actionable) {
+          await this.runInvestigate(classification);
+        } else {
+          console.log('[Orchestrator] No actionable incidents or findings; skipping Investigate');
+        }
       } else if (result.status === 'error') {
         console.error('[Orchestrator] Classify stage failed:', result.error);
       }
@@ -65,6 +77,40 @@ export class Orchestrator {
       console.error('[Orchestrator] Unhandled error in Classify stage:', error);
     } finally {
       this.classifyInFlight = false;
+    }
+  }
+
+  private async runInvestigate(classification: ClassificationResult): Promise<void> {
+    if (this.investigateInFlight) {
+      console.log('[Orchestrator] Investigate stage still in flight, skipping');
+      return;
+    }
+
+    this.investigateInFlight = true;
+
+    try {
+      console.log('[Orchestrator] Starting Investigate stage');
+      const input: StageInput = {
+        stage: 'Investigate',
+        timestamp: new Date().toISOString(),
+      };
+
+      const result = await investigateStage.run(input, this.config, classification);
+
+      if (result.status === 'success' && result.data) {
+        const data = result.data as InvestigationResult;
+        console.log(
+          `[Orchestrator] Investigate stage completed: ${data.overall_assessment} ` +
+            `(severity ${data.overall_severity}, ${data.investigations.length} investigation(s))`
+        );
+        console.log(JSON.stringify(result.data, null, 2));
+      } else if (result.status === 'error') {
+        console.error('[Orchestrator] Investigate stage failed:', result.error);
+      }
+    } catch (error) {
+      console.error('[Orchestrator] Unhandled error in Investigate stage:', error);
+    } finally {
+      this.investigateInFlight = false;
     }
   }
 }
