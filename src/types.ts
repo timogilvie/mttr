@@ -66,6 +66,73 @@ export interface ClassificationResult {
   findings: Finding[];
 }
 
+export type OverallAssessment =
+  | 'ACTIVE_INCIDENT'
+  | 'POSSIBLE_INCIDENT'
+  | 'OBSERVABILITY_ISSUE'
+  | 'NO_ACTIONABLE_INCIDENT'
+  | 'INSUFFICIENT_EVIDENCE';
+
+export type InvestigationStatus =
+  | 'CONFIRMED_INCIDENT'
+  | 'POSSIBLE_INCIDENT'
+  | 'LIKELY_NON_INCIDENT'
+  | 'OBSERVABILITY_GAP'
+  | 'INSUFFICIENT_EVIDENCE';
+
+export interface LikelyCause {
+  cause: string;
+  confidence: number;
+  evidence: string[];
+}
+
+export interface AdditionalDataNeeded {
+  data: string;
+  reason: string;
+  suggested_query_or_source: string;
+}
+
+export interface NextInvestigationStep {
+  priority: number;
+  action: string;
+  expected_signal: string;
+}
+
+export interface PriorityItem {
+  rank: number;
+  incident_id: string;
+  title: string;
+  reason: string;
+}
+
+export interface Investigation {
+  incident_id: string;
+  title: string;
+  original_classification: IncidentClassification;
+  investigation_status: InvestigationStatus;
+  severity: Severity;
+  confidence: number;
+  affected_services: string[];
+  confirmed_facts: string[];
+  supporting_evidence: string[];
+  contradicting_evidence: string[];
+  likely_causes: LikelyCause[];
+  unknowns: string[];
+  additional_data_needed: AdditionalDataNeeded[];
+  recommended_next_investigation_steps: NextInvestigationStep[];
+  requires_more_evidence_before_mitigation: boolean;
+  possible_future_remediation: string[];
+}
+
+export interface InvestigationResult {
+  summary: string;
+  overall_assessment: OverallAssessment;
+  overall_severity: Severity;
+  investigations: Investigation[];
+  cross_cutting_observations: string[];
+  priority_order: PriorityItem[];
+}
+
 export type Stage = 'Classify' | 'Investigate' | 'Mitigate' | 'Restore' | 'Verify';
 
 export interface StageInput {
@@ -77,6 +144,6 @@ export interface StageResult {
   stage: Stage;
   status: 'success' | 'error' | 'not_implemented';
   timestamp: string;
-  data?: ClassificationResult | { message: string };
+  data?: ClassificationResult | InvestigationResult | { message: string };
   error?: string;
 }

@@ -1,9 +1,9 @@
 import { z } from 'zod';
 import type { ClassificationResult } from '../types.js';
 
-const SeveritySchema = z.enum(['NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL']);
+export const SeveritySchema = z.enum(['NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL']);
 
-const IncidentClassificationSchema = z.enum([
+export const IncidentClassificationSchema = z.enum([
   'DEPLOYMENT_REGRESSION',
   'RESOURCE_EXHAUSTION',
   'AUTH_FAILURE',
