@@ -40,6 +40,9 @@ const mockConfig: Config = {
   monitoring: {
     intervalMs: 5000,
   },
+  state: {
+    path: '.test-mttr-state.json',
+  },
   timeouts: {
     llmMs: 5000,
     s3Ms: 5000,

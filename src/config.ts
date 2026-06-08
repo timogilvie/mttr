@@ -32,6 +32,9 @@ export interface Config {
   monitoring: {
     intervalMs: number;
   };
+  state: {
+    path: string;
+  };
   timeouts: {
     llmMs: number;
     s3Ms: number;
@@ -98,6 +101,9 @@ export function loadConfig(): Config {
     },
     monitoring: {
       intervalMs: getEnvNumber('MONITOR_INTERVAL_MS', 300000),
+    },
+    state: {
+      path: getEnv('AGENT_STATE_PATH', '.mttr-state.json'),
     },
     timeouts: {
       llmMs: getEnvNumber('LLM_TIMEOUT_MS', 60000),

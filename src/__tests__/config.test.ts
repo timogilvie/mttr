@@ -25,6 +25,7 @@ describe('config', () => {
     );
     expect(config.aws.region).toBe('us-east-1');
     expect(config.monitoring.intervalMs).toBe(300000);
+    expect(config.state.path).toBe('.mttr-state.json');
     expect(config.timeouts.llmMs).toBe(60000);
     expect(config.timeouts.s3Ms).toBe(15000);
   });
@@ -47,6 +48,7 @@ describe('config', () => {
       'OPENROUTER_BACKOFF_BASE_MS',
       'OPENROUTER_BACKOFF_MAX_MS',
       'AWS_MAX_ATTEMPTS',
+      'AGENT_STATE_PATH',
     ]) {
       delete process.env[key];
     }
@@ -68,6 +70,7 @@ describe('config', () => {
     expect(config.openrouter.backoffBaseMs).toBe(1000);
     expect(config.openrouter.backoffMaxMs).toBe(30000);
     expect(config.aws.maxAttempts).toBe(5);
+    expect(config.state.path).toBe('.mttr-state.json');
   });
 
   it('reads investigate model overrides from env', () => {

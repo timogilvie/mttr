@@ -35,6 +35,7 @@ const mockConfig: Config = {
   healthReport: { s3Uri: 's3://test/report.md' },
   aws: { region: 'us-east-1', maxAttempts: 5 },
   monitoring: { intervalMs: 5000 },
+  state: { path: '.test-mttr-state.json' },
   timeouts: { llmMs: 5000, s3Ms: 5000 },
 };
 
