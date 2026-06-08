@@ -1,10 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { rmSync } from 'node:fs';
 import { Orchestrator } from '../orchestrator.js';
 import type { Config } from '../config.js';
 import type { StageResult, ClassificationResult } from '../types.js';
 
 vi.mock('../stages/classify.js');
 vi.mock('../stages/investigate.js');
+vi.mock('../report/fetchReport.js');
+
+let stateFileCounter = 0;
 
 const mockConfig: Config = {
   openrouter: {
@@ -40,6 +44,9 @@ const mockConfig: Config = {
   monitoring: {
     intervalMs: 1000,
   },
+  state: {
+    path: '.test-mttr-state.json',
+  },
   timeouts: {
     llmMs: 5000,
     s3Ms: 5000,
@@ -49,15 +56,25 @@ const mockConfig: Config = {
 describe('Orchestrator', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    stateFileCounter += 1;
+    mockConfig.state.path = `/private/tmp/mttr-orchestrator-${process.pid}-${stateFileCounter}.json`;
+    rmSync(mockConfig.state.path, { force: true });
     vi.useFakeTimers();
   });
 
   afterEach(() => {
+    rmSync(mockConfig.state.path, { force: true });
     vi.useRealTimers();
   });
 
+  async function mockReport(text = '# report'): Promise<void> {
+    const { fetchReport } = await import('../report/fetchReport.js');
+    vi.mocked(fetchReport).mockResolvedValue(text);
+  }
+
   it('ticks continue while long Classify task is in flight', async () => {
     const classifyStage = await import('../stages/classify.js');
+    await mockReport();
 
     const mockResult: StageResult = {
       stage: 'Classify',
@@ -65,21 +82,22 @@ describe('Orchestrator', () => {
       timestamp: new Date().toISOString(),
     };
 
-    vi.mocked(classifyStage.run).mockResolvedValue(mockResult);
+    vi.mocked(classifyStage.runWithReport).mockResolvedValue(mockResult);
 
     const orchestrator = new Orchestrator(mockConfig);
     orchestrator.start();
 
-    expect(classifyStage.run).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1));
 
     await vi.advanceTimersByTimeAsync(500);
-    expect(classifyStage.run).toHaveBeenCalledTimes(1);
+    expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1);
 
     orchestrator.stop();
   });
 
   it('overlapping Classify runs are skipped', async () => {
     const classifyStage = await import('../stages/classify.js');
+    await mockReport();
 
     let resolveFirst: (() => void) | null = null;
     const firstPromise = new Promise<StageResult>((resolve) => {
@@ -97,29 +115,30 @@ describe('Orchestrator', () => {
       timestamp: new Date().toISOString(),
     };
 
-    vi.mocked(classifyStage.run)
+    vi.mocked(classifyStage.runWithReport)
       .mockReturnValueOnce(firstPromise)
       .mockResolvedValue(mockResult);
 
     const orchestrator = new Orchestrator(mockConfig);
     orchestrator.start();
 
-    expect(classifyStage.run).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1));
 
     await vi.advanceTimersByTimeAsync(1000);
-    expect(classifyStage.run).toHaveBeenCalledTimes(1);
+    expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1);
 
     resolveFirst!();
     await vi.waitFor(() => Promise.resolve());
 
     await vi.advanceTimersByTimeAsync(1000);
-    expect(classifyStage.run).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(classifyStage.runWithReport).toHaveBeenCalledTimes(2));
 
     orchestrator.stop();
   });
 
   it('stage rejection is logged and later ticks continue', async () => {
     const classifyStage = await import('../stages/classify.js');
+    await mockReport();
 
     const mockResult: StageResult = {
       stage: 'Classify',
@@ -127,25 +146,26 @@ describe('Orchestrator', () => {
       timestamp: new Date().toISOString(),
     };
 
-    vi.mocked(classifyStage.run)
+    vi.mocked(classifyStage.runWithReport)
       .mockRejectedValueOnce(new Error('Test error'))
       .mockResolvedValue(mockResult);
 
     const orchestrator = new Orchestrator(mockConfig);
     orchestrator.start();
 
-    expect(classifyStage.run).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1));
 
     await vi.waitFor(() => Promise.resolve());
 
     await vi.advanceTimersByTimeAsync(1000);
-    expect(classifyStage.run).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(classifyStage.runWithReport).toHaveBeenCalledTimes(2));
 
     orchestrator.stop();
   });
 
   it('stop() prevents further ticks', async () => {
     const classifyStage = await import('../stages/classify.js');
+    await mockReport();
 
     const mockResult: StageResult = {
       stage: 'Classify',
@@ -153,18 +173,18 @@ describe('Orchestrator', () => {
       timestamp: new Date().toISOString(),
     };
 
-    vi.mocked(classifyStage.run).mockResolvedValue(mockResult);
+    vi.mocked(classifyStage.runWithReport).mockResolvedValue(mockResult);
 
     const orchestrator = new Orchestrator(mockConfig);
     orchestrator.start();
 
-    expect(classifyStage.run).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1));
 
     orchestrator.stop();
 
     await vi.advanceTimersByTimeAsync(5000);
 
-    expect(classifyStage.run).toHaveBeenCalledTimes(1);
+    expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1);
   });
 
   const actionableClassification: ClassificationResult = {
@@ -208,19 +228,21 @@ describe('Orchestrator', () => {
   it('chains Investigate after an actionable Classify result', async () => {
     const classifyStage = await import('../stages/classify.js');
     const investigateStage = await import('../stages/investigate.js');
+    await mockReport();
 
-    vi.mocked(classifyStage.run).mockResolvedValue(actionableClassifyResult);
+    vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
     vi.mocked(investigateStage.run).mockResolvedValue(investigateResult);
 
-    const orchestrator = new Orchestrator(mockConfig);
+    const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+    const orchestrator = new Orchestrator(config);
     orchestrator.start();
 
-    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(investigateStage.run).toHaveBeenCalledTimes(1));
 
     expect(investigateStage.run).toHaveBeenCalledTimes(1);
     const call = vi.mocked(investigateStage.run).mock.calls[0]!;
     expect(call[0]).toEqual(expect.objectContaining({ stage: 'Investigate' }));
-    expect(call[1]).toBe(mockConfig);
+    expect(call[1]).toEqual(config);
     expect((call[2] as ClassificationResult).findings).toHaveLength(1);
 
     orchestrator.stop();
@@ -229,20 +251,22 @@ describe('Orchestrator', () => {
   it('skips Investigate when Classify has no incidents or findings', async () => {
     const classifyStage = await import('../stages/classify.js');
     const investigateStage = await import('../stages/investigate.js');
+    await mockReport();
 
-    vi.mocked(classifyStage.run).mockResolvedValue({
+    vi.mocked(classifyStage.runWithReport).mockResolvedValue({
       stage: 'Classify',
       status: 'success',
       timestamp: 't',
       data: { summary: '', overall_severity: 'NONE', incidents: [], findings: [] },
     });
 
-    const orchestrator = new Orchestrator(mockConfig);
+    const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+    const orchestrator = new Orchestrator(config);
     orchestrator.start();
 
-    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1));
 
-    expect(classifyStage.run).toHaveBeenCalledTimes(1);
+    expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1);
     expect(investigateStage.run).not.toHaveBeenCalled();
 
     orchestrator.stop();
@@ -251,8 +275,25 @@ describe('Orchestrator', () => {
   it('logs an Investigate error and later ticks continue', async () => {
     const classifyStage = await import('../stages/classify.js');
     const investigateStage = await import('../stages/investigate.js');
+    const { fetchReport } = await import('../report/fetchReport.js');
+    vi.mocked(fetchReport).mockResolvedValueOnce('first report').mockResolvedValue('second report');
 
-    vi.mocked(classifyStage.run).mockResolvedValue(actionableClassifyResult);
+    const changedClassifyResult: StageResult = {
+      ...actionableClassifyResult,
+      data: {
+        ...actionableClassification,
+        findings: [
+          {
+            ...actionableClassification.findings[0]!,
+            evidence: ['changed evidence'],
+          },
+        ],
+      },
+    };
+
+    vi.mocked(classifyStage.runWithReport)
+      .mockResolvedValueOnce(actionableClassifyResult)
+      .mockResolvedValue(changedClassifyResult);
     vi.mocked(investigateStage.run)
       .mockRejectedValueOnce(new Error('investigate boom'))
       .mockResolvedValue(investigateResult);
@@ -260,9 +301,58 @@ describe('Orchestrator', () => {
     const orchestrator = new Orchestrator(mockConfig);
     orchestrator.start();
 
+    await vi.waitFor(() => expect(investigateStage.run).toHaveBeenCalledTimes(1));
+
     await vi.advanceTimersByTimeAsync(1000);
-    expect(classifyStage.run).toHaveBeenCalledTimes(2);
-    expect(investigateStage.run).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(classifyStage.runWithReport).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(investigateStage.run).toHaveBeenCalledTimes(2));
+
+    orchestrator.stop();
+  });
+
+  it('skips Classify and Investigate when the report content is unchanged', async () => {
+    const classifyStage = await import('../stages/classify.js');
+    const investigateStage = await import('../stages/investigate.js');
+    await mockReport('same report');
+
+    vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
+    vi.mocked(investigateStage.run).mockResolvedValue(investigateResult);
+
+    const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+    const orchestrator = new Orchestrator(config);
+    orchestrator.start();
+
+    await vi.waitFor(() => expect(investigateStage.run).toHaveBeenCalledTimes(1));
+    expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1);
+    expect(investigateStage.run).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1_000_000);
+    expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1);
+    expect(investigateStage.run).toHaveBeenCalledTimes(1);
+
+    orchestrator.stop();
+  });
+
+  it('skips Investigate for recurring unchanged observations from changed reports', async () => {
+    const classifyStage = await import('../stages/classify.js');
+    const investigateStage = await import('../stages/investigate.js');
+    const { fetchReport } = await import('../report/fetchReport.js');
+    vi.mocked(fetchReport).mockResolvedValueOnce('first report').mockResolvedValue('second report');
+
+    vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
+    vi.mocked(investigateStage.run).mockResolvedValue(investigateResult);
+
+    const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+    const orchestrator = new Orchestrator(config);
+    orchestrator.start();
+
+    await vi.waitFor(() => expect(investigateStage.run).toHaveBeenCalledTimes(1));
+    expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1);
+    expect(investigateStage.run).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(1_000_000);
+    await vi.waitFor(() => expect(classifyStage.runWithReport).toHaveBeenCalledTimes(2));
+    expect(investigateStage.run).toHaveBeenCalledTimes(1);
 
     orchestrator.stop();
   });

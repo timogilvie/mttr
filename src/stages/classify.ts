@@ -53,7 +53,58 @@ function createFallbackResult(reason: string): ClassificationResult {
   };
 }
 
-export async function run(_input: StageInput, config: Config): Promise<StageResult> {
+async function classifyReport(report: string, config: Config, timestamp: string): Promise<StageResult> {
+  const prompt = buildClassifyPrompt(report);
+
+  const llmResponse = await callOpenRouter(
+    prompt,
+    config.openrouter.apiKey,
+    config.openrouter.model,
+    config.openrouter.baseUrl,
+    config.timeouts.llmMs
+  );
+
+  const classificationResult = await attemptParse(llmResponse, config, false, prompt);
+
+  if (!classificationResult) {
+    const fallback = createFallbackResult('LLM returned invalid JSON after retry');
+    return {
+      stage: 'Classify',
+      status: 'success',
+      timestamp,
+      data: fallback,
+    };
+  }
+
+  return {
+    stage: 'Classify',
+    status: 'success',
+    timestamp,
+    data: classificationResult,
+  };
+}
+
+export async function runWithReport(
+  _input: StageInput,
+  config: Config,
+  report: string
+): Promise<StageResult> {
+  const timestamp = new Date().toISOString();
+
+  try {
+    return await classifyReport(report, config, timestamp);
+  } catch (error) {
+    console.error('[Classify] Stage execution failed', error);
+    return {
+      stage: 'Classify',
+      status: 'error',
+      timestamp,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+export async function run(input: StageInput, config: Config): Promise<StageResult> {
   const timestamp = new Date().toISOString();
 
   try {
@@ -63,38 +114,11 @@ export async function run(_input: StageInput, config: Config): Promise<StageResu
       config.timeouts.s3Ms
     );
 
-    const prompt = buildClassifyPrompt(report);
-
-    const llmResponse = await callOpenRouter(
-      prompt,
-      config.openrouter.apiKey,
-      config.openrouter.model,
-      config.openrouter.baseUrl,
-      config.timeouts.llmMs
-    );
-
-    const classificationResult = await attemptParse(llmResponse, config, false, prompt);
-
-    if (!classificationResult) {
-      const fallback = createFallbackResult('LLM returned invalid JSON after retry');
-      return {
-        stage: 'Classify',
-        status: 'success',
-        timestamp,
-        data: fallback,
-      };
-    }
-
-    return {
-      stage: 'Classify',
-      status: 'success',
-      timestamp,
-      data: classificationResult,
-    };
+    return await classifyReport(report, config, timestamp);
   } catch (error) {
     console.error('[Classify] Stage execution failed', error);
     return {
-      stage: 'Classify',
+      stage: input.stage,
       status: 'error',
       timestamp,
       error: error instanceof Error ? error.message : String(error),

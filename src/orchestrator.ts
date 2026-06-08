@@ -2,13 +2,26 @@ import type { Config } from './config.js';
 import type { StageInput, ClassificationResult, InvestigationResult } from './types.js';
 import * as classifyStage from './stages/classify.js';
 import * as investigateStage from './stages/investigate.js';
+import { fetchReport } from './report/fetchReport.js';
+import {
+  hashReportContent,
+  hasProcessedReport,
+  loadAgentState,
+  reconcileObservations,
+  recordProcessedReport,
+  saveAgentState,
+  type ObservationReconciliation,
+} from './state/agentState.js';
 
 export class Orchestrator {
   private intervalId: NodeJS.Timeout | null = null;
   private classifyInFlight = false;
   private investigateInFlight = false;
+  private readonly config: Config;
 
-  constructor(private readonly config: Config) {}
+  constructor(config: Config) {
+    this.config = structuredClone(config);
+  }
 
   start(): void {
     if (this.intervalId) {
@@ -55,18 +68,44 @@ export class Orchestrator {
   private async runClassifyAsync(input: StageInput): Promise<void> {
     try {
       console.log('[Orchestrator] Starting Classify stage');
-      const result = await classifyStage.run(input, this.config);
+      const report = await fetchReport(
+        this.config.healthReport.s3Uri,
+        this.config.aws.region,
+        this.config.timeouts.s3Ms
+      );
+      const reportFingerprint = hashReportContent(report);
+      const state = await loadAgentState(this.config.state.path);
+
+      if (hasProcessedReport(state, this.config.healthReport.s3Uri, reportFingerprint)) {
+        console.log(
+          `[Orchestrator] Report unchanged (${reportFingerprint.slice(0, 12)}); ` +
+            'skipping Classify and Investigate'
+        );
+        return;
+      }
+
+      const result = await classifyStage.runWithReport(input, this.config, report);
 
       if (result.status === 'success' && result.data) {
         console.log('[Orchestrator] Classify stage completed successfully');
         console.log(JSON.stringify(result.data, null, 2));
 
         const classification = result.data as ClassificationResult;
+        const now = new Date().toISOString();
+        recordProcessedReport(state, this.config.healthReport.s3Uri, reportFingerprint, now);
+        const reconciliation = reconcileObservations(state, classification, now);
+        await saveAgentState(this.config.state.path, state);
+        this.logObservationReconciliation(reconciliation);
+
         const actionable =
           classification.incidents.length > 0 || classification.findings.length > 0;
 
-        if (actionable) {
+        if (actionable && reconciliation.shouldInvestigate) {
           await this.runInvestigate(classification);
+        } else if (actionable) {
+          console.log(
+            '[Orchestrator] Only recurring unchanged observations detected; skipping Investigate'
+          );
         } else {
           console.log('[Orchestrator] No actionable incidents or findings; skipping Investigate');
         }
@@ -77,6 +116,27 @@ export class Orchestrator {
       console.error('[Orchestrator] Unhandled error in Classify stage:', error);
     } finally {
       this.classifyInFlight = false;
+    }
+  }
+
+  private logObservationReconciliation(reconciliation: ObservationReconciliation): void {
+    const parts = [
+      `${reconciliation.newObservations.length} new`,
+      `${reconciliation.changedObservations.length} changed`,
+      `${reconciliation.recurringObservations.length} recurring`,
+      `${reconciliation.resolvedObservations.length} resolved`,
+    ];
+    console.log(`[Orchestrator] Observation state: ${parts.join(', ')}`);
+
+    for (const observation of reconciliation.recurringObservations) {
+      console.log(
+        `[Orchestrator] Recurring ${observation.type}: "${observation.title}" ` +
+          `(${observation.occurrences} occurrence(s), first seen ${observation.firstSeen})`
+      );
+    }
+
+    for (const observation of reconciliation.resolvedObservations) {
+      console.log(`[Orchestrator] Resolved ${observation.type}: "${observation.title}"`);
     }
   }
 
