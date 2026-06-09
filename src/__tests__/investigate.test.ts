@@ -93,7 +93,9 @@ describe('investigate stage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockDiscoverLogGroups.mockResolvedValue(
-      'Found 1 candidate log group(s):\nlogGroupName=/ecs/hokusai-api-development'
+      'Found 2 candidate log group(s):\n' +
+        'logGroupName=/ecs/hokusai-api-development, storedBytes=11701821\n' +
+        'logGroupName=/ecs/hokusai/api/development, storedBytes=0'
     );
     mockQueryLogs.mockResolvedValue(
       'Query returned 1 row(s):\nstatus=401, path=/api/probe, requests=12'
@@ -137,11 +139,16 @@ describe('investigate stage', () => {
       expect.objectContaining({ region: 'us-east-1' })
     );
     expect(mockQueryLogs).toHaveBeenCalledWith(
-      expect.objectContaining({ log_group: '/ecs/hokusai-api-development' }),
+      expect.objectContaining({
+        log_group: '/ecs/hokusai-api-development',
+        lookback_minutes: mockConfig.tools.maxLookbackMinutes,
+      }),
       expect.objectContaining({ region: 'us-east-1' })
     );
+    expect(mockQueryLogs).toHaveBeenCalledTimes(1);
     expect(mockLoop.mock.calls[0]![0].prompt).toContain('Pre-gathered Tool Evidence');
     expect(mockLoop.mock.calls[0]![0].prompt).toContain('standard 4xx/auth breakdown');
+    expect(mockLoop.mock.calls[0]![0].prompt).toContain('1440 minute lookback');
     const data = result.data as InvestigationResult;
     expect(data.overall_assessment).toBe('POSSIBLE_INCIDENT');
     expect(data.overall_severity).toBe('MEDIUM');
@@ -181,6 +188,31 @@ describe('investigate stage', () => {
       expect.objectContaining({ region: 'us-east-1' })
     );
     expect(mockLoop.mock.calls[0]![0].prompt).toContain('standard warning sample');
+  });
+
+  it('queries multiple non-empty candidate log groups during standard evidence gathering', async () => {
+    mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+    mockDiscoverLogGroups.mockResolvedValue(
+      'Found 3 candidate log group(s):\n' +
+        'logGroupName=/ecs/hokusai-api-development, storedBytes=11701821\n' +
+        'logGroupName=/ecs/hokusai-api-secondary, storedBytes=42\n' +
+        'logGroupName=/ecs/hokusai/api/development, storedBytes=0'
+    );
+
+    const result = await investigateStage.run(mockInput, mockConfig, classificationWithFinding);
+
+    expect(result.status).toBe('success');
+    expect(mockQueryLogs).toHaveBeenCalledTimes(2);
+    expect(mockQueryLogs).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ log_group: '/ecs/hokusai-api-development' }),
+      expect.anything()
+    );
+    expect(mockQueryLogs).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ log_group: '/ecs/hokusai-api-secondary' }),
+      expect.anything()
+    );
   });
 
   it('strips markdown fences from the response', async () => {
