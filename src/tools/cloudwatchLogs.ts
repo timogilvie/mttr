@@ -25,6 +25,17 @@ const DEFAULT_DISCOVERY_LIMIT = 10;
 const MAX_DISCOVERY_LIMIT = 50;
 const MAX_DISCOVERY_PAGES = 20;
 const POLL_INTERVAL_MS = 500;
+const GENERIC_SERVICE_TOKENS = new Set([
+  'app',
+  'application',
+  'backend',
+  'data',
+  'development',
+  'pipeline',
+  'prod',
+  'production',
+  'service',
+]);
 
 const argsSchema = z.object({
   log_group: z.string().min(1),
@@ -97,9 +108,22 @@ function formatRows(rows: ResultField[][]): string {
   return `Query returned ${rows.length} row(s):\n${lines.join('\n')}`;
 }
 
-function formatLogGroups(serviceName: string, groups: LogGroup[]): string {
+function discoveryTerms(serviceName: string): string[] {
+  const normalized = serviceName.toLowerCase();
+  const tokens = normalized
+    .split(/[^a-z0-9]+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3 && !GENERIC_SERVICE_TOKENS.has(token));
+  return [...new Set([normalized, ...tokens])];
+}
+
+function formatLogGroups(
+  serviceName: string,
+  groups: LogGroup[],
+  searchedTerms: string[] = [serviceName]
+): string {
   if (groups.length === 0) {
-    return `No CloudWatch log groups found containing "${serviceName}".`;
+    return `No CloudWatch log groups found for "${serviceName}" using terms: ${searchedTerms.join(', ')}.`;
   }
 
   const lines = groups.map((group) => {
@@ -113,11 +137,33 @@ function formatLogGroups(serviceName: string, groups: LogGroup[]): string {
     return parts.join(', ');
   });
 
-  return `Found ${groups.length} candidate log group(s) containing "${serviceName}":\n${lines.join('\n')}`;
+  return `Found ${groups.length} candidate log group(s) for "${serviceName}" using terms: ${searchedTerms.join(', ')}:\n${lines.join('\n')}`;
+}
+
+function scoreLogGroup(group: LogGroup, terms: string[]): number {
+  const name = (group.logGroupName ?? '').toLowerCase();
+  let score = 0;
+
+  if (name.startsWith('/ecs/')) {
+    score += 20;
+  }
+  if (name.includes('/api/') || name.includes('-api-') || name.includes('/auth/')) {
+    score += 5;
+  }
+  if (name.includes('db-init') || name.includes('migration') || name.includes('/rds/')) {
+    score -= 10;
+  }
+  if (name.includes('proxy')) {
+    score -= 5;
+  }
+
+  score += terms.filter((term) => name.includes(term)).length;
+
+  return score;
 }
 
 async function discoverHandler(args: DiscoverLogGroupsArgs, ctx: ToolContext): Promise<string> {
-  const serviceName = args.service_name.toLowerCase();
+  const terms = discoveryTerms(args.service_name);
   const limit =
     args.limit && args.limit > 0
       ? Math.min(Math.floor(args.limit), MAX_DISCOVERY_LIMIT)
@@ -130,6 +176,7 @@ async function discoverHandler(args: DiscoverLogGroupsArgs, ctx: ToolContext): P
 
   try {
     const matches: LogGroup[] = [];
+    const seen = new Set<string>();
     let nextToken: string | undefined;
     let pages = 0;
 
@@ -143,10 +190,16 @@ async function discoverHandler(args: DiscoverLogGroupsArgs, ctx: ToolContext): P
 
       for (const group of response.logGroups ?? []) {
         const name = group.logGroupName ?? '';
-        if (name.toLowerCase().includes(serviceName)) {
+        const lowerName = name.toLowerCase();
+        if (terms.some((term) => lowerName.includes(term)) && !seen.has(name)) {
+          seen.add(name);
           matches.push(group);
           if (matches.length >= limit) {
-            return formatLogGroups(args.service_name, matches);
+            return formatLogGroups(
+              args.service_name,
+              [...matches].sort((a, b) => scoreLogGroup(b, terms) - scoreLogGroup(a, terms)),
+              terms
+            );
           }
         }
       }
@@ -155,7 +208,11 @@ async function discoverHandler(args: DiscoverLogGroupsArgs, ctx: ToolContext): P
       pages += 1;
     } while (nextToken && pages < MAX_DISCOVERY_PAGES);
 
-    return formatLogGroups(args.service_name, matches);
+    return formatLogGroups(
+      args.service_name,
+      [...matches].sort((a, b) => scoreLogGroup(b, terms) - scoreLogGroup(a, terms)),
+      terms
+    );
   } catch (error) {
     throw new CloudWatchLogsToolError(
       `discover_log_groups failed: ${error instanceof Error ? error.message : String(error)}`,

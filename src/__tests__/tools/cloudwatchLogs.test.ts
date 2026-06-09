@@ -154,6 +154,39 @@ describe('cloudwatchLogs discover_log_groups', () => {
     expect(send.mock.calls[0]?.[0]).toBeInstanceOf(DescribeLogGroupsCommand);
   });
 
+  it('falls back to meaningful service-name tokens for aliased log groups', async () => {
+    const send = vi.fn().mockResolvedValueOnce({
+      logGroups: [
+        { logGroupName: '/ecs/hokusai-api-development', storedBytes: 11701821 },
+        { logGroupName: '/ecs/hokusai-auth/development', storedBytes: 42076235 },
+      ],
+    });
+    mockClient(send);
+
+    const result = await discoverLogGroupsTool.handler({ service_name: 'data-pipeline-api' }, ctx);
+
+    expect(result).toContain('/ecs/hokusai-api-development');
+    expect(result).toContain('using terms: data-pipeline-api, api');
+    expect(result).not.toContain('/ecs/hokusai-auth/development');
+  });
+
+  it('ranks ECS application log groups ahead of database and migration candidates', async () => {
+    const send = vi.fn().mockResolvedValueOnce({
+      logGroups: [
+        { logGroupName: '/aws/rds/instance/hokusai-auth-development/postgresql' },
+        { logGroupName: '/aws/rds/proxy/hokusai-auth-proxy-development' },
+        { logGroupName: '/ecs/hokusai-auth-migrations' },
+        { logGroupName: '/ecs/hokusai-auth/development' },
+      ],
+    });
+    mockClient(send);
+
+    const result = await discoverLogGroupsTool.handler({ service_name: 'auth-service' }, ctx);
+    const firstResultLine = result.split('\n')[1];
+
+    expect(firstResultLine).toContain('/ecs/hokusai-auth/development');
+  });
+
   it('paginates until it finds enough matches', async () => {
     const send = vi
       .fn()
@@ -188,6 +221,7 @@ describe('cloudwatchLogs discover_log_groups', () => {
     const result = await discoverLogGroupsTool.handler({ service_name: 'data-pipeline-api' }, ctx);
 
     expect(result).toContain('No CloudWatch log groups found');
+    expect(result).toContain('data-pipeline-api, api');
   });
 
   it('validates discovery arguments via argsSchema', () => {

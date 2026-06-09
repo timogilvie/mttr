@@ -9,8 +9,10 @@ import { buildInvestigatePrompt } from '../prompts/investigatePrompt.js';
 import { callOpenRouterWithTools, type ToolLoopOptions } from '../llm/toolLoop.js';
 import { getTools } from '../tools/registry.js';
 import type { ToolContext } from '../tools/types.js';
+import { discoverLogGroupsTool, queryLogsTool } from '../tools/cloudwatchLogs.js';
 import { parseInvestigation } from '../validation/investigationSchema.js';
 import { stripMarkdownFences } from '../llm/json.js';
+import type { Finding, Incident, IncidentClassification } from '../types.js';
 
 function isNonActionable(classification: ClassificationResult): boolean {
   return classification.incidents.length === 0 && classification.findings.length === 0;
@@ -58,6 +60,132 @@ function tryParse(text: string): InvestigationResult | null {
   }
 }
 
+type InvestigationItem =
+  | { id: string; kind: 'incident'; item: Incident }
+  | { id: string; kind: 'finding'; item: Finding };
+
+const FOUR_XX_QUERY = `fields @timestamp, @message, @logStream
+| filter @message like / 4[0-9][0-9] / or @message like /Unauthorized|Forbidden|unauthorized|forbidden|authentication|authorization|token|credential|signature/
+| parse @message /"(?<method>\\S+) (?<path>\\S+) HTTP\\/[^"]+" (?<status>\\d{3})/
+| stats count(*) as requests by status, path
+| sort requests desc
+| limit 25`;
+
+const WARNING_QUERY = `fields @timestamp, @message, @logStream
+| filter @message like /WARN|Warning|WARNING|warning/
+| sort @timestamp desc
+| limit 25`;
+
+function allItems(classification: ClassificationResult): InvestigationItem[] {
+  return [
+    ...classification.incidents.map((item) => ({
+      id: item.incident_id,
+      kind: 'incident' as const,
+      item,
+    })),
+    ...classification.findings.map((item, index) => ({
+      id: `finding-${index}`,
+      kind: 'finding' as const,
+      item,
+    })),
+  ];
+}
+
+function itemText(item: Incident | Finding): string {
+  return [item.title, item.classification, ...item.evidence].join(' ').toLowerCase();
+}
+
+function needs4xxDrilldown(classification: IncidentClassification, text: string): boolean {
+  return classification === 'AUTH_FAILURE' || /\b4xx\b|\b401\b|\b403\b|unauthorized|forbidden/.test(text);
+}
+
+function needsWarningDrilldown(text: string): boolean {
+  return /warn|warning/.test(text);
+}
+
+function extractFirstLogGroup(discoveryResult: string): string | null {
+  return discoveryResult.match(/^logGroupName=([^,\n]+)/m)?.[1] ?? null;
+}
+
+async function runEvidenceTool(label: string, action: () => Promise<string>): Promise<string> {
+  try {
+    const result = await action();
+    return `${label}\n${result}`;
+  } catch (error) {
+    return `${label}\nError: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+async function gatherStandardEvidence(
+  classification: ClassificationResult,
+  ctx: ToolContext
+): Promise<string> {
+  const sections: string[] = [];
+
+  for (const { id, kind, item } of allItems(classification)) {
+    const text = itemText(item);
+    const shouldQuery4xx = needs4xxDrilldown(item.classification, text);
+    const shouldQueryWarnings = needsWarningDrilldown(text);
+
+    if (!shouldQuery4xx && !shouldQueryWarnings) {
+      continue;
+    }
+
+    for (const service of item.affected_services) {
+      console.log(`[Investigate] Pre-gathering standard evidence for ${id} (${service})`);
+
+      const discovery = await runEvidenceTool(
+        `### ${id} ${kind}: discover_log_groups(${service})`,
+        () => discoverLogGroupsTool.handler({ service_name: service, limit: 5 }, ctx)
+      );
+      sections.push(discovery);
+
+      const logGroup = extractFirstLogGroup(discovery);
+      if (!logGroup) {
+        continue;
+      }
+
+      if (shouldQuery4xx) {
+        sections.push(
+          await runEvidenceTool(
+            `### ${id} ${kind}: standard 4xx/auth breakdown on ${logGroup}`,
+            () =>
+              queryLogsTool.handler(
+                {
+                  log_group: logGroup,
+                  filter_or_query: FOUR_XX_QUERY,
+                  lookback_minutes: ctx.defaultLookbackMinutes,
+                  limit: 100,
+                },
+                ctx
+              )
+          )
+        );
+      }
+
+      if (shouldQueryWarnings) {
+        sections.push(
+          await runEvidenceTool(
+            `### ${id} ${kind}: standard warning sample on ${logGroup}`,
+            () =>
+              queryLogsTool.handler(
+                {
+                  log_group: logGroup,
+                  filter_or_query: WARNING_QUERY,
+                  lookback_minutes: ctx.defaultLookbackMinutes,
+                  limit: 100,
+                },
+                ctx
+              )
+          )
+        );
+      }
+    }
+  }
+
+  return sections.join('\n\n');
+}
+
 export async function run(
   _input: StageInput,
   config: Config,
@@ -77,8 +205,10 @@ export async function run(
       };
     }
 
+    const toolContext = buildToolContext(config);
+    const preGatheredEvidence = await gatherStandardEvidence(classification, toolContext);
     const step1Json = JSON.stringify(classification, null, 2);
-    const prompt = buildInvestigatePrompt(step1Json);
+    const prompt = buildInvestigatePrompt(step1Json, preGatheredEvidence);
 
     const loopOptions: ToolLoopOptions = {
       prompt,
@@ -87,7 +217,7 @@ export async function run(
       model: config.investigate.model,
       fallbackModel: config.investigate.modelFallback,
       tools: getTools(),
-      toolContext: buildToolContext(config),
+      toolContext,
       maxIterations: config.investigate.maxToolIterations,
       maxToolCalls: config.investigate.maxToolCalls,
       maxConcurrency: config.tools.maxConcurrency,
