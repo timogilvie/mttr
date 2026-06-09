@@ -26,6 +26,7 @@ Use suggested_cloudwatch_queries and signals to target your queries. For finding
 
 ## Evidence discipline
 
+- Treat the Pre-gathered Tool Evidence section as actual tool output. Use it before deciding whether more tool calls are needed.
 - Every entry in confirmed_facts and supporting_evidence MUST be traceable to a specific Step 1 field or a tool result you actually received. Quote or reference it. If you have no evidence beyond Step 1, leave the array empty and record the gap in unknowns.
 - Do NOT assign a per-item confidence higher than that item's Step 1 confidence unless you obtained corroborating evidence from a tool.
 - Do not fabricate logs, metrics, timestamps, or service names. Preserve service names exactly as given in Step 1.
@@ -83,9 +84,12 @@ Return valid JSON only. Do not include markdown. Use this schema:
 
 ## Step 1 Input
 
-{{STEP_1_JSON}}`;
+{{STEP_1_JSON}}
+
+{{PRE_GATHERED_EVIDENCE}}`;
 
 const TEMPLATE_TOKEN = '{{STEP_1_JSON}}';
+const PRE_GATHERED_EVIDENCE_TOKEN = '{{PRE_GATHERED_EVIDENCE}}';
 
 export class PromptBuildError extends Error {
   constructor(message: string) {
@@ -94,7 +98,7 @@ export class PromptBuildError extends Error {
   }
 }
 
-export function buildInvestigatePrompt(step1Json: string): string {
+export function buildInvestigatePrompt(step1Json: string, preGatheredEvidence = ''): string {
   if (!step1Json || step1Json.trim() === '') {
     throw new PromptBuildError('Step 1 JSON cannot be empty or whitespace');
   }
@@ -103,10 +107,18 @@ export function buildInvestigatePrompt(step1Json: string): string {
     throw new PromptBuildError('Template missing {{STEP_1_JSON}} token');
   }
 
-  const prompt = INVESTIGATE_PROMPT_TEMPLATE.replace(TEMPLATE_TOKEN, step1Json);
+  const evidenceSection =
+    preGatheredEvidence.trim() === ''
+      ? ''
+      : `## Pre-gathered Tool Evidence\n\n${preGatheredEvidence.trim()}`;
 
-  if (prompt.includes(TEMPLATE_TOKEN)) {
-    throw new PromptBuildError('Generated prompt still contains {{STEP_1_JSON}} token');
+  const prompt = INVESTIGATE_PROMPT_TEMPLATE.replace(TEMPLATE_TOKEN, step1Json).replace(
+    PRE_GATHERED_EVIDENCE_TOKEN,
+    evidenceSection
+  );
+
+  if (prompt.includes(TEMPLATE_TOKEN) || prompt.includes(PRE_GATHERED_EVIDENCE_TOKEN)) {
+    throw new PromptBuildError('Generated prompt still contains template token');
   }
 
   return prompt;

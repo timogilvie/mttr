@@ -1,12 +1,23 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as investigateStage from '../stages/investigate.js';
 import { callOpenRouterWithTools } from '../llm/toolLoop.js';
+import { discoverLogGroupsTool, queryLogsTool } from '../tools/cloudwatchLogs.js';
 import type { Config } from '../config.js';
 import type { StageInput, ClassificationResult, InvestigationResult } from '../types.js';
 
 vi.mock('../llm/toolLoop.js');
+vi.mock('../tools/cloudwatchLogs.js', () => ({
+  discoverLogGroupsTool: {
+    handler: vi.fn(),
+  },
+  queryLogsTool: {
+    handler: vi.fn(),
+  },
+}));
 
 const mockLoop = vi.mocked(callOpenRouterWithTools);
+const mockDiscoverLogGroups = vi.mocked(discoverLogGroupsTool.handler);
+const mockQueryLogs = vi.mocked(queryLogsTool.handler);
 
 const mockConfig: Config = {
   openrouter: {
@@ -81,6 +92,12 @@ const classificationWithFinding: ClassificationResult = {
 describe('investigate stage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockDiscoverLogGroups.mockResolvedValue(
+      'Found 1 candidate log group(s):\nlogGroupName=/ecs/hokusai-api-development'
+    );
+    mockQueryLogs.mockResolvedValue(
+      'Query returned 1 row(s):\nstatus=401, path=/api/probe, requests=12'
+    );
   });
 
   it('short-circuits on empty classification with no LLM call', async () => {
@@ -115,9 +132,55 @@ describe('investigate stage', () => {
 
     expect(result.status).toBe('success');
     expect(mockLoop).toHaveBeenCalledTimes(1);
+    expect(mockDiscoverLogGroups).toHaveBeenCalledWith(
+      { service_name: 'data-pipeline-api', limit: 5 },
+      expect.objectContaining({ region: 'us-east-1' })
+    );
+    expect(mockQueryLogs).toHaveBeenCalledWith(
+      expect.objectContaining({ log_group: '/ecs/hokusai-api-development' }),
+      expect.objectContaining({ region: 'us-east-1' })
+    );
+    expect(mockLoop.mock.calls[0]![0].prompt).toContain('Pre-gathered Tool Evidence');
+    expect(mockLoop.mock.calls[0]![0].prompt).toContain('standard 4xx/auth breakdown');
     const data = result.data as InvestigationResult;
     expect(data.overall_assessment).toBe('POSSIBLE_INCIDENT');
     expect(data.overall_severity).toBe('MEDIUM');
+  });
+
+  it('pre-gathers warning samples for warning findings', async () => {
+    mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+    const warningClassification: ClassificationResult = {
+      summary: 'Warnings to investigate.',
+      overall_severity: 'LOW',
+      incidents: [],
+      findings: [
+        {
+          title: 'High Warning Count in auth-service',
+          classification: 'OBSERVABILITY_FAILURE',
+          severity: 'LOW',
+          confidence: 0.6,
+          affected_services: ['auth-service'],
+          evidence: ['65 warnings in recent logs.'],
+          reason_not_incident: 'Warnings do not indicate a specific actionable incident.',
+        },
+      ],
+    };
+
+    const result = await investigateStage.run(mockInput, mockConfig, warningClassification);
+
+    expect(result.status).toBe('success');
+    expect(mockDiscoverLogGroups).toHaveBeenCalledWith(
+      { service_name: 'auth-service', limit: 5 },
+      expect.objectContaining({ region: 'us-east-1' })
+    );
+    expect(mockQueryLogs).toHaveBeenCalledWith(
+      expect.objectContaining({
+        log_group: '/ecs/hokusai-api-development',
+        filter_or_query: expect.stringContaining('WARN'),
+      }),
+      expect.objectContaining({ region: 'us-east-1' })
+    );
+    expect(mockLoop.mock.calls[0]![0].prompt).toContain('standard warning sample');
   });
 
   it('strips markdown fences from the response', async () => {

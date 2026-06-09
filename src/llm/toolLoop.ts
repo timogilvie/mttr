@@ -213,11 +213,15 @@ export async function callOpenRouterWithTools(opts: ToolLoopOptions): Promise<To
             };
           }
           toolCalls += 1;
+          console.log(`[ToolLoop] Calling tool ${call.function.name}`);
           const content = await dispatchToolCall(
             call.function.name,
             call.function.arguments,
             opts.toolContext,
             opts.tools
+          );
+          console.log(
+            `[ToolLoop] Tool ${call.function.name} ${content.startsWith('Error:') ? 'failed' : 'succeeded'}`
           );
           return { id: call.id, content, failed: content.startsWith('Error:') };
         }
