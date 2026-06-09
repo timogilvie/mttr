@@ -3,3 +3,6 @@ dist
 .env
 .DS_Store
 *.log
+.mttr-state.json
+.wavemill-config.json
+.wavemill/

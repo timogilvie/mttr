@@ -1,11 +1,12 @@
 import type { ToolDefinition, ToolContext } from './types.js';
-import { queryLogsTool } from './cloudwatchLogs.js';
+import { discoverLogGroupsTool, queryLogsTool } from './cloudwatchLogs.js';
 import { metricsAndAlarmsTool } from './cloudwatchMetrics.js';
 
 /**
  * Built-in read-only tools available to the Investigate stage.
  */
 const BUILTIN_TOOLS: ToolDefinition[] = [
+  discoverLogGroupsTool as ToolDefinition,
   queryLogsTool as ToolDefinition,
   metricsAndAlarmsTool as ToolDefinition,
 ];

@@ -1,11 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   CloudWatchLogsClient,
+  DescribeLogGroupsCommand,
   StartQueryCommand,
   GetQueryResultsCommand,
   StopQueryCommand,
 } from '@aws-sdk/client-cloudwatch-logs';
-import { queryLogsTool, CloudWatchLogsToolError } from '../../tools/cloudwatchLogs.js';
+import {
+  discoverLogGroupsTool,
+  queryLogsTool,
+  CloudWatchLogsToolError,
+} from '../../tools/cloudwatchLogs.js';
 import type { ToolContext } from '../../tools/types.js';
 
 vi.mock('@aws-sdk/client-cloudwatch-logs', async () => {
@@ -120,5 +125,75 @@ describe('cloudwatchLogs query_logs', () => {
       false
     );
     expect(queryLogsTool.argsSchema.safeParse(validArgs).success).toBe(true);
+  });
+});
+
+describe('cloudwatchLogs discover_log_groups', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns candidate log groups containing the service name', async () => {
+    const send = vi.fn().mockResolvedValueOnce({
+      logGroups: [
+        { logGroupName: '/aws/lambda/other-service', storedBytes: 10 },
+        {
+          logGroupName: '/aws/ecs/data-pipeline-api',
+          creationTime: Date.parse('2026-06-09T12:00:00Z'),
+          storedBytes: 2048,
+        },
+      ],
+    });
+    mockClient(send);
+
+    const result = await discoverLogGroupsTool.handler({ service_name: 'data-pipeline-api' }, ctx);
+
+    expect(result).toContain('Found 1 candidate');
+    expect(result).toContain('/aws/ecs/data-pipeline-api');
+    expect(result).toContain('storedBytes=2048');
+    expect(send.mock.calls[0]?.[0]).toBeInstanceOf(DescribeLogGroupsCommand);
+  });
+
+  it('paginates until it finds enough matches', async () => {
+    const send = vi
+      .fn()
+      .mockResolvedValueOnce({
+        logGroups: [{ logGroupName: '/aws/ecs/unrelated' }],
+        nextToken: 'page-2',
+      })
+      .mockResolvedValueOnce({
+        logGroups: [
+          { logGroupName: '/aws/ecs/data-pipeline-api/access' },
+          { logGroupName: '/aws/ecs/data-pipeline-api/app' },
+        ],
+      });
+    mockClient(send);
+
+    const result = await discoverLogGroupsTool.handler(
+      { service_name: 'data-pipeline-api', limit: 2 },
+      ctx
+    );
+
+    expect(result).toContain('/aws/ecs/data-pipeline-api/access');
+    expect(result).toContain('/aws/ecs/data-pipeline-api/app');
+    expect(send).toHaveBeenCalledTimes(2);
+  });
+
+  it('reports no matching log groups clearly', async () => {
+    const send = vi.fn().mockResolvedValueOnce({
+      logGroups: [{ logGroupName: '/aws/ecs/other-service' }],
+    });
+    mockClient(send);
+
+    const result = await discoverLogGroupsTool.handler({ service_name: 'data-pipeline-api' }, ctx);
+
+    expect(result).toContain('No CloudWatch log groups found');
+  });
+
+  it('validates discovery arguments via argsSchema', () => {
+    expect(discoverLogGroupsTool.argsSchema.safeParse({ service_name: '' }).success).toBe(false);
+    expect(
+      discoverLogGroupsTool.argsSchema.safeParse({ service_name: 'data-pipeline-api' }).success
+    ).toBe(true);
   });
 });
