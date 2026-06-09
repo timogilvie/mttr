@@ -64,9 +64,16 @@ type InvestigationItem =
   | { id: string; kind: 'incident'; item: Incident }
   | { id: string; kind: 'finding'; item: Finding };
 
+interface CandidateLogGroup {
+  name: string;
+  storedBytes?: number;
+}
+
+const MAX_STANDARD_LOG_GROUPS = 2;
+
 const FOUR_XX_QUERY = `fields @timestamp, @message, @logStream
-| filter @message like / 4[0-9][0-9] / or @message like /Unauthorized|Forbidden|unauthorized|forbidden|authentication|authorization|token|credential|signature/
 | parse @message /"(?<method>\\S+) (?<path>\\S+) HTTP\\/[^"]+" (?<status>\\d{3})/
+| filter status like /^4/
 | stats count(*) as requests by status, path
 | sort requests desc
 | limit 25`;
@@ -103,8 +110,25 @@ function needsWarningDrilldown(text: string): boolean {
   return /warn|warning/.test(text);
 }
 
-function extractFirstLogGroup(discoveryResult: string): string | null {
-  return discoveryResult.match(/^logGroupName=([^,\n]+)/m)?.[1] ?? null;
+function extractLogGroups(discoveryResult: string): CandidateLogGroup[] {
+  return discoveryResult
+    .split('\n')
+    .map((line) => {
+      const name = line.match(/^logGroupName=([^,\n]+)/)?.[1];
+      if (!name) {
+        return null;
+      }
+      const storedBytesText = line.match(/\bstoredBytes=(\d+)/)?.[1];
+      return storedBytesText === undefined ? { name } : { name, storedBytes: Number(storedBytesText) };
+    })
+    .filter((group): group is CandidateLogGroup => group !== null);
+}
+
+function selectStandardLogGroups(discoveryResult: string): string[] {
+  return extractLogGroups(discoveryResult)
+    .filter((group) => group.storedBytes === undefined || group.storedBytes > 0)
+    .slice(0, MAX_STANDARD_LOG_GROUPS)
+    .map((group) => group.name);
 }
 
 async function runEvidenceTool(label: string, action: () => Promise<string>): Promise<string> {
@@ -140,45 +164,47 @@ async function gatherStandardEvidence(
       );
       sections.push(discovery);
 
-      const logGroup = extractFirstLogGroup(discovery);
-      if (!logGroup) {
+      const logGroups = selectStandardLogGroups(discovery);
+      if (logGroups.length === 0) {
         continue;
       }
 
-      if (shouldQuery4xx) {
-        sections.push(
-          await runEvidenceTool(
-            `### ${id} ${kind}: standard 4xx/auth breakdown on ${logGroup}`,
-            () =>
-              queryLogsTool.handler(
-                {
-                  log_group: logGroup,
-                  filter_or_query: FOUR_XX_QUERY,
-                  lookback_minutes: ctx.defaultLookbackMinutes,
-                  limit: 100,
-                },
-                ctx
-              )
-          )
-        );
-      }
+      for (const logGroup of logGroups) {
+        if (shouldQuery4xx) {
+          sections.push(
+            await runEvidenceTool(
+              `### ${id} ${kind}: standard 4xx/auth breakdown on ${logGroup} (${ctx.maxLookbackMinutes} minute lookback)`,
+              () =>
+                queryLogsTool.handler(
+                  {
+                    log_group: logGroup,
+                    filter_or_query: FOUR_XX_QUERY,
+                    lookback_minutes: ctx.maxLookbackMinutes,
+                    limit: 100,
+                  },
+                  ctx
+                )
+            )
+          );
+        }
 
-      if (shouldQueryWarnings) {
-        sections.push(
-          await runEvidenceTool(
-            `### ${id} ${kind}: standard warning sample on ${logGroup}`,
-            () =>
-              queryLogsTool.handler(
-                {
-                  log_group: logGroup,
-                  filter_or_query: WARNING_QUERY,
-                  lookback_minutes: ctx.defaultLookbackMinutes,
-                  limit: 100,
-                },
-                ctx
-              )
-          )
-        );
+        if (shouldQueryWarnings) {
+          sections.push(
+            await runEvidenceTool(
+              `### ${id} ${kind}: standard warning sample on ${logGroup} (${ctx.maxLookbackMinutes} minute lookback)`,
+              () =>
+                queryLogsTool.handler(
+                  {
+                    log_group: logGroup,
+                    filter_or_query: WARNING_QUERY,
+                    lookback_minutes: ctx.maxLookbackMinutes,
+                    limit: 100,
+                  },
+                  ctx
+                )
+            )
+          );
+        }
       }
     }
   }
