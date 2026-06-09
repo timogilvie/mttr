@@ -1,9 +1,11 @@
 import {
   CloudWatchLogsClient,
+  DescribeLogGroupsCommand,
   StartQueryCommand,
   GetQueryResultsCommand,
   StopQueryCommand,
   type ResultField,
+  type LogGroup,
 } from '@aws-sdk/client-cloudwatch-logs';
 import { z } from 'zod';
 import type { ToolContext, ToolDefinition } from './types.js';
@@ -19,6 +21,9 @@ export class CloudWatchLogsToolError extends Error {
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 1000;
+const DEFAULT_DISCOVERY_LIMIT = 10;
+const MAX_DISCOVERY_LIMIT = 50;
+const MAX_DISCOVERY_PAGES = 20;
 const POLL_INTERVAL_MS = 500;
 
 const argsSchema = z.object({
@@ -29,6 +34,13 @@ const argsSchema = z.object({
 });
 
 type QueryLogsArgs = z.infer<typeof argsSchema>;
+
+const discoverArgsSchema = z.object({
+  service_name: z.string().min(1),
+  limit: z.number().optional(),
+});
+
+type DiscoverLogGroupsArgs = z.infer<typeof discoverArgsSchema>;
 
 const parametersJsonSchema = {
   type: 'object',
@@ -54,6 +66,22 @@ const parametersJsonSchema = {
   required: ['log_group', 'filter_or_query'],
 } as const;
 
+const discoverParametersJsonSchema = {
+  type: 'object',
+  properties: {
+    service_name: {
+      type: 'string',
+      description:
+        'Service name or distinctive substring to find in CloudWatch Logs log group names.',
+    },
+    limit: {
+      type: 'number',
+      description: `Max log groups to return (default ${DEFAULT_DISCOVERY_LIMIT}, capped at ${MAX_DISCOVERY_LIMIT}).`,
+    },
+  },
+  required: ['service_name'],
+} as const;
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 function formatRows(rows: ResultField[][]): string {
@@ -67,6 +95,75 @@ function formatRows(rows: ResultField[][]): string {
       .join(', ')
   );
   return `Query returned ${rows.length} row(s):\n${lines.join('\n')}`;
+}
+
+function formatLogGroups(serviceName: string, groups: LogGroup[]): string {
+  if (groups.length === 0) {
+    return `No CloudWatch log groups found containing "${serviceName}".`;
+  }
+
+  const lines = groups.map((group) => {
+    const parts = [`logGroupName=${group.logGroupName ?? 'unknown'}`];
+    if (group.creationTime) {
+      parts.push(`created=${new Date(group.creationTime).toISOString()}`);
+    }
+    if (group.storedBytes !== undefined) {
+      parts.push(`storedBytes=${group.storedBytes}`);
+    }
+    return parts.join(', ');
+  });
+
+  return `Found ${groups.length} candidate log group(s) containing "${serviceName}":\n${lines.join('\n')}`;
+}
+
+async function discoverHandler(args: DiscoverLogGroupsArgs, ctx: ToolContext): Promise<string> {
+  const serviceName = args.service_name.toLowerCase();
+  const limit =
+    args.limit && args.limit > 0
+      ? Math.min(Math.floor(args.limit), MAX_DISCOVERY_LIMIT)
+      : DEFAULT_DISCOVERY_LIMIT;
+
+  const client = new CloudWatchLogsClient({
+    region: ctx.region,
+    ...awsRetryConfig(ctx.maxAttempts),
+  });
+
+  try {
+    const matches: LogGroup[] = [];
+    let nextToken: string | undefined;
+    let pages = 0;
+
+    do {
+      const response = await client.send(
+        new DescribeLogGroupsCommand({
+          nextToken,
+          limit: 50,
+        })
+      );
+
+      for (const group of response.logGroups ?? []) {
+        const name = group.logGroupName ?? '';
+        if (name.toLowerCase().includes(serviceName)) {
+          matches.push(group);
+          if (matches.length >= limit) {
+            return formatLogGroups(args.service_name, matches);
+          }
+        }
+      }
+
+      nextToken = response.nextToken;
+      pages += 1;
+    } while (nextToken && pages < MAX_DISCOVERY_PAGES);
+
+    return formatLogGroups(args.service_name, matches);
+  } catch (error) {
+    throw new CloudWatchLogsToolError(
+      `discover_log_groups failed: ${error instanceof Error ? error.message : String(error)}`,
+      error
+    );
+  } finally {
+    client.destroy();
+  }
 }
 
 async function handler(args: QueryLogsArgs, ctx: ToolContext): Promise<string> {
@@ -138,4 +235,13 @@ export const queryLogsTool: ToolDefinition<QueryLogsArgs> = {
   parametersJsonSchema,
   argsSchema,
   handler,
+};
+
+export const discoverLogGroupsTool: ToolDefinition<DiscoverLogGroupsArgs> = {
+  name: 'discover_log_groups',
+  description:
+    'Read-only: find candidate CloudWatch log groups whose names contain a service name. Use before query_logs when Step 1 names a service but not a log group.',
+  parametersJsonSchema: discoverParametersJsonSchema,
+  argsSchema: discoverArgsSchema,
+  handler: discoverHandler,
 };

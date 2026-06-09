@@ -44,8 +44,18 @@ describe('investigatePrompt', () => {
   it('describes the available read-only tools', () => {
     const prompt = buildInvestigatePrompt(sampleStep1);
 
+    expect(prompt).toContain('discover_log_groups');
     expect(prompt).toContain('query_logs');
     expect(prompt).toContain('get_metrics_and_alarms');
+  });
+
+  it('instructs active log drill-down for high 4xx auth findings', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('high 4xx rate or AUTH_FAILURE');
+    expect(prompt).toContain('break down 4xx responses by status code');
+    expect(prompt).toContain('unauthorized');
+    expect(prompt).toContain('forbidden');
   });
 
   it('encodes the output schema enums and mitigation gate', () => {
