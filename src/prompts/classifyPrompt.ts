@@ -75,6 +75,9 @@ Service unavailable, no healthy tasks, sustained 5xx errors, or major confirmed 
 * Do not infer root cause unless the report directly supports it.
 * Multiple incidents may be created if signals are unrelated.
 * Related signals should be grouped into one incident.
+* Any alarm listed in ALARM state is an actionable incident. Include the alarm name in signals.alarms and investigate it even if ECS task counts look healthy.
+* Any non-zero ALB 5xx count is an actionable incident. Classify it as APPLICATION_ERROR unless the report directly supports a more specific classification.
+* A detector liveness metric with zero datapoints is an actionable OBSERVABILITY_FAILURE incident, not merely a finding. Zero detector event values can be normal; zero liveness datapoints is not.
 * Missing metrics, alarms in INSUFFICIENT_DATA, or inconsistent telemetry may indicate OBSERVABILITY_FAILURE.
 * High 4xx rates may indicate auth issues, client misuse, integration drift, or expected denied traffic. Do not assume auth failure unless supported by logs or alarms.
 * Healthy ECS task counts and zero 5xx errors should lower severity.

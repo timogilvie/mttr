@@ -42,4 +42,12 @@ describe('classifyPrompt', () => {
     expect(prompt).toContain('HIGH:');
     expect(prompt).toContain('CRITICAL:');
   });
+
+  it('requires hard health signals to be classified as incidents', () => {
+    const prompt = buildClassifyPrompt(sampleReport);
+
+    expect(prompt).toContain('Any alarm listed in ALARM state is an actionable incident');
+    expect(prompt).toContain('Any non-zero ALB 5xx count is an actionable incident');
+    expect(prompt).toContain('zero liveness datapoints is not');
+  });
 });
