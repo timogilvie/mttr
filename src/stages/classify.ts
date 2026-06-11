@@ -5,6 +5,7 @@ import { buildClassifyPrompt } from '../prompts/classifyPrompt.js';
 import { callOpenRouter } from '../llm/openrouter.js';
 import { parseClassification } from '../validation/classificationSchema.js';
 import { stripMarkdownFences } from '../llm/json.js';
+import { enforceMandatoryIncidents } from '../report/mandatoryIncidents.js';
 
 async function attemptParse(
   responseText: string,
@@ -80,7 +81,7 @@ async function classifyReport(report: string, config: Config, timestamp: string)
     stage: 'Classify',
     status: 'success',
     timestamp,
-    data: classificationResult,
+    data: enforceMandatoryIncidents(classificationResult, report),
   };
 }
 

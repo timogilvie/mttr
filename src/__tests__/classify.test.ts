@@ -140,4 +140,65 @@ describe('classify stage', () => {
     const data = result.data as { summary: string };
     expect(data.summary).toContain('Classification failed');
   });
+
+  it('adds mandatory incidents when the LLM ignores active alarms, ALB 5xx, and detector liveness loss', async () => {
+    const { fetchReport } = await import('../report/fetchReport.js');
+    const { callOpenRouter } = await import('../llm/openrouter.js');
+
+    vi.mocked(fetchReport).mockResolvedValue(`# Hokusai Service Health Report
+
+## Service Details
+
+### auth-service
+
+| Alarm | State |
+| --- | --- |
+| \`hokusai-auth-development-task-health\` | \`ALARM\` |
+
+### data-pipeline-api
+
+| ALB target | Requests | 2xx | 4xx | 5xx | Avg latency |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| \`hokusai-reg-api-development\` | 56 | 5 | 28 | 23 | 0.244s |
+
+### deltaone-anomaly-detection
+
+> No datapoints from the detector's liveness metric in this window.
+`);
+    vi.mocked(callOpenRouter).mockResolvedValue(
+      JSON.stringify({
+        summary: 'No actionable incidents detected.',
+        overall_severity: 'NONE',
+        incidents: [],
+        findings: [],
+      })
+    );
+
+    const result = await classifyStage.run(mockInput, mockConfig);
+
+    expect(result.status).toBe('success');
+    const data = result.data as {
+      overall_severity: string;
+      incidents: Array<{ title: string; classification: string; severity: string; signals: { alarms: string[] } }>;
+    };
+
+    expect(data.overall_severity).toBe('HIGH');
+    expect(data.incidents).toHaveLength(3);
+    expect(data.incidents.map((incident) => incident.title)).toEqual(
+      expect.arrayContaining([
+        'Active alarm for auth-service: hokusai-auth-development-task-health',
+        'ALB 5xx responses for data-pipeline-api',
+        'No detector liveness datapoints for deltaone-anomaly-detection',
+      ])
+    );
+    expect(data.incidents.find((incident) => incident.title.includes('auth-service'))?.signals.alarms).toEqual([
+      'hokusai-auth-development-task-health',
+    ]);
+    expect(data.incidents.find((incident) => incident.title.includes('data-pipeline-api'))?.classification).toBe(
+      'APPLICATION_ERROR'
+    );
+    expect(data.incidents.find((incident) => incident.title.includes('deltaone'))?.classification).toBe(
+      'OBSERVABILITY_FAILURE'
+    );
+  });
 });
