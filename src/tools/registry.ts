@@ -1,6 +1,8 @@
 import type { ToolDefinition, ToolContext } from './types.js';
 import { discoverLogGroupsTool, queryLogsTool } from './cloudwatchLogs.js';
 import { metricsAndAlarmsTool } from './cloudwatchMetrics.js';
+import { albAccessLogsTool } from './albAccessLogs.js';
+import { ecsServiceEventsTool } from './ecs.js';
 
 /**
  * Built-in read-only tools available to the Investigate stage.
@@ -9,6 +11,8 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
   discoverLogGroupsTool as ToolDefinition,
   queryLogsTool as ToolDefinition,
   metricsAndAlarmsTool as ToolDefinition,
+  albAccessLogsTool as ToolDefinition,
+  ecsServiceEventsTool as ToolDefinition,
 ];
 
 export function getTools(): ToolDefinition[] {

@@ -10,6 +10,8 @@ import {
 import { z } from 'zod';
 import type { ToolContext, ToolDefinition } from './types.js';
 import { resolveToolTimeRange } from './types.js';
+import { serviceSearchTerms } from './serviceNames.js';
+import { resolveServiceLogGroups, type ServiceLogGroup } from './ecs.js';
 import { awsRetryConfig } from '../util/awsRetry.js';
 
 export class CloudWatchLogsToolError extends Error {
@@ -25,17 +27,6 @@ const DEFAULT_DISCOVERY_LIMIT = 10;
 const MAX_DISCOVERY_LIMIT = 50;
 const MAX_DISCOVERY_PAGES = 20;
 const POLL_INTERVAL_MS = 500;
-const GENERIC_SERVICE_TOKENS = new Set([
-  'app',
-  'application',
-  'backend',
-  'data',
-  'development',
-  'pipeline',
-  'prod',
-  'production',
-  'service',
-]);
 
 const argsSchema = z.object({
   log_group: z.string().min(1),
@@ -119,36 +110,46 @@ function formatRows(rows: ResultField[][]): string {
   return `Query returned ${rows.length} row(s):\n${lines.join('\n')}`;
 }
 
-function discoveryTerms(serviceName: string): string[] {
-  const normalized = serviceName.toLowerCase();
-  const tokens = normalized
-    .split(/[^a-z0-9]+/)
-    .map((token) => token.trim())
-    .filter((token) => token.length >= 3 && !GENERIC_SERVICE_TOKENS.has(token));
-  return [...new Set([normalized, ...tokens])];
-}
-
 function formatLogGroups(
   serviceName: string,
   groups: LogGroup[],
-  searchedTerms: string[] = [serviceName]
+  searchedTerms: string[] = [serviceName],
+  ecsResolved: ServiceLogGroup[] = []
 ): string {
-  if (groups.length === 0) {
-    return `No CloudWatch log groups found for "${serviceName}" using terms: ${searchedTerms.join(', ')}.`;
+  const ecsNames = new Set(ecsResolved.map((resolved) => resolved.logGroup));
+  const ecsLines = ecsResolved.map(
+    (resolved) =>
+      `logGroupName=${resolved.logGroup}, source=ecs-task-definition (service ${resolved.serviceName}, container ${resolved.containerName})`
+  );
+  const nameLines = groups
+    .filter((group) => !ecsNames.has(group.logGroupName ?? ''))
+    .map((group) => {
+      const parts = [`logGroupName=${group.logGroupName ?? 'unknown'}`];
+      if (group.creationTime) {
+        parts.push(`created=${new Date(group.creationTime).toISOString()}`);
+      }
+      if (group.storedBytes !== undefined) {
+        parts.push(`storedBytes=${group.storedBytes}`);
+      }
+      return parts.join(', ');
+    });
+
+  if (ecsLines.length === 0 && nameLines.length === 0) {
+    return `No CloudWatch log groups found for "${serviceName}" using terms: ${searchedTerms.join(', ')}, and no matching ECS service declares an awslogs log group.`;
   }
 
-  const lines = groups.map((group) => {
-    const parts = [`logGroupName=${group.logGroupName ?? 'unknown'}`];
-    if (group.creationTime) {
-      parts.push(`created=${new Date(group.creationTime).toISOString()}`);
-    }
-    if (group.storedBytes !== undefined) {
-      parts.push(`storedBytes=${group.storedBytes}`);
-    }
-    return parts.join(', ');
-  });
-
-  return `Found ${groups.length} candidate log group(s) for "${serviceName}" using terms: ${searchedTerms.join(', ')}:\n${lines.join('\n')}`;
+  const sections: string[] = [];
+  if (ecsLines.length > 0) {
+    sections.push(
+      `Authoritative log group(s) for "${serviceName}" resolved from ECS task definitions:\n${ecsLines.join('\n')}`
+    );
+  }
+  if (nameLines.length > 0) {
+    sections.push(
+      `Found ${nameLines.length} candidate log group(s) for "${serviceName}" by name match using terms: ${searchedTerms.join(', ')}:\n${nameLines.join('\n')}`
+    );
+  }
+  return sections.join('\n');
 }
 
 function scoreLogGroup(group: LogGroup, terms: string[]): number {
@@ -174,11 +175,22 @@ function scoreLogGroup(group: LogGroup, terms: string[]): number {
 }
 
 async function discoverHandler(args: DiscoverLogGroupsArgs, ctx: ToolContext): Promise<string> {
-  const terms = discoveryTerms(args.service_name);
+  const terms = serviceSearchTerms(args.service_name);
   const limit =
     args.limit && args.limit > 0
       ? Math.min(Math.floor(args.limit), MAX_DISCOVERY_LIMIT)
       : DEFAULT_DISCOVERY_LIMIT;
+
+  // Deterministic resolution first: the awslogs group declared by a matching
+  // ECS service's task definition. Degrades to name matching when ECS is
+  // unreachable or not permitted.
+  let ecsResolved: ServiceLogGroup[] = [];
+  let ecsError: string | undefined;
+  try {
+    ecsResolved = await resolveServiceLogGroups(args.service_name, ctx);
+  } catch (error) {
+    ecsError = error instanceof Error ? error.message : String(error);
+  }
 
   const client = new CloudWatchLogsClient({
     region: ctx.region,
@@ -206,24 +218,29 @@ async function discoverHandler(args: DiscoverLogGroupsArgs, ctx: ToolContext): P
           seen.add(name);
           matches.push(group);
           if (matches.length >= limit) {
-            return formatLogGroups(
-              args.service_name,
-              [...matches].sort((a, b) => scoreLogGroup(b, terms) - scoreLogGroup(a, terms)),
-              terms
-            );
+            nextToken = undefined;
+            break;
           }
         }
+      }
+
+      if (matches.length >= limit) {
+        break;
       }
 
       nextToken = response.nextToken;
       pages += 1;
     } while (nextToken && pages < MAX_DISCOVERY_PAGES);
 
-    return formatLogGroups(
+    const formatted = formatLogGroups(
       args.service_name,
       [...matches].sort((a, b) => scoreLogGroup(b, terms) - scoreLogGroup(a, terms)),
-      terms
+      terms,
+      ecsResolved
     );
+    return ecsError === undefined
+      ? formatted
+      : `${formatted}\n(ECS-based resolution unavailable: ${ecsError})`;
   } catch (error) {
     throw new CloudWatchLogsToolError(
       `discover_log_groups failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -313,7 +330,7 @@ export const queryLogsTool: ToolDefinition<QueryLogsArgs> = {
 export const discoverLogGroupsTool: ToolDefinition<DiscoverLogGroupsArgs> = {
   name: 'discover_log_groups',
   description:
-    'Read-only: find candidate CloudWatch log groups whose names contain a service name. Use before query_logs when Step 1 names a service but not a log group.',
+    'Read-only: find CloudWatch log groups for a service, first by reading the awslogs configuration of matching ECS task definitions (authoritative), then by log group name match. Use before query_logs when Step 1 names a service but not a log group.',
   parametersJsonSchema: discoverParametersJsonSchema,
   argsSchema: discoverArgsSchema,
   handler: discoverHandler,

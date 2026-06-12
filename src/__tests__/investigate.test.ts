@@ -3,6 +3,8 @@ import * as investigateStage from '../stages/investigate.js';
 import { callOpenRouterWithTools } from '../llm/toolLoop.js';
 import { discoverLogGroupsTool, queryLogsTool } from '../tools/cloudwatchLogs.js';
 import { metricsAndAlarmsTool } from '../tools/cloudwatchMetrics.js';
+import { albAccessLogsTool } from '../tools/albAccessLogs.js';
+import { ecsServiceEventsTool } from '../tools/ecs.js';
 import type { Config } from '../config.js';
 import type { StageInput, ClassificationResult, InvestigationResult } from '../types.js';
 
@@ -20,11 +22,23 @@ vi.mock('../tools/cloudwatchMetrics.js', () => ({
     handler: vi.fn(),
   },
 }));
+vi.mock('../tools/albAccessLogs.js', () => ({
+  albAccessLogsTool: {
+    handler: vi.fn(),
+  },
+}));
+vi.mock('../tools/ecs.js', () => ({
+  ecsServiceEventsTool: {
+    handler: vi.fn(),
+  },
+}));
 
 const mockLoop = vi.mocked(callOpenRouterWithTools);
 const mockDiscoverLogGroups = vi.mocked(discoverLogGroupsTool.handler);
 const mockQueryLogs = vi.mocked(queryLogsTool.handler);
 const mockMetricsAndAlarms = vi.mocked(metricsAndAlarmsTool.handler);
+const mockAlbAccessLogs = vi.mocked(albAccessLogsTool.handler);
+const mockEcsServiceEvents = vi.mocked(ecsServiceEventsTool.handler);
 
 const mockConfig: Config = {
   openrouter: {
@@ -96,6 +110,52 @@ const classificationWithFinding: ClassificationResult = {
   ],
 };
 
+const fiveXxClassification: ClassificationResult = {
+  summary: 'ALB 5xx detected.',
+  overall_severity: 'HIGH',
+  report_context: {
+    window_start: '2026-06-05T11:35:04.881Z',
+    window_end: '2026-06-06T11:35:04.881Z',
+  },
+  incidents: [
+    {
+      incident_id: 'mandatory-alb-5xx-data-pipeline-api-0',
+      title: 'ALB 5xx responses for data-pipeline-api',
+      classification: 'APPLICATION_ERROR',
+      severity: 'HIGH',
+      confidence: 0.9,
+      affected_services: ['data-pipeline-api'],
+      evidence: ['Health report shows 10 ALB 5xx responses.'],
+      signals: {
+        alarms: [],
+        metrics: ['ALB 5xx responses: 10'],
+        logs: [],
+        cloudwatch_metrics: [
+          {
+            namespace: 'AWS/ApplicationELB',
+            metric_name: 'HTTPCode_Target_5XX_Count',
+            stat: 'Sum',
+            dimensions: [
+              { name: 'LoadBalancer', value: 'app/hokusai-reg-api-development/def456' },
+              { name: 'TargetGroup', value: 'targetgroup/hokusai-reg-api-development/abc123' },
+            ],
+          },
+        ],
+      },
+      suspected_causes: ['Application errors.'],
+      investigation_plan: {
+        priority: 1,
+        estimated_user_impact: 'PARTIAL',
+        first_actions: [],
+        questions_to_answer: [],
+        suggested_cloudwatch_queries: [],
+      },
+      recommended_next_stage: 'INVESTIGATE',
+    },
+  ],
+  findings: [],
+};
+
 describe('investigate stage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -109,6 +169,12 @@ describe('investigate stage', () => {
     );
     mockMetricsAndAlarms.mockResolvedValue(
       'Metric datapoints (1):\n2026-06-06T10:00:00.000Z: Sum=10 Count'
+    );
+    mockAlbAccessLogs.mockResolvedValue(
+      'Breakdown by status and path:\n  elb_status=502 target_status=- POST /api/ingest: 7'
+    );
+    mockEcsServiceEvents.mockResolvedValue(
+      'Service data-pipeline-api (cluster hokusai-development): status=ACTIVE'
     );
   });
 
@@ -288,6 +354,69 @@ describe('investigate stage', () => {
       })
     );
     expect(mockLoop.mock.calls[0]![0].prompt).toContain('metric AWS/ApplicationELB/HTTPCode_Target_5XX_Count');
+  });
+
+  it('pre-gathers ALB access logs, ECS events, and a 5xx log breakdown for 5xx incidents, narrowed to the metric spike', async () => {
+    mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+    mockMetricsAndAlarms.mockResolvedValue(
+      'Metric datapoints (2):\n' +
+        '2026-06-05T14:18:00.000Z: Sum=2 Count\n' +
+        '2026-06-05T15:48:00.000Z: Sum=3 Count'
+    );
+
+    const result = await investigateStage.run(mockInput, mockConfig, fiveXxClassification);
+
+    expect(result.status).toBe('success');
+
+    // Spike window: first/last non-zero datapoint padded by 15 minutes.
+    const spikeWindow = {
+      start_time: '2026-06-05T14:03:00.000Z',
+      end_time: '2026-06-05T16:03:00.000Z',
+    };
+
+    expect(mockAlbAccessLogs).toHaveBeenCalledWith(
+      expect.objectContaining({
+        load_balancer: 'app/hokusai-reg-api-development/def456',
+        status_class: '5xx',
+        ...spikeWindow,
+      }),
+      expect.anything()
+    );
+    expect(mockEcsServiceEvents).toHaveBeenCalledWith(
+      expect.objectContaining({ service_name: 'data-pipeline-api', ...spikeWindow }),
+      expect.anything()
+    );
+    expect(mockQueryLogs).toHaveBeenCalledWith(
+      expect.objectContaining({
+        log_group: '/ecs/hokusai-api-development',
+        filter_or_query: expect.stringContaining('/^5/'),
+        ...spikeWindow,
+      }),
+      expect.anything()
+    );
+    expect(mockLoop.mock.calls[0]![0].prompt).toContain('ALB access-log 5xx breakdown');
+    expect(mockLoop.mock.calls[0]![0].prompt).toContain('ECS service events for data-pipeline-api');
+    expect(mockLoop.mock.calls[0]![0].prompt).toContain('narrowed to metric spike window');
+  });
+
+  it('falls back to the report window when no error-metric datapoints localize a spike', async () => {
+    mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+    mockMetricsAndAlarms.mockResolvedValue('No metric datapoints in the requested window.');
+
+    const result = await investigateStage.run(mockInput, mockConfig, fiveXxClassification);
+
+    expect(result.status).toBe('success');
+    expect(mockAlbAccessLogs).toHaveBeenCalledWith(
+      expect.objectContaining({
+        load_balancer: 'app/hokusai-reg-api-development/def456',
+        lookback_minutes: mockConfig.tools.maxLookbackMinutes,
+      }),
+      expect.anything()
+    );
+    expect(mockAlbAccessLogs).toHaveBeenCalledWith(
+      expect.not.objectContaining({ start_time: expect.anything() }),
+      expect.anything()
+    );
   });
 
   it('strips markdown fences from the response', async () => {

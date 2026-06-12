@@ -11,6 +11,8 @@ import { getTools } from '../tools/registry.js';
 import type { ToolContext } from '../tools/types.js';
 import { discoverLogGroupsTool, queryLogsTool } from '../tools/cloudwatchLogs.js';
 import { metricsAndAlarmsTool } from '../tools/cloudwatchMetrics.js';
+import { albAccessLogsTool } from '../tools/albAccessLogs.js';
+import { ecsServiceEventsTool } from '../tools/ecs.js';
 import { parseInvestigation } from '../validation/investigationSchema.js';
 import { stripMarkdownFences } from '../llm/json.js';
 import type { Finding, Incident, IncidentClassification } from '../types.js';
@@ -81,10 +83,56 @@ const FOUR_XX_QUERY = `fields @timestamp, @message, @logStream
 | sort requests desc
 | limit 25`;
 
+const FIVE_XX_QUERY = `fields @timestamp, @message, @logStream
+| parse @message /"(?<method>\\S+) (?<path>\\S+) HTTP\\/[^"]+" (?<status>\\d{3})/
+| filter status like /^5/
+| stats count(*) as requests by status, path
+| sort requests desc
+| limit 25`;
+
 const WARNING_QUERY = `fields @timestamp, @message, @logStream
 | filter @message like /WARN|Warning|WARNING|warning/
 | sort @timestamp desc
 | limit 25`;
+
+const ERROR_METRIC_PATTERN = /5xx|4xx|error|fault|failure/i;
+const SPIKE_PADDING_MS = 15 * 60 * 1000;
+
+interface SpikeWindow {
+  start: string;
+  end: string;
+}
+
+/**
+ * Narrow drilldown queries to the span of non-zero error-metric datapoints
+ * (padded by 15 minutes each side). Without this, queries over the full report
+ * window return mostly healthy traffic and drown out a short error spike.
+ */
+function extractSpikeWindow(errorMetricEvidence: string[]): SpikeWindow | null {
+  const times: number[] = [];
+  for (const section of errorMetricEvidence) {
+    for (const line of section.split('\n')) {
+      const match = line.match(
+        /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z): \w+=([\d.eE+-]+)/
+      );
+      if (!match || !match[1] || !match[2]) {
+        continue;
+      }
+      const value = Number(match[2]);
+      const timestamp = new Date(match[1]).getTime();
+      if (Number.isFinite(value) && value > 0 && !Number.isNaN(timestamp)) {
+        times.push(timestamp);
+      }
+    }
+  }
+  if (times.length === 0) {
+    return null;
+  }
+  return {
+    start: new Date(Math.min(...times) - SPIKE_PADDING_MS).toISOString(),
+    end: new Date(Math.max(...times) + SPIKE_PADDING_MS).toISOString(),
+  };
+}
 
 function allItems(classification: ClassificationResult): InvestigationItem[] {
   return [
@@ -107,6 +155,10 @@ function itemText(item: Incident | Finding): string {
 
 function needs4xxDrilldown(classification: IncidentClassification, text: string): boolean {
   return classification === 'AUTH_FAILURE' || /\b4xx\b|\b401\b|\b403\b|unauthorized|forbidden/.test(text);
+}
+
+function needs5xxDrilldown(classification: IncidentClassification, text: string): boolean {
+  return classification === 'APPLICATION_ERROR' || /\b5xx\b|\b50[0-9]\b|server error/.test(text);
 }
 
 function needsWarningDrilldown(text: string): boolean {
@@ -152,34 +204,75 @@ async function gatherStandardEvidence(
   for (const { id, kind, item } of allItems(classification)) {
     const text = itemText(item);
     const shouldQuery4xx = needs4xxDrilldown(item.classification, text);
+    const shouldQuery5xx = needs5xxDrilldown(item.classification, text);
     const shouldQueryWarnings = needsWarningDrilldown(text);
     const cloudwatchMetrics = 'signals' in item ? item.signals.cloudwatch_metrics ?? [] : [];
 
+    const errorMetricEvidence: string[] = [];
     for (const metric of cloudwatchMetrics) {
-      sections.push(
-        await runEvidenceTool(
-          `### ${id} ${kind}: metric ${metric.namespace}/${metric.metric_name}` +
-            (metric.label ? ` (${metric.label})` : ''),
-          () =>
-            metricsAndAlarmsTool.handler(
-              {
-                namespace: metric.namespace,
-                metric_name: metric.metric_name,
-                dimensions: metric.dimensions,
-                stat: metric.stat,
-              },
-              ctx
-            )
-        )
+      const evidence = await runEvidenceTool(
+        `### ${id} ${kind}: metric ${metric.namespace}/${metric.metric_name}` +
+          (metric.label ? ` (${metric.label})` : ''),
+        () =>
+          metricsAndAlarmsTool.handler(
+            {
+              namespace: metric.namespace,
+              metric_name: metric.metric_name,
+              dimensions: metric.dimensions,
+              stat: metric.stat,
+            },
+            ctx
+          )
       );
+      sections.push(evidence);
+      if (ERROR_METRIC_PATTERN.test(metric.metric_name)) {
+        errorMetricEvidence.push(evidence);
+      }
     }
 
-    if (!shouldQuery4xx && !shouldQueryWarnings) {
+    const spike = extractSpikeWindow(errorMetricEvidence);
+    const windowArgs = spike
+      ? { start_time: spike.start, end_time: spike.end }
+      : { lookback_minutes: ctx.maxLookbackMinutes };
+    const windowLabel = spike
+      ? `narrowed to metric spike window ${spike.start}..${spike.end}`
+      : `report window or ${ctx.maxLookbackMinutes} minute lookback`;
+
+    if (shouldQuery5xx) {
+      const albDimension = cloudwatchMetrics
+        .filter((metric) => metric.namespace === 'AWS/ApplicationELB')
+        .flatMap((metric) => metric.dimensions ?? [])
+        .find((dimension) => dimension.name === 'LoadBalancer')?.value;
+
+      if (albDimension) {
+        sections.push(
+          await runEvidenceTool(
+            `### ${id} ${kind}: ALB access-log 5xx breakdown for ${albDimension} (${windowLabel})`,
+            () =>
+              albAccessLogsTool.handler(
+                { load_balancer: albDimension, status_class: '5xx', ...windowArgs },
+                ctx
+              )
+          )
+        );
+      }
+    }
+
+    if (!shouldQuery4xx && !shouldQuery5xx && !shouldQueryWarnings) {
       continue;
     }
 
     for (const service of item.affected_services) {
       console.log(`[Investigate] Pre-gathering standard evidence for ${id} (${service})`);
+
+      if (shouldQuery5xx) {
+        sections.push(
+          await runEvidenceTool(
+            `### ${id} ${kind}: ECS service events for ${service} (${windowLabel})`,
+            () => ecsServiceEventsTool.handler({ service_name: service, ...windowArgs }, ctx)
+          )
+        );
+      }
 
       const discovery = await runEvidenceTool(
         `### ${id} ${kind}: discover_log_groups(${service})`,
@@ -196,13 +289,31 @@ async function gatherStandardEvidence(
         if (shouldQuery4xx) {
           sections.push(
             await runEvidenceTool(
-              `### ${id} ${kind}: standard 4xx/auth breakdown on ${logGroup} (${ctx.maxLookbackMinutes} minute lookback)`,
+              `### ${id} ${kind}: standard 4xx/auth breakdown on ${logGroup} (${windowLabel})`,
               () =>
                 queryLogsTool.handler(
                   {
                     log_group: logGroup,
                     filter_or_query: FOUR_XX_QUERY,
-                    lookback_minutes: ctx.maxLookbackMinutes,
+                    ...windowArgs,
+                    limit: 100,
+                  },
+                  ctx
+                )
+            )
+          );
+        }
+
+        if (shouldQuery5xx) {
+          sections.push(
+            await runEvidenceTool(
+              `### ${id} ${kind}: standard 5xx breakdown on ${logGroup} (${windowLabel})`,
+              () =>
+                queryLogsTool.handler(
+                  {
+                    log_group: logGroup,
+                    filter_or_query: FIVE_XX_QUERY,
+                    ...windowArgs,
                     limit: 100,
                   },
                   ctx
@@ -214,13 +325,13 @@ async function gatherStandardEvidence(
         if (shouldQueryWarnings) {
           sections.push(
             await runEvidenceTool(
-              `### ${id} ${kind}: standard warning sample on ${logGroup} (${ctx.maxLookbackMinutes} minute lookback)`,
+              `### ${id} ${kind}: standard warning sample on ${logGroup} (${windowLabel})`,
               () =>
                 queryLogsTool.handler(
                   {
                     log_group: logGroup,
                     filter_or_query: WARNING_QUERY,
-                    lookback_minutes: ctx.maxLookbackMinutes,
+                    ...windowArgs,
                     limit: 100,
                   },
                   ctx

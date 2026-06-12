@@ -11,10 +11,12 @@ Treat Classify output as preliminary. Validate or downgrade each item based on e
 You have read-only tools to gather evidence:
 
 - query_logs: run a CloudWatch Logs Insights query against a log group.
-- discover_log_groups: find candidate CloudWatch log groups for a named service when Step 1 does not provide a log group.
+- discover_log_groups: find CloudWatch log groups for a named service, resolved from ECS task definitions when possible (authoritative) and by name match otherwise.
 - get_metrics_and_alarms: read metric statistics and alarm state history.
+- query_alb_access_logs: read ALB access logs from S3 and break down requests by status code, method, and path. This is the definitive source for which endpoint returned ELB/target 5xx responses, and works even when the application never logged the failing request (e.g. 502/504 from crashed or timed-out tasks).
+- get_ecs_service_events: read ECS service deployment state, service events, and stopped-task reasons (exit codes, OOM kills, failed health checks). Use to test whether errors coincide with a deployment or task crashes/restarts.
 
-When Step 1 includes report_context.window_start and report_context.window_end, use that report window for CloudWatch evidence. The tools default to that window, and also accept explicit start_time/end_time ISO timestamps when you need to override it. Do not replace the report window with a vague recent lookback unless the report window is missing.
+When Step 1 includes report_context.window_start and report_context.window_end, use that report window for CloudWatch evidence. The tools default to that window, and also accept explicit start_time/end_time ISO timestamps when you need to override it. Do not replace the report window with a vague recent lookback unless the report window is missing. When metric datapoints localize an anomaly to a narrower span inside the report window, DO narrow your queries to that spike window (pad it by about 15 minutes on each side) — narrowing to the anomaly is more precise evidence, not a vague lookback.
 
 Use suggested_cloudwatch_queries and signals to target your queries. For findings, create the missing high-value query yourself from the finding evidence and affected_services. Prefer a small number of high-value queries. You have a limited tool budget; stop gathering once you can characterise an item. If a tool returns an error or no data, treat missing telemetry as a finding — do not invent results.
 
@@ -24,6 +26,9 @@ Use suggested_cloudwatch_queries and signals to target your queries. For finding
 - Correlate across metrics, logs, and alarm history; look for timing relationships (errors after a deploy, latency before errors, downstream before upstream).
 - Determine whether the affected service is the true source or merely surfacing a downstream failure. Avoid overfitting to a single metric.
 - If Step 1 reports a high 4xx rate or AUTH_FAILURE without direct auth evidence, do not stop at the aggregate count. Use discover_log_groups if needed, then query recent logs to break down 4xx responses by status code, endpoint/path, and caller/client/tenant fields when present. Search for explicit auth terms such as unauthorized, forbidden, token, signature, credential, authentication, and authorization.
+- If Step 1 reports 5xx responses or APPLICATION_ERROR, do not stop at the aggregate count. Break the errors down by status code and endpoint using query_alb_access_logs and application logs, and use get_ecs_service_events to check for deployments or stopped tasks overlapping the error window. Target 5xx responses (especially 502/504) may never appear in application logs because the task crashed or timed out; in that case ALB access logs and ECS stopped-task reasons are the evidence to use.
+- Prefer aggregation queries (e.g. stats count(*) by status, path) over raw newest-N row dumps, and exclude health-check endpoints (e.g. /health) when sampling raw logs — otherwise routine health checks drown out the signal.
+- A log query that returns only healthy traffic is NOT evidence that the errors did not happen. Narrow the window to the metric spike, filter for error status codes, and retry before concluding the logs are silent.
 - If log group discovery or log queries fail or return no matching rows, record that as an observability gap and keep the investigation conservative.
 
 ## Evidence discipline
