@@ -13,6 +13,8 @@ import { discoverLogGroupsTool, queryLogsTool } from '../tools/cloudwatchLogs.js
 import { metricsAndAlarmsTool } from '../tools/cloudwatchMetrics.js';
 import { albAccessLogsTool } from '../tools/albAccessLogs.js';
 import { ecsServiceEventsTool } from '../tools/ecs.js';
+import { listMetricsTool } from '../tools/listMetrics.js';
+import { findAlarmsTool } from '../tools/alarms.js';
 import { parseInvestigation } from '../validation/investigationSchema.js';
 import { stripMarkdownFences } from '../llm/json.js';
 import type { Finding, Incident, IncidentClassification } from '../types.js';
@@ -95,8 +97,30 @@ const WARNING_QUERY = `fields @timestamp, @message, @logStream
 | sort @timestamp desc
 | limit 25`;
 
+// Raw error-context lines (exceptions, timeouts, dependency failures) around a
+// 5xx spike. The aggregate 5xx breakdown identifies WHICH endpoint failed; this
+// sample is what carries WHY (stack trace, dependency name, timeout message).
+const ERROR_CONTEXT_QUERY = `fields @timestamp, @message, @logStream
+| filter @message like /(?i)(error|exception|timeout|traceback|unavailable|refused|fatal)/
+| filter @message not like /\\/health/
+| sort @timestamp desc
+| limit 50`;
+
+// Newest raw lines regardless of level. For observability incidents this shows
+// whether the workload ran at all in the window: recent logs without metric
+// datapoints indicate emission failure; silent logs indicate stoppage.
+const RECENT_ACTIVITY_QUERY = `fields @timestamp, @message, @logStream
+| sort @timestamp desc
+| limit 25`;
+
 const ERROR_METRIC_PATTERN = /5xx|4xx|error|fault|failure/i;
 const SPIKE_PADDING_MS = 15 * 60 * 1000;
+
+// For zero-datapoint metrics the report window cannot answer "when did the
+// signal stop"; scan back this far before the window at a coarser period that
+// keeps the call under CloudWatch's 1440-datapoint cap.
+const OBSERVABILITY_METRIC_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
+const OBSERVABILITY_METRIC_PERIOD_SECONDS = 3600;
 
 interface SpikeWindow {
   start: string;
@@ -165,6 +189,33 @@ function needsWarningDrilldown(text: string): boolean {
   return /warn|warning/.test(text);
 }
 
+function needsObservabilityDrilldown(
+  classification: IncidentClassification,
+  text: string
+): boolean {
+  return (
+    classification === 'OBSERVABILITY_FAILURE' ||
+    /\b(?:no|zero|missing) datapoints?\b|liveness|missing metric|stopped (?:emitting|publishing|reporting)/.test(
+      text
+    )
+  );
+}
+
+function extendedMetricWindow(ctx: ToolContext): { start_time: string; end_time: string } | null {
+  if (!ctx.defaultStartTime || !ctx.defaultEndTime) {
+    return null;
+  }
+  const start = new Date(ctx.defaultStartTime).getTime();
+  const end = new Date(ctx.defaultEndTime).getTime();
+  if (Number.isNaN(start) || Number.isNaN(end)) {
+    return null;
+  }
+  return {
+    start_time: new Date(start - OBSERVABILITY_METRIC_LOOKBACK_MS).toISOString(),
+    end_time: new Date(end).toISOString(),
+  };
+}
+
 function extractLogGroups(discoveryResult: string): CandidateLogGroup[] {
   return discoveryResult
     .split('\n')
@@ -206,6 +257,7 @@ async function gatherStandardEvidence(
     const shouldQuery4xx = needs4xxDrilldown(item.classification, text);
     const shouldQuery5xx = needs5xxDrilldown(item.classification, text);
     const shouldQueryWarnings = needsWarningDrilldown(text);
+    const shouldQueryObservability = needsObservabilityDrilldown(item.classification, text);
     const cloudwatchMetrics = 'signals' in item ? item.signals.cloudwatch_metrics ?? [] : [];
 
     const errorMetricEvidence: string[] = [];
@@ -227,6 +279,29 @@ async function gatherStandardEvidence(
       sections.push(evidence);
       if (ERROR_METRIC_PATTERN.test(metric.metric_name)) {
         errorMetricEvidence.push(evidence);
+      }
+
+      if (shouldQueryObservability) {
+        const extendedWindow = extendedMetricWindow(ctx);
+        if (extendedWindow) {
+          sections.push(
+            await runEvidenceTool(
+              `### ${id} ${kind}: extended 14-day history for ${metric.namespace}/${metric.metric_name} (locates the last datapoint before the report window)`,
+              () =>
+                metricsAndAlarmsTool.handler(
+                  {
+                    namespace: metric.namespace,
+                    metric_name: metric.metric_name,
+                    dimensions: metric.dimensions,
+                    stat: metric.stat,
+                    period_seconds: OBSERVABILITY_METRIC_PERIOD_SECONDS,
+                    ...extendedWindow,
+                  },
+                  ctx
+                )
+            )
+          );
+        }
       }
     }
 
@@ -258,7 +333,7 @@ async function gatherStandardEvidence(
       }
     }
 
-    if (!shouldQuery4xx && !shouldQuery5xx && !shouldQueryWarnings) {
+    if (!shouldQuery4xx && !shouldQuery5xx && !shouldQueryWarnings && !shouldQueryObservability) {
       continue;
     }
 
@@ -270,6 +345,21 @@ async function gatherStandardEvidence(
           await runEvidenceTool(
             `### ${id} ${kind}: ECS service events for ${service} (${windowLabel})`,
             () => ecsServiceEventsTool.handler({ service_name: service, ...windowArgs }, ctx)
+          )
+        );
+      }
+
+      if (shouldQueryObservability) {
+        sections.push(
+          await runEvidenceTool(
+            `### ${id} ${kind}: metric discovery for ${service}`,
+            () => listMetricsTool.handler({ search: service }, ctx)
+          )
+        );
+        sections.push(
+          await runEvidenceTool(
+            `### ${id} ${kind}: alarm coverage for ${service}`,
+            () => findAlarmsTool.handler({ search: service }, ctx)
           )
         );
       }
@@ -320,6 +410,21 @@ async function gatherStandardEvidence(
                 )
             )
           );
+          sections.push(
+            await runEvidenceTool(
+              `### ${id} ${kind}: error-context sample on ${logGroup} (${windowLabel})`,
+              () =>
+                queryLogsTool.handler(
+                  {
+                    log_group: logGroup,
+                    filter_or_query: ERROR_CONTEXT_QUERY,
+                    ...windowArgs,
+                    limit: 50,
+                  },
+                  ctx
+                )
+            )
+          );
         }
 
         if (shouldQueryWarnings) {
@@ -333,6 +438,24 @@ async function gatherStandardEvidence(
                     filter_or_query: WARNING_QUERY,
                     ...windowArgs,
                     limit: 100,
+                  },
+                  ctx
+                )
+            )
+          );
+        }
+
+        if (shouldQueryObservability) {
+          sections.push(
+            await runEvidenceTool(
+              `### ${id} ${kind}: recent runtime activity sample on ${logGroup} (${windowLabel})`,
+              () =>
+                queryLogsTool.handler(
+                  {
+                    log_group: logGroup,
+                    filter_or_query: RECENT_ACTIVITY_QUERY,
+                    ...windowArgs,
+                    limit: 25,
                   },
                   ctx
                 )

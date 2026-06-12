@@ -3,6 +3,8 @@ import { discoverLogGroupsTool, queryLogsTool } from './cloudwatchLogs.js';
 import { metricsAndAlarmsTool } from './cloudwatchMetrics.js';
 import { albAccessLogsTool } from './albAccessLogs.js';
 import { ecsServiceEventsTool } from './ecs.js';
+import { listMetricsTool } from './listMetrics.js';
+import { findAlarmsTool } from './alarms.js';
 
 /**
  * Built-in read-only tools available to the Investigate stage.
@@ -13,6 +15,8 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
   metricsAndAlarmsTool as ToolDefinition,
   albAccessLogsTool as ToolDefinition,
   ecsServiceEventsTool as ToolDefinition,
+  listMetricsTool as ToolDefinition,
+  findAlarmsTool as ToolDefinition,
 ];
 
 export function getTools(): ToolDefinition[] {

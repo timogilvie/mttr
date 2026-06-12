@@ -18,7 +18,9 @@ export class CloudWatchMetricsToolError extends Error {
 }
 
 const STATISTICS = ['Average', 'Sum', 'Minimum', 'Maximum', 'SampleCount'] as const;
-const PERIOD_SECONDS = 300;
+const DEFAULT_PERIOD_SECONDS = 300;
+const MIN_PERIOD_SECONDS = 60;
+const MAX_PERIOD_SECONDS = 86400;
 const MAX_ALARM_HISTORY_ITEMS = 20;
 
 const argsSchema = z.object({
@@ -31,6 +33,7 @@ const argsSchema = z.object({
   start_time: z.string().optional(),
   end_time: z.string().optional(),
   lookback_minutes: z.number().optional(),
+  period_seconds: z.number().optional(),
   alarm_name: z.string().optional(),
 });
 
@@ -67,6 +70,11 @@ const parametersJsonSchema = {
     end_time: {
       type: 'string',
       description: 'Optional absolute query end time as an ISO timestamp. Must be paired with start_time.',
+    },
+    period_seconds: {
+      type: 'number',
+      description:
+        'Datapoint period in seconds (default 300). Use a larger period (e.g. 3600) when scanning ranges longer than a few days: CloudWatch returns at most 1440 datapoints per call.',
     },
     alarm_name: {
       type: 'string',
@@ -105,6 +113,22 @@ function formatAlarmHistory(items: AlarmHistoryItem[]): string {
   return `Alarm history (${items.length}):\n${lines.join('\n')}`;
 }
 
+/**
+ * Clamp a requested period to CloudWatch's bounds and round to a whole minute,
+ * which GetMetricStatistics requires for periods of 60s and above.
+ */
+function clampPeriod(requestedSeconds: number | undefined): number {
+  if (
+    requestedSeconds === undefined ||
+    !Number.isFinite(requestedSeconds) ||
+    requestedSeconds <= 0
+  ) {
+    return DEFAULT_PERIOD_SECONDS;
+  }
+  const rounded = Math.round(requestedSeconds / 60) * 60;
+  return Math.min(Math.max(rounded, MIN_PERIOD_SECONDS), MAX_PERIOD_SECONDS);
+}
+
 async function handler(args: MetricsArgs, ctx: ToolContext): Promise<string> {
   const stat = args.stat ?? 'Average';
   const { startTime, endTime } = resolveToolTimeRange(
@@ -127,7 +151,7 @@ async function handler(args: MetricsArgs, ctx: ToolContext): Promise<string> {
         Dimensions: args.dimensions?.map((d) => ({ Name: d.name, Value: d.value })),
         StartTime: startTime,
         EndTime: endTime,
-        Period: PERIOD_SECONDS,
+        Period: clampPeriod(args.period_seconds),
         Statistics: [stat],
       })
     );

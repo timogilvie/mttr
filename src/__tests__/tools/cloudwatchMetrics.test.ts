@@ -104,6 +104,21 @@ describe('cloudwatchMetrics get_metrics_and_alarms', () => {
     expect(command.input.EndTime?.toISOString()).toBe('2026-06-06T10:00:00.000Z');
   });
 
+  it('uses the default 300s period and honours a clamped period_seconds override', async () => {
+    const send = vi.fn().mockResolvedValue({ Datapoints: [] });
+    mockClient(send);
+
+    await metricsAndAlarmsTool.handler(validArgs, ctx);
+    await metricsAndAlarmsTool.handler({ ...validArgs, period_seconds: 3600 }, ctx);
+    await metricsAndAlarmsTool.handler({ ...validArgs, period_seconds: 10 }, ctx);
+    await metricsAndAlarmsTool.handler({ ...validArgs, period_seconds: 999999 }, ctx);
+
+    const periods = send.mock.calls.map(
+      (call) => (call[0] as GetMetricStatisticsCommand).input.Period
+    );
+    expect(periods).toEqual([300, 3600, 60, 86400]);
+  });
+
   it('reports clearly when there are no datapoints', async () => {
     const send = vi.fn().mockResolvedValueOnce({ Datapoints: [] });
     mockClient(send);
