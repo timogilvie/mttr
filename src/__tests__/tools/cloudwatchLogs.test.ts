@@ -23,6 +23,14 @@ vi.mock('@aws-sdk/client-cloudwatch-logs', async () => {
   };
 });
 
+vi.mock('../../tools/ecs.js', () => ({
+  resolveServiceLogGroups: vi.fn(),
+}));
+
+import { resolveServiceLogGroups } from '../../tools/ecs.js';
+
+const mockResolveServiceLogGroups = vi.mocked(resolveServiceLogGroups);
+
 const ctx: ToolContext = {
   region: 'us-east-1',
   maxAttempts: 3,
@@ -174,6 +182,47 @@ describe('cloudwatchLogs query_logs', () => {
 describe('cloudwatchLogs discover_log_groups', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockResolveServiceLogGroups.mockResolvedValue([]);
+  });
+
+  it('lists ECS-resolved log groups as authoritative, ahead of name matches', async () => {
+    mockResolveServiceLogGroups.mockResolvedValue([
+      {
+        logGroup: '/ecs/hokusai-api-development',
+        serviceName: 'hokusai-reg-api-development',
+        containerName: 'api',
+      },
+    ]);
+    const send = vi.fn().mockResolvedValueOnce({
+      logGroups: [
+        { logGroupName: '/ecs/hokusai-api-development', storedBytes: 2048 },
+        { logGroupName: '/aws/ecs/data-pipeline-api/access', storedBytes: 10 },
+      ],
+    });
+    mockClient(send);
+
+    const result = await discoverLogGroupsTool.handler({ service_name: 'data-pipeline-api' }, ctx);
+
+    expect(result).toContain('resolved from ECS task definitions');
+    expect(result).toContain('source=ecs-task-definition (service hokusai-reg-api-development, container api)');
+    // The ECS-resolved group is not repeated in the name-match list.
+    expect(result.match(/\/ecs\/hokusai-api-development/g)).toHaveLength(1);
+    expect(result.indexOf('/ecs/hokusai-api-development')).toBeLessThan(
+      result.indexOf('/aws/ecs/data-pipeline-api/access')
+    );
+  });
+
+  it('degrades to name matching when ECS resolution fails', async () => {
+    mockResolveServiceLogGroups.mockRejectedValue(new Error('AccessDenied'));
+    const send = vi.fn().mockResolvedValueOnce({
+      logGroups: [{ logGroupName: '/aws/ecs/data-pipeline-api', storedBytes: 2048 }],
+    });
+    mockClient(send);
+
+    const result = await discoverLogGroupsTool.handler({ service_name: 'data-pipeline-api' }, ctx);
+
+    expect(result).toContain('/aws/ecs/data-pipeline-api');
+    expect(result).toContain('ECS-based resolution unavailable: AccessDenied');
   });
 
   it('returns candidate log groups containing the service name', async () => {
