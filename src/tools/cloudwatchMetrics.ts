@@ -7,7 +7,7 @@ import {
 } from '@aws-sdk/client-cloudwatch';
 import { z } from 'zod';
 import type { ToolContext, ToolDefinition } from './types.js';
-import { clampLookback } from './types.js';
+import { resolveToolTimeRange } from './types.js';
 import { awsRetryConfig } from '../util/awsRetry.js';
 
 export class CloudWatchMetricsToolError extends Error {
@@ -28,6 +28,8 @@ const argsSchema = z.object({
     .array(z.object({ name: z.string().min(1), value: z.string() }))
     .optional(),
   stat: z.enum(STATISTICS).optional(),
+  start_time: z.string().optional(),
+  end_time: z.string().optional(),
   lookback_minutes: z.number().optional(),
   alarm_name: z.string().optional(),
 });
@@ -55,7 +57,16 @@ const parametersJsonSchema = {
     },
     lookback_minutes: {
       type: 'number',
-      description: 'How far back to read, in minutes. Clamped to the configured maximum.',
+      description:
+        'Fallback relative lookback in minutes. Ignored when start_time and end_time are supplied or a report window is available.',
+    },
+    start_time: {
+      type: 'string',
+      description: 'Optional absolute query start time as an ISO timestamp. Must be paired with end_time.',
+    },
+    end_time: {
+      type: 'string',
+      description: 'Optional absolute query end time as an ISO timestamp. Must be paired with start_time.',
     },
     alarm_name: {
       type: 'string',
@@ -96,9 +107,12 @@ function formatAlarmHistory(items: AlarmHistoryItem[]): string {
 
 async function handler(args: MetricsArgs, ctx: ToolContext): Promise<string> {
   const stat = args.stat ?? 'Average';
-  const lookbackMinutes = clampLookback(args.lookback_minutes, ctx);
-  const endTime = new Date();
-  const startTime = new Date(endTime.getTime() - lookbackMinutes * 60 * 1000);
+  const { startTime, endTime } = resolveToolTimeRange(
+    args.start_time,
+    args.end_time,
+    args.lookback_minutes,
+    ctx
+  );
 
   const client = new CloudWatchClient({
     region: ctx.region,

@@ -6,6 +6,7 @@ import { callOpenRouter } from '../llm/openrouter.js';
 import { parseClassification } from '../validation/classificationSchema.js';
 import { stripMarkdownFences } from '../llm/json.js';
 import { enforceMandatoryIncidents } from '../report/mandatoryIncidents.js';
+import { parseReportContext } from '../report/reportContext.js';
 
 async function attemptParse(
   responseText: string,
@@ -54,6 +55,14 @@ function createFallbackResult(reason: string): ClassificationResult {
   };
 }
 
+function attachReportContext(
+  classification: ClassificationResult,
+  report: string
+): ClassificationResult {
+  const reportContext = parseReportContext(report);
+  return reportContext ? { ...classification, report_context: reportContext } : classification;
+}
+
 async function classifyReport(report: string, config: Config, timestamp: string): Promise<StageResult> {
   const prompt = buildClassifyPrompt(report);
 
@@ -68,7 +77,10 @@ async function classifyReport(report: string, config: Config, timestamp: string)
   const classificationResult = await attemptParse(llmResponse, config, false, prompt);
 
   if (!classificationResult) {
-    const fallback = createFallbackResult('LLM returned invalid JSON after retry');
+    const fallback = attachReportContext(
+      createFallbackResult('LLM returned invalid JSON after retry'),
+      report
+    );
     return {
       stage: 'Classify',
       status: 'success',
@@ -81,7 +93,7 @@ async function classifyReport(report: string, config: Config, timestamp: string)
     stage: 'Classify',
     status: 'success',
     timestamp,
-    data: enforceMandatoryIncidents(classificationResult, report),
+    data: attachReportContext(enforceMandatoryIncidents(classificationResult, report), report),
   };
 }
 

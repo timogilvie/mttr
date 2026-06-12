@@ -1,4 +1,10 @@
-import type { ClassificationResult, Incident, IncidentClassification, Severity } from '../types.js';
+import type {
+  ClassificationResult,
+  CloudWatchMetricSignal,
+  Incident,
+  IncidentClassification,
+  Severity,
+} from '../types.js';
 
 interface MandatoryIncidentSpec {
   key: string;
@@ -10,6 +16,7 @@ interface MandatoryIncidentSpec {
   evidence: string[];
   alarms?: string[];
   metrics?: string[];
+  cloudwatchMetrics?: CloudWatchMetricSignal[];
   logs?: string[];
   suspectedCauses: string[];
   firstActions: string[];
@@ -26,6 +33,7 @@ interface ServiceSection {
 const SERVICE_HEADING_RE = /^### (.+)$/gm;
 const ALARM_ROW_RE = /^\|\s*`([^`]+)`\s*\|\s*`?ALARM`?\s*\|/gm;
 const ALB_ROW_RE = /^\|\s*`?([^|`]+)`?\s*\|\s*([\d,]+|-)\s*\|\s*([\d,]+|-)\s*\|\s*([\d,]+|-)\s*\|\s*([\d,]+|-)\s*\|/gm;
+const ALB_DIMS_RE = /_ALB dims:\s*TargetGroup=`([^`]+)`\s+LoadBalancer=`([^`]+)`_/i;
 
 function splitServiceSections(report: string): ServiceSection[] {
   const matches = [...report.matchAll(SERVICE_HEADING_RE)];
@@ -73,6 +81,7 @@ function buildIncident(spec: MandatoryIncidentSpec, index: number): Incident {
       alarms: spec.alarms ?? [],
       metrics: spec.metrics ?? [],
       logs: spec.logs ?? [],
+      cloudwatch_metrics: spec.cloudwatchMetrics ?? [],
     },
     suspected_causes: spec.suspectedCauses,
     investigation_plan: {
@@ -84,6 +93,14 @@ function buildIncident(spec: MandatoryIncidentSpec, index: number): Incident {
     },
     recommended_next_stage: 'INVESTIGATE',
   };
+}
+
+function extractAlbDimensions(body: string): { targetGroup: string; loadBalancer: string } | undefined {
+  const match = body.match(ALB_DIMS_RE);
+  if (!match?.[1] || !match[2]) {
+    return undefined;
+  }
+  return { targetGroup: match[1], loadBalancer: match[2] };
 }
 
 function incidentCoversSpec(incident: Incident, spec: MandatoryIncidentSpec): boolean {
@@ -114,6 +131,59 @@ function findingCoversSpec(findingText: string, spec: MandatoryIncidentSpec): bo
     .toLowerCase();
 
   return findingText.includes(service) && signal.split(/\s+/).some((token) => token.length > 8 && findingText.includes(token));
+}
+
+function mergeCloudWatchMetrics(
+  existing: CloudWatchMetricSignal[] | undefined,
+  added: CloudWatchMetricSignal[] | undefined
+): CloudWatchMetricSignal[] | undefined {
+  if (!added || added.length === 0) {
+    return existing;
+  }
+
+  const merged = [...(existing ?? [])];
+  const keys = new Set(
+    merged.map((metric) =>
+      [
+        metric.namespace,
+        metric.metric_name,
+        ...metric.dimensions.map((dimension) => `${dimension.name}=${dimension.value}`).sort(),
+      ].join('|')
+    )
+  );
+
+  for (const metric of added) {
+    const key = [
+      metric.namespace,
+      metric.metric_name,
+      ...metric.dimensions.map((dimension) => `${dimension.name}=${dimension.value}`).sort(),
+    ].join('|');
+    if (!keys.has(key)) {
+      keys.add(key);
+      merged.push(metric);
+    }
+  }
+
+  return merged;
+}
+
+function enrichIncidentWithSpec(incident: Incident, spec: MandatoryIncidentSpec): Incident {
+  const cloudwatchMetrics = mergeCloudWatchMetrics(
+    incident.signals.cloudwatch_metrics,
+    spec.cloudwatchMetrics
+  );
+
+  if (cloudwatchMetrics === incident.signals.cloudwatch_metrics) {
+    return incident;
+  }
+
+  return {
+    ...incident,
+    signals: {
+      ...incident.signals,
+      cloudwatch_metrics: cloudwatchMetrics,
+    },
+  };
 }
 
 function extractActiveAlarmSpecs(report: string): MandatoryIncidentSpec[] {
@@ -147,6 +217,7 @@ function extractActiveAlarmSpecs(report: string): MandatoryIncidentSpec[] {
 function extractAlb5xxSpecs(report: string): MandatoryIncidentSpec[] {
   return splitServiceSections(report).flatMap(({ service, body }) => {
     const specs: MandatoryIncidentSpec[] = [];
+    const dimensions = extractAlbDimensions(body);
 
     for (const match of body.matchAll(ALB_ROW_RE)) {
       const target = match[1]?.trim();
@@ -174,6 +245,27 @@ function extractAlb5xxSpecs(report: string): MandatoryIncidentSpec[] {
         affectedService: service,
         evidence: [`Health report shows ${fiveXx} ALB 5xx responses for ${target}${rate}.`],
         metrics: [`ALB 5xx responses: ${fiveXx}`],
+        cloudwatchMetrics: dimensions
+          ? [
+              {
+                namespace: 'AWS/ApplicationELB',
+                metric_name: 'HTTPCode_Target_5XX_Count',
+                stat: 'Sum',
+                label: 'Target 5xx responses from the health report ALB dimensions',
+                dimensions: [
+                  { name: 'LoadBalancer', value: dimensions.loadBalancer },
+                  { name: 'TargetGroup', value: dimensions.targetGroup },
+                ],
+              },
+              {
+                namespace: 'AWS/ApplicationELB',
+                metric_name: 'HTTPCode_ELB_5XX_Count',
+                stat: 'Sum',
+                label: 'Load balancer generated 5xx responses for the same ALB',
+                dimensions: [{ name: 'LoadBalancer', value: dimensions.loadBalancer }],
+              },
+            ]
+          : [],
         logs: [],
         suspectedCauses: ['Application or upstream dependency returned server errors behind the load balancer.'],
         firstActions: [
@@ -241,18 +333,26 @@ export function enforceMandatoryIncidents(
   classification: ClassificationResult,
   report: string
 ): ClassificationResult {
-  const missingSpecs = mandatoryIncidentSpecs(report).filter(
+  const specs = mandatoryIncidentSpecs(report);
+  let didEnrichIncident = false;
+  const enrichedIncidents = classification.incidents.map((incident) => {
+    const coveringSpec = specs.find((spec) => incidentCoversSpec(incident, spec));
+    const enriched = coveringSpec ? enrichIncidentWithSpec(incident, coveringSpec) : incident;
+    didEnrichIncident ||= enriched !== incident;
+    return enriched;
+  });
+  const missingSpecs = specs.filter(
     (spec) => !classification.incidents.some((incident) => incidentCoversSpec(incident, spec))
   );
 
   if (missingSpecs.length === 0) {
-    return classification;
+    return didEnrichIncident ? { ...classification, incidents: enrichedIncidents } : classification;
   }
 
   const addedIncidents = missingSpecs.map((spec, index) =>
-    buildIncident(spec, classification.incidents.length + index)
+    buildIncident(spec, enrichedIncidents.length + index)
   );
-  const allIncidents = [...classification.incidents, ...addedIncidents];
+  const allIncidents = [...enrichedIncidents, ...addedIncidents];
   const highestSeverity = allIncidents.reduce(
     (severity, incident) => maxSeverity(severity, incident.severity),
     classification.overall_severity

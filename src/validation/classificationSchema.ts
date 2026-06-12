@@ -29,6 +29,17 @@ const IncidentSignalsSchema = z.object({
   alarms: z.array(z.string()),
   metrics: z.array(z.string()),
   logs: z.array(z.string()),
+  cloudwatch_metrics: z
+    .array(
+      z.object({
+        namespace: z.string(),
+        metric_name: z.string(),
+        dimensions: z.array(z.object({ name: z.string(), value: z.string() })),
+        stat: z.enum(['Average', 'Sum', 'Minimum', 'Maximum', 'SampleCount']).optional(),
+        label: z.string().optional(),
+      })
+    )
+    .optional(),
 });
 
 const InvestigationPlanSchema = z.object({
@@ -68,6 +79,14 @@ const ClassificationResultSchema = z.object({
   overall_severity: SeveritySchema,
   incidents: z.array(IncidentSchema),
   findings: z.array(FindingSchema),
+  report_context: z
+    .object({
+      window_label: z.string().optional(),
+      generated_at: z.string().optional(),
+      window_start: z.string().optional(),
+      window_end: z.string().optional(),
+    })
+    .optional(),
 });
 
 export class ClassificationValidationError extends Error {

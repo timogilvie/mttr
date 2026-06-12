@@ -10,6 +10,7 @@ import { callOpenRouterWithTools, type ToolLoopOptions } from '../llm/toolLoop.j
 import { getTools } from '../tools/registry.js';
 import type { ToolContext } from '../tools/types.js';
 import { discoverLogGroupsTool, queryLogsTool } from '../tools/cloudwatchLogs.js';
+import { metricsAndAlarmsTool } from '../tools/cloudwatchMetrics.js';
 import { parseInvestigation } from '../validation/investigationSchema.js';
 import { stripMarkdownFences } from '../llm/json.js';
 import type { Finding, Incident, IncidentClassification } from '../types.js';
@@ -40,7 +41,7 @@ function fallbackResult(reason: string): InvestigationResult {
   };
 }
 
-function buildToolContext(config: Config): ToolContext {
+function buildToolContext(config: Config, classification: ClassificationResult): ToolContext {
   return {
     region: config.aws.region,
     maxAttempts: config.aws.maxAttempts,
@@ -48,6 +49,8 @@ function buildToolContext(config: Config): ToolContext {
     maxResultChars: config.tools.resultMaxChars,
     defaultLookbackMinutes: config.tools.defaultLookbackMinutes,
     maxLookbackMinutes: config.tools.maxLookbackMinutes,
+    defaultStartTime: classification.report_context?.window_start,
+    defaultEndTime: classification.report_context?.window_end,
   };
 }
 
@@ -150,6 +153,26 @@ async function gatherStandardEvidence(
     const text = itemText(item);
     const shouldQuery4xx = needs4xxDrilldown(item.classification, text);
     const shouldQueryWarnings = needsWarningDrilldown(text);
+    const cloudwatchMetrics = 'signals' in item ? item.signals.cloudwatch_metrics ?? [] : [];
+
+    for (const metric of cloudwatchMetrics) {
+      sections.push(
+        await runEvidenceTool(
+          `### ${id} ${kind}: metric ${metric.namespace}/${metric.metric_name}` +
+            (metric.label ? ` (${metric.label})` : ''),
+          () =>
+            metricsAndAlarmsTool.handler(
+              {
+                namespace: metric.namespace,
+                metric_name: metric.metric_name,
+                dimensions: metric.dimensions,
+                stat: metric.stat,
+              },
+              ctx
+            )
+        )
+      );
+    }
 
     if (!shouldQuery4xx && !shouldQueryWarnings) {
       continue;
@@ -231,7 +254,7 @@ export async function run(
       };
     }
 
-    const toolContext = buildToolContext(config);
+    const toolContext = buildToolContext(config, classification);
     const preGatheredEvidence = await gatherStandardEvidence(classification, toolContext);
     const step1Json = JSON.stringify(classification, null, 2);
     const prompt = buildInvestigatePrompt(step1Json, preGatheredEvidence);

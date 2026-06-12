@@ -49,6 +49,14 @@ describe('investigatePrompt', () => {
     expect(prompt).toContain('get_metrics_and_alarms');
   });
 
+  it('instructs use of the structured report window for tool evidence', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('report_context.window_start');
+    expect(prompt).toContain('start_time/end_time');
+    expect(prompt).toContain('Do not replace the report window');
+  });
+
   it('instructs active log drill-down for high 4xx auth findings', () => {
     const prompt = buildInvestigatePrompt(sampleStep1);
 
