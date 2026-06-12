@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import * as investigateStage from '../stages/investigate.js';
 import { callOpenRouterWithTools } from '../llm/toolLoop.js';
 import { discoverLogGroupsTool, queryLogsTool } from '../tools/cloudwatchLogs.js';
+import { metricsAndAlarmsTool } from '../tools/cloudwatchMetrics.js';
 import type { Config } from '../config.js';
 import type { StageInput, ClassificationResult, InvestigationResult } from '../types.js';
 
@@ -14,10 +15,16 @@ vi.mock('../tools/cloudwatchLogs.js', () => ({
     handler: vi.fn(),
   },
 }));
+vi.mock('../tools/cloudwatchMetrics.js', () => ({
+  metricsAndAlarmsTool: {
+    handler: vi.fn(),
+  },
+}));
 
 const mockLoop = vi.mocked(callOpenRouterWithTools);
 const mockDiscoverLogGroups = vi.mocked(discoverLogGroupsTool.handler);
 const mockQueryLogs = vi.mocked(queryLogsTool.handler);
+const mockMetricsAndAlarms = vi.mocked(metricsAndAlarmsTool.handler);
 
 const mockConfig: Config = {
   openrouter: {
@@ -99,6 +106,9 @@ describe('investigate stage', () => {
     );
     mockQueryLogs.mockResolvedValue(
       'Query returned 1 row(s):\nstatus=401, path=/api/probe, requests=12'
+    );
+    mockMetricsAndAlarms.mockResolvedValue(
+      'Metric datapoints (1):\n2026-06-06T10:00:00.000Z: Sum=10 Count'
     );
   });
 
@@ -213,6 +223,71 @@ describe('investigate stage', () => {
       expect.objectContaining({ log_group: '/ecs/hokusai-api-secondary' }),
       expect.anything()
     );
+  });
+
+  it('pre-gathers structured CloudWatch metric evidence using the report window context', async () => {
+    mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+    const classificationWithMetric: ClassificationResult = {
+      summary: 'ALB 5xx detected.',
+      overall_severity: 'HIGH',
+      report_context: {
+        window_start: '2026-06-05T11:35:04.881Z',
+        window_end: '2026-06-06T11:35:04.881Z',
+      },
+      incidents: [
+        {
+          incident_id: 'mandatory-alb-5xx-data-pipeline-api-0',
+          title: 'ALB 5xx responses for data-pipeline-api',
+          classification: 'APPLICATION_ERROR',
+          severity: 'HIGH',
+          confidence: 0.9,
+          affected_services: ['data-pipeline-api'],
+          evidence: ['Health report shows 10 ALB 5xx responses.'],
+          signals: {
+            alarms: [],
+            metrics: ['ALB 5xx responses: 10'],
+            logs: [],
+            cloudwatch_metrics: [
+              {
+                namespace: 'AWS/ApplicationELB',
+                metric_name: 'HTTPCode_Target_5XX_Count',
+                stat: 'Sum',
+                dimensions: [
+                  { name: 'LoadBalancer', value: 'app/hokusai-reg-api-development/def456' },
+                  { name: 'TargetGroup', value: 'targetgroup/hokusai-reg-api-development/abc123' },
+                ],
+              },
+            ],
+          },
+          suspected_causes: ['Application errors.'],
+          investigation_plan: {
+            priority: 1,
+            estimated_user_impact: 'PARTIAL',
+            first_actions: [],
+            questions_to_answer: [],
+            suggested_cloudwatch_queries: [],
+          },
+          recommended_next_stage: 'INVESTIGATE',
+        },
+      ],
+      findings: [],
+    };
+
+    const result = await investigateStage.run(mockInput, mockConfig, classificationWithMetric);
+
+    expect(result.status).toBe('success');
+    expect(mockMetricsAndAlarms).toHaveBeenCalledWith(
+      expect.objectContaining({
+        namespace: 'AWS/ApplicationELB',
+        metric_name: 'HTTPCode_Target_5XX_Count',
+        stat: 'Sum',
+      }),
+      expect.objectContaining({
+        defaultStartTime: '2026-06-05T11:35:04.881Z',
+        defaultEndTime: '2026-06-06T11:35:04.881Z',
+      })
+    );
+    expect(mockLoop.mock.calls[0]![0].prompt).toContain('metric AWS/ApplicationELB/HTTPCode_Target_5XX_Count');
   });
 
   it('strips markdown fences from the response', async () => {

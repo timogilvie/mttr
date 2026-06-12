@@ -1,8 +1,10 @@
+import { loadEnvFile } from './env.js';
 import { loadConfig } from './config.js';
 import { Orchestrator } from './orchestrator.js';
 
 function main() {
   console.log('[Main] Hokusai Monitoring Agent starting');
+  loadEnvFile();
 
   let config;
   try {

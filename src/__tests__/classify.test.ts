@@ -147,6 +147,9 @@ describe('classify stage', () => {
 
     vi.mocked(fetchReport).mockResolvedValue(`# Hokusai Service Health Report
 
+- Window: last 24 hours
+- Generated: \`2026-06-06T11:35:04.881055+00:00\`
+
 ## Service Details
 
 ### auth-service
@@ -156,6 +159,8 @@ describe('classify stage', () => {
 | \`hokusai-auth-development-task-health\` | \`ALARM\` |
 
 ### data-pipeline-api
+
+_ALB dims: TargetGroup=\`targetgroup/hokusai-reg-api-development/abc123\` LoadBalancer=\`app/hokusai-reg-api-development/def456\`_
 
 | ALB target | Requests | 2xx | 4xx | 5xx | Avg latency |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -179,10 +184,28 @@ describe('classify stage', () => {
     expect(result.status).toBe('success');
     const data = result.data as {
       overall_severity: string;
-      incidents: Array<{ title: string; classification: string; severity: string; signals: { alarms: string[] } }>;
+      report_context?: { window_start?: string; window_end?: string };
+      incidents: Array<{
+        title: string;
+        classification: string;
+        severity: string;
+        signals: {
+          alarms: string[];
+          cloudwatch_metrics?: Array<{
+            metric_name: string;
+            dimensions: Array<{ name: string; value: string }>;
+          }>;
+        };
+      }>;
     };
 
     expect(data.overall_severity).toBe('HIGH');
+    expect(data.report_context).toEqual({
+      window_label: 'last 24 hours',
+      generated_at: '2026-06-06T11:35:04.881Z',
+      window_start: '2026-06-05T11:35:04.881Z',
+      window_end: '2026-06-06T11:35:04.881Z',
+    });
     expect(data.incidents).toHaveLength(3);
     expect(data.incidents.map((incident) => incident.title)).toEqual(
       expect.arrayContaining([
@@ -197,6 +220,22 @@ describe('classify stage', () => {
     expect(data.incidents.find((incident) => incident.title.includes('data-pipeline-api'))?.classification).toBe(
       'APPLICATION_ERROR'
     );
+    expect(
+      data.incidents.find((incident) => incident.title.includes('data-pipeline-api'))?.signals
+        .cloudwatch_metrics
+    ).toEqual([
+      expect.objectContaining({
+        metric_name: 'HTTPCode_Target_5XX_Count',
+        dimensions: [
+          { name: 'LoadBalancer', value: 'app/hokusai-reg-api-development/def456' },
+          { name: 'TargetGroup', value: 'targetgroup/hokusai-reg-api-development/abc123' },
+        ],
+      }),
+      expect.objectContaining({
+        metric_name: 'HTTPCode_ELB_5XX_Count',
+        dimensions: [{ name: 'LoadBalancer', value: 'app/hokusai-reg-api-development/def456' }],
+      }),
+    ]);
     expect(data.incidents.find((incident) => incident.title.includes('deltaone'))?.classification).toBe(
       'OBSERVABILITY_FAILURE'
     );

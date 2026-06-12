@@ -77,6 +77,49 @@ describe('cloudwatchLogs query_logs', () => {
     expect(send.mock.calls[1]?.[0]).toBeInstanceOf(GetQueryResultsCommand);
   });
 
+  it('uses explicit absolute time bounds when provided', async () => {
+    const send = vi
+      .fn()
+      .mockResolvedValueOnce({ queryId: 'q-1' })
+      .mockResolvedValueOnce({ status: 'Complete', results: [] });
+    mockClient(send);
+
+    await queryLogsTool.handler(
+      {
+        ...validArgs,
+        start_time: '2026-06-06T10:00:00Z',
+        end_time: '2026-06-06T11:00:00Z',
+        lookback_minutes: 5,
+      },
+      ctx
+    );
+
+    const command = send.mock.calls[0]?.[0] as StartQueryCommand;
+    expect(command.input.startTime).toBe(Date.parse('2026-06-06T10:00:00Z') / 1000);
+    expect(command.input.endTime).toBe(Date.parse('2026-06-06T11:00:00Z') / 1000);
+  });
+
+  it('uses context absolute time bounds before lookback fallback', async () => {
+    const send = vi
+      .fn()
+      .mockResolvedValueOnce({ queryId: 'q-1' })
+      .mockResolvedValueOnce({ status: 'Complete', results: [] });
+    mockClient(send);
+
+    await queryLogsTool.handler(
+      { ...validArgs, lookback_minutes: 5 },
+      {
+        ...ctx,
+        defaultStartTime: '2026-06-06T09:00:00Z',
+        defaultEndTime: '2026-06-06T10:00:00Z',
+      }
+    );
+
+    const command = send.mock.calls[0]?.[0] as StartQueryCommand;
+    expect(command.input.startTime).toBe(Date.parse('2026-06-06T09:00:00Z') / 1000);
+    expect(command.input.endTime).toBe(Date.parse('2026-06-06T10:00:00Z') / 1000);
+  });
+
   it('reports zero matching rows clearly', async () => {
     const send = vi
       .fn()

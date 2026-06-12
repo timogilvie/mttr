@@ -25,6 +25,20 @@ export interface IncidentSignals {
   alarms: string[];
   metrics: string[];
   logs: string[];
+  cloudwatch_metrics?: CloudWatchMetricSignal[] | undefined;
+}
+
+export interface MetricDimension {
+  name: string;
+  value: string;
+}
+
+export interface CloudWatchMetricSignal {
+  namespace: string;
+  metric_name: string;
+  dimensions: MetricDimension[];
+  stat?: 'Average' | 'Sum' | 'Minimum' | 'Maximum' | 'SampleCount' | undefined;
+  label?: string | undefined;
 }
 
 export interface InvestigationPlan {
@@ -64,6 +78,14 @@ export interface ClassificationResult {
   overall_severity: Severity;
   incidents: Incident[];
   findings: Finding[];
+  report_context?: ReportContext | undefined;
+}
+
+export interface ReportContext {
+  window_label?: string | undefined;
+  generated_at?: string | undefined;
+  window_start?: string | undefined;
+  window_end?: string | undefined;
 }
 
 export type OverallAssessment =

@@ -9,7 +9,7 @@ import {
 } from '@aws-sdk/client-cloudwatch-logs';
 import { z } from 'zod';
 import type { ToolContext, ToolDefinition } from './types.js';
-import { clampLookback } from './types.js';
+import { resolveToolTimeRange } from './types.js';
 import { awsRetryConfig } from '../util/awsRetry.js';
 
 export class CloudWatchLogsToolError extends Error {
@@ -40,6 +40,8 @@ const GENERIC_SERVICE_TOKENS = new Set([
 const argsSchema = z.object({
   log_group: z.string().min(1),
   filter_or_query: z.string().min(1),
+  start_time: z.string().optional(),
+  end_time: z.string().optional(),
   lookback_minutes: z.number().optional(),
   limit: z.number().optional(),
 });
@@ -67,7 +69,16 @@ const parametersJsonSchema = {
     },
     lookback_minutes: {
       type: 'number',
-      description: 'How far back to search, in minutes. Clamped to the configured maximum.',
+      description:
+        'Fallback relative lookback in minutes. Ignored when start_time and end_time are supplied or a report window is available.',
+    },
+    start_time: {
+      type: 'string',
+      description: 'Optional absolute query start time as an ISO timestamp. Must be paired with end_time.',
+    },
+    end_time: {
+      type: 'string',
+      description: 'Optional absolute query end time as an ISO timestamp. Must be paired with start_time.',
     },
     limit: {
       type: 'number',
@@ -224,9 +235,14 @@ async function discoverHandler(args: DiscoverLogGroupsArgs, ctx: ToolContext): P
 }
 
 async function handler(args: QueryLogsArgs, ctx: ToolContext): Promise<string> {
-  const lookbackMinutes = clampLookback(args.lookback_minutes, ctx);
-  const endTime = Math.floor(Date.now() / 1000);
-  const startTime = endTime - lookbackMinutes * 60;
+  const timeRange = resolveToolTimeRange(
+    args.start_time,
+    args.end_time,
+    args.lookback_minutes,
+    ctx
+  );
+  const startTime = Math.floor(timeRange.startTime.getTime() / 1000);
+  const endTime = Math.floor(timeRange.endTime.getTime() / 1000);
   const limit =
     args.limit && args.limit > 0 ? Math.min(Math.floor(args.limit), MAX_LIMIT) : DEFAULT_LIMIT;
 

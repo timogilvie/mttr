@@ -11,6 +11,8 @@ export interface ToolContext {
   maxResultChars: number;
   defaultLookbackMinutes: number;
   maxLookbackMinutes: number;
+  defaultStartTime?: string | undefined;
+  defaultEndTime?: string | undefined;
 }
 
 /**
@@ -42,4 +44,45 @@ export function clampLookback(
     return ctx.defaultLookbackMinutes;
   }
   return Math.min(requestedMinutes, ctx.maxLookbackMinutes);
+}
+
+function parseIsoDate(value: string, fieldName: string): Date {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`${fieldName} must be a valid ISO timestamp, got: ${value}`);
+  }
+  return date;
+}
+
+export function resolveToolTimeRange(
+  requestedStartTime: string | undefined,
+  requestedEndTime: string | undefined,
+  requestedLookbackMinutes: number | undefined,
+  ctx: ToolContext
+): { startTime: Date; endTime: Date; source: 'requested_absolute' | 'context_absolute' | 'lookback' } {
+  if (requestedStartTime !== undefined || requestedEndTime !== undefined) {
+    if (!requestedStartTime || !requestedEndTime) {
+      throw new Error('start_time and end_time must be provided together');
+    }
+
+    const startTime = parseIsoDate(requestedStartTime, 'start_time');
+    const endTime = parseIsoDate(requestedEndTime, 'end_time');
+    if (startTime >= endTime) {
+      throw new Error('start_time must be before end_time');
+    }
+    return { startTime, endTime, source: 'requested_absolute' };
+  }
+
+  if (ctx.defaultStartTime && ctx.defaultEndTime) {
+    const startTime = parseIsoDate(ctx.defaultStartTime, 'defaultStartTime');
+    const endTime = parseIsoDate(ctx.defaultEndTime, 'defaultEndTime');
+    if (startTime < endTime) {
+      return { startTime, endTime, source: 'context_absolute' };
+    }
+  }
+
+  const lookbackMinutes = clampLookback(requestedLookbackMinutes, ctx);
+  const endTime = new Date();
+  const startTime = new Date(endTime.getTime() - lookbackMinutes * 60 * 1000);
+  return { startTime, endTime, source: 'lookback' };
 }

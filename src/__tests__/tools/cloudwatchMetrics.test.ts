@@ -67,6 +67,43 @@ describe('cloudwatchMetrics get_metrics_and_alarms', () => {
     expect(send.mock.calls[0]?.[0]).toBeInstanceOf(GetMetricStatisticsCommand);
   });
 
+  it('uses explicit absolute time bounds when provided', async () => {
+    const send = vi.fn().mockResolvedValueOnce({ Datapoints: [] });
+    mockClient(send);
+
+    await metricsAndAlarmsTool.handler(
+      {
+        ...validArgs,
+        start_time: '2026-06-06T10:00:00Z',
+        end_time: '2026-06-06T11:00:00Z',
+        lookback_minutes: 5,
+      },
+      ctx
+    );
+
+    const command = send.mock.calls[0]?.[0] as GetMetricStatisticsCommand;
+    expect(command.input.StartTime?.toISOString()).toBe('2026-06-06T10:00:00.000Z');
+    expect(command.input.EndTime?.toISOString()).toBe('2026-06-06T11:00:00.000Z');
+  });
+
+  it('uses context absolute time bounds before lookback fallback', async () => {
+    const send = vi.fn().mockResolvedValueOnce({ Datapoints: [] });
+    mockClient(send);
+
+    await metricsAndAlarmsTool.handler(
+      { ...validArgs, lookback_minutes: 5 },
+      {
+        ...ctx,
+        defaultStartTime: '2026-06-06T09:00:00Z',
+        defaultEndTime: '2026-06-06T10:00:00Z',
+      }
+    );
+
+    const command = send.mock.calls[0]?.[0] as GetMetricStatisticsCommand;
+    expect(command.input.StartTime?.toISOString()).toBe('2026-06-06T09:00:00.000Z');
+    expect(command.input.EndTime?.toISOString()).toBe('2026-06-06T10:00:00.000Z');
+  });
+
   it('reports clearly when there are no datapoints', async () => {
     const send = vi.fn().mockResolvedValueOnce({ Datapoints: [] });
     mockClient(send);

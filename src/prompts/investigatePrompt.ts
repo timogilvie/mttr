@@ -14,6 +14,8 @@ You have read-only tools to gather evidence:
 - discover_log_groups: find candidate CloudWatch log groups for a named service when Step 1 does not provide a log group.
 - get_metrics_and_alarms: read metric statistics and alarm state history.
 
+When Step 1 includes report_context.window_start and report_context.window_end, use that report window for CloudWatch evidence. The tools default to that window, and also accept explicit start_time/end_time ISO timestamps when you need to override it. Do not replace the report window with a vague recent lookback unless the report window is missing.
+
 Use suggested_cloudwatch_queries and signals to target your queries. For findings, create the missing high-value query yourself from the finding evidence and affected_services. Prefer a small number of high-value queries. You have a limited tool budget; stop gathering once you can characterise an item. If a tool returns an error or no data, treat missing telemetry as a finding — do not invent results.
 
 ## Method
