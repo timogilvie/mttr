@@ -47,6 +47,24 @@ describe('investigatePrompt', () => {
     expect(prompt).toContain('discover_log_groups');
     expect(prompt).toContain('query_logs');
     expect(prompt).toContain('get_metrics_and_alarms');
+    expect(prompt).toContain('list_metrics');
+    expect(prompt).toContain('find_alarms');
+  });
+
+  it('requires tool attempts before declaring INSUFFICIENT_EVIDENCE', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('Do NOT return investigation_status INSUFFICIENT_EVIDENCE');
+    expect(prompt).toContain('tool budget remaining');
+    expect(prompt).toContain('re-read your own recommended_next_investigation_steps');
+  });
+
+  it('instructs active drill-down for missing-metric observability incidents', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('missing or zero-datapoint metric');
+    expect(prompt).toContain('Use list_metrics to recover the exact metric namespace');
+    expect(prompt).toContain('metric-emission failure');
   });
 
   it('instructs use of the structured report window for tool evidence', () => {
