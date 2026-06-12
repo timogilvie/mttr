@@ -13,6 +13,12 @@ export interface ToolContext {
   maxLookbackMinutes: number;
 }
 
+export interface ToolTimeRangeArgs {
+  lookback_minutes?: number | undefined;
+  start_time?: string | undefined;
+  end_time?: string | undefined;
+}
+
 /**
  * A read-only evidence-gathering tool the Investigate stage can call.
  *
@@ -42,4 +48,38 @@ export function clampLookback(
     return ctx.defaultLookbackMinutes;
   }
   return Math.min(requestedMinutes, ctx.maxLookbackMinutes);
+}
+
+export function resolveToolTimeRange(
+  args: ToolTimeRangeArgs,
+  ctx: ToolContext,
+  now = new Date()
+): { start: Date; end: Date; description: string } {
+  if (args.start_time && args.end_time) {
+    const start = new Date(args.start_time);
+    const end = new Date(args.end_time);
+    const maxWindowMs = ctx.maxLookbackMinutes * 60 * 1000;
+
+    if (
+      !Number.isNaN(start.getTime()) &&
+      !Number.isNaN(end.getTime()) &&
+      start < end &&
+      end.getTime() - start.getTime() <= maxWindowMs
+    ) {
+      return {
+        start,
+        end,
+        description: `${start.toISOString()} to ${end.toISOString()}`,
+      };
+    }
+  }
+
+  const lookbackMinutes = clampLookback(args.lookback_minutes, ctx);
+  const end = now;
+  const start = new Date(end.getTime() - lookbackMinutes * 60 * 1000);
+  return {
+    start,
+    end,
+    description: `last ${lookbackMinutes} minute(s)`,
+  };
 }

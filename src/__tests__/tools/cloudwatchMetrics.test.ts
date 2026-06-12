@@ -75,6 +75,27 @@ describe('cloudwatchMetrics get_metrics_and_alarms', () => {
     expect(result).toContain('No metric datapoints');
   });
 
+  it('uses absolute start and end times when provided', async () => {
+    const send = vi.fn().mockResolvedValueOnce({ Datapoints: [] });
+    mockClient(send);
+
+    const result = await metricsAndAlarmsTool.handler(
+      {
+        ...validArgs,
+        start_time: '2026-06-05T11:35:04.000Z',
+        end_time: '2026-06-06T11:35:04.000Z',
+      },
+      ctx
+    );
+
+    const command = send.mock.calls[0]?.[0] as GetMetricStatisticsCommand;
+    expect(command.input.StartTime?.toISOString()).toBe('2026-06-05T11:35:04.000Z');
+    expect(command.input.EndTime?.toISOString()).toBe('2026-06-06T11:35:04.000Z');
+    expect(result).toContain(
+      'Query window: 2026-06-05T11:35:04.000Z to 2026-06-06T11:35:04.000Z'
+    );
+  });
+
   it('fetches alarm history when alarm_name is provided', async () => {
     const send = vi
       .fn()

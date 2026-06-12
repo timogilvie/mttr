@@ -43,6 +43,14 @@ describe('classifyPrompt', () => {
     expect(prompt).toContain('CRITICAL:');
   });
 
+  it('constrains estimated user impact to the schema enum', () => {
+    const prompt = buildClassifyPrompt(sampleReport);
+
+    expect(prompt).toContain('For investigation_plan.estimated_user_impact');
+    expect(prompt).toContain('PARTIAL');
+    expect(prompt).toContain('Do not use POTENTIAL');
+  });
+
   it('requires hard health signals to be classified as incidents', () => {
     const prompt = buildClassifyPrompt(sampleReport);
 

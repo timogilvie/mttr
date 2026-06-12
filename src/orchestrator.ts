@@ -3,6 +3,7 @@ import type { StageInput, ClassificationResult, InvestigationResult } from './ty
 import * as classifyStage from './stages/classify.js';
 import * as investigateStage from './stages/investigate.js';
 import { fetchReport } from './report/fetchReport.js';
+import { enrichReportWithExactWindow, extractReportWindow } from './report/reportMetadata.js';
 import {
   hashReportContent,
   hasProcessedReport,
@@ -68,11 +69,20 @@ export class Orchestrator {
   private async runClassifyAsync(input: StageInput): Promise<void> {
     try {
       console.log('[Orchestrator] Starting Classify stage');
-      const report = await fetchReport(
+      const fetchedReport = await fetchReport(
         this.config.healthReport.s3Uri,
         this.config.aws.region,
         this.config.timeouts.s3Ms
       );
+      const report = enrichReportWithExactWindow(fetchedReport);
+      const reportWindow = extractReportWindow(report) ?? undefined;
+      if (reportWindow?.startTime && reportWindow.endTime) {
+        console.log(
+          `[Orchestrator] Report exact window: ${reportWindow.startTime} to ${reportWindow.endTime}`
+        );
+      } else if (reportWindow) {
+        console.log(`[Orchestrator] Report window: ${reportWindow.label}`);
+      }
       const reportFingerprint = hashReportContent(report);
       const state = await loadAgentState(this.config.state.path);
 
@@ -101,7 +111,7 @@ export class Orchestrator {
           classification.incidents.length > 0 || classification.findings.length > 0;
 
         if (actionable && reconciliation.shouldInvestigate) {
-          await this.runInvestigate(classification);
+          await this.runInvestigate(classification, reportWindow);
         } else if (actionable) {
           console.log(
             '[Orchestrator] Only recurring unchanged observations detected; skipping Investigate'
@@ -140,7 +150,10 @@ export class Orchestrator {
     }
   }
 
-  private async runInvestigate(classification: ClassificationResult): Promise<void> {
+  private async runInvestigate(
+    classification: ClassificationResult,
+    reportWindow?: StageInput['reportWindow']
+  ): Promise<void> {
     if (this.investigateInFlight) {
       console.log('[Orchestrator] Investigate stage still in flight, skipping');
       return;
@@ -153,6 +166,7 @@ export class Orchestrator {
       const input: StageInput = {
         stage: 'Investigate',
         timestamp: new Date().toISOString(),
+        reportWindow,
       };
 
       const result = await investigateStage.run(input, this.config, classification);

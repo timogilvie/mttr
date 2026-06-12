@@ -69,12 +69,25 @@ Significant degradation. User impact likely.
 CRITICAL:
 Service unavailable, no healthy tasks, sustained 5xx errors, or major confirmed customer impact.
 
+## **User Impact Enum**
+
+For investigation_plan.estimated_user_impact, use exactly one of:
+
+* NONE
+* MINIMAL
+* PARTIAL
+* SIGNIFICANT
+* COMPLETE
+
+Do not use POTENTIAL, UNKNOWN, POSSIBLE, or free-form impact labels.
+
 ## **Classification Rules**
 
 * Prefer evidence over speculation.
 * Do not infer root cause unless the report directly supports it.
 * Multiple incidents may be created if signals are unrelated.
 * Related signals should be grouped into one incident.
+* Preserve the report's exact time window in evidence, first_actions, and suggested_cloudwatch_queries when the report provides one.
 * Any alarm listed in ALARM state is an actionable incident. Include the alarm name in signals.alarms and investigate it even if ECS task counts look healthy.
 * Any non-zero ALB 5xx count is an actionable incident. Classify it as APPLICATION_ERROR unless the report directly supports a more specific classification.
 * A detector liveness metric with zero datapoints is an actionable OBSERVABILITY_FAILURE incident, not merely a finding. Zero detector event values can be normal; zero liveness datapoints is not.

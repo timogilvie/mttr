@@ -7,7 +7,7 @@ import {
 } from '@aws-sdk/client-cloudwatch';
 import { z } from 'zod';
 import type { ToolContext, ToolDefinition } from './types.js';
-import { clampLookback } from './types.js';
+import { resolveToolTimeRange } from './types.js';
 import { awsRetryConfig } from '../util/awsRetry.js';
 
 export class CloudWatchMetricsToolError extends Error {
@@ -29,6 +29,8 @@ const argsSchema = z.object({
     .optional(),
   stat: z.enum(STATISTICS).optional(),
   lookback_minutes: z.number().optional(),
+  start_time: z.string().optional(),
+  end_time: z.string().optional(),
   alarm_name: z.string().optional(),
 });
 
@@ -55,7 +57,18 @@ const parametersJsonSchema = {
     },
     lookback_minutes: {
       type: 'number',
-      description: 'How far back to read, in minutes. Clamped to the configured maximum.',
+      description:
+        'How far back to read, in minutes. Used only when start_time/end_time are not provided. Clamped to the configured maximum.',
+    },
+    start_time: {
+      type: 'string',
+      description:
+        'Optional ISO-8601 UTC start time. Use with end_time when the health report provides an exact window.',
+    },
+    end_time: {
+      type: 'string',
+      description:
+        'Optional ISO-8601 UTC end time. Use with start_time when the health report provides an exact window.',
     },
     alarm_name: {
       type: 'string',
@@ -96,9 +109,9 @@ function formatAlarmHistory(items: AlarmHistoryItem[]): string {
 
 async function handler(args: MetricsArgs, ctx: ToolContext): Promise<string> {
   const stat = args.stat ?? 'Average';
-  const lookbackMinutes = clampLookback(args.lookback_minutes, ctx);
-  const endTime = new Date();
-  const startTime = new Date(endTime.getTime() - lookbackMinutes * 60 * 1000);
+  const range = resolveToolTimeRange(args, ctx);
+  const startTime = range.start;
+  const endTime = range.end;
 
   const client = new CloudWatchClient({
     region: ctx.region,
@@ -118,7 +131,10 @@ async function handler(args: MetricsArgs, ctx: ToolContext): Promise<string> {
       })
     );
 
-    const sections = [formatDatapoints(stat, metrics.Datapoints ?? [])];
+    const sections = [
+      `Query window: ${range.description}`,
+      formatDatapoints(stat, metrics.Datapoints ?? []),
+    ];
 
     if (args.alarm_name) {
       const history = await client.send(

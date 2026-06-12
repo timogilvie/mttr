@@ -49,6 +49,13 @@ describe('investigatePrompt', () => {
     expect(prompt).toContain('get_metrics_and_alarms');
   });
 
+  it('instructs tool calls to prefer exact report windows', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('Prefer start_time/end_time over lookback_minutes');
+    expect(prompt).toContain('If an exact window is missing');
+  });
+
   it('instructs active log drill-down for high 4xx auth findings', () => {
     const prompt = buildInvestigatePrompt(sampleStep1);
 

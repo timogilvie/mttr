@@ -19,8 +19,10 @@ Use suggested_cloudwatch_queries and signals to target your queries. For finding
 ## Method
 
 - Start from the highest severity / highest confidence items.
+- Use the health report's exact report window for CloudWatch queries when Step 1 or Pre-gathered Tool Evidence provides one. Prefer start_time/end_time over lookback_minutes. If an exact window is missing, explicitly recommend adding it to the health report.
 - Correlate across metrics, logs, and alarm history; look for timing relationships (errors after a deploy, latency before errors, downstream before upstream).
 - Determine whether the affected service is the true source or merely surfacing a downstream failure. Avoid overfitting to a single metric.
+- For ALB 5xx incidents, first verify the ALB metric using the exact LoadBalancer and TargetGroup dimensions when available, then query request logs with a status/path breakdown over the same window. Sampling recent logs is not sufficient to refute a prior-window 5xx count.
 - If Step 1 reports a high 4xx rate or AUTH_FAILURE without direct auth evidence, do not stop at the aggregate count. Use discover_log_groups if needed, then query recent logs to break down 4xx responses by status code, endpoint/path, and caller/client/tenant fields when present. Search for explicit auth terms such as unauthorized, forbidden, token, signature, credential, authentication, and authorization.
 - If log group discovery or log queries fail or return no matching rows, record that as an observability gap and keep the investigation conservative.
 

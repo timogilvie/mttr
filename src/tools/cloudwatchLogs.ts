@@ -9,7 +9,7 @@ import {
 } from '@aws-sdk/client-cloudwatch-logs';
 import { z } from 'zod';
 import type { ToolContext, ToolDefinition } from './types.js';
-import { clampLookback } from './types.js';
+import { resolveToolTimeRange } from './types.js';
 import { awsRetryConfig } from '../util/awsRetry.js';
 
 export class CloudWatchLogsToolError extends Error {
@@ -41,6 +41,8 @@ const argsSchema = z.object({
   log_group: z.string().min(1),
   filter_or_query: z.string().min(1),
   lookback_minutes: z.number().optional(),
+  start_time: z.string().optional(),
+  end_time: z.string().optional(),
   limit: z.number().optional(),
 });
 
@@ -67,7 +69,18 @@ const parametersJsonSchema = {
     },
     lookback_minutes: {
       type: 'number',
-      description: 'How far back to search, in minutes. Clamped to the configured maximum.',
+      description:
+        'How far back to search, in minutes. Used only when start_time/end_time are not provided. Clamped to the configured maximum.',
+    },
+    start_time: {
+      type: 'string',
+      description:
+        'Optional ISO-8601 UTC start time. Use with end_time when the health report provides an exact window.',
+    },
+    end_time: {
+      type: 'string',
+      description:
+        'Optional ISO-8601 UTC end time. Use with start_time when the health report provides an exact window.',
     },
     limit: {
       type: 'number',
@@ -224,9 +237,9 @@ async function discoverHandler(args: DiscoverLogGroupsArgs, ctx: ToolContext): P
 }
 
 async function handler(args: QueryLogsArgs, ctx: ToolContext): Promise<string> {
-  const lookbackMinutes = clampLookback(args.lookback_minutes, ctx);
-  const endTime = Math.floor(Date.now() / 1000);
-  const startTime = endTime - lookbackMinutes * 60;
+  const range = resolveToolTimeRange(args, ctx);
+  const startTime = Math.floor(range.start.getTime() / 1000);
+  const endTime = Math.floor(range.end.getTime() / 1000);
   const limit =
     args.limit && args.limit > 0 ? Math.min(Math.floor(args.limit), MAX_LIMIT) : DEFAULT_LIMIT;
 
@@ -257,7 +270,7 @@ async function handler(args: QueryLogsArgs, ctx: ToolContext): Promise<string> {
       const status = results.status;
 
       if (status === 'Complete') {
-        return formatRows(results.results ?? []);
+        return `Query window: ${range.description}\n${formatRows(results.results ?? [])}`;
       }
       if (status === 'Failed' || status === 'Cancelled' || status === 'Timeout') {
         throw new CloudWatchLogsToolError(`Logs Insights query ${status}`);

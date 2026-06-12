@@ -135,9 +135,17 @@ export interface InvestigationResult {
 
 export type Stage = 'Classify' | 'Investigate' | 'Mitigate' | 'Restore' | 'Verify';
 
+export interface ReportWindow {
+  label: string;
+  generatedAt?: string | undefined;
+  startTime?: string | undefined;
+  endTime?: string | undefined;
+}
+
 export interface StageInput {
   stage: Stage;
   timestamp: string;
+  reportWindow?: ReportWindow | undefined;
 }
 
 export interface StageResult {

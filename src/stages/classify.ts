@@ -1,11 +1,25 @@
 import type { Config } from '../config.js';
 import type { StageInput, StageResult, ClassificationResult } from '../types.js';
 import { fetchReport } from '../report/fetchReport.js';
+import { enrichReportWithExactWindow } from '../report/reportMetadata.js';
 import { buildClassifyPrompt } from '../prompts/classifyPrompt.js';
 import { callOpenRouter } from '../llm/openrouter.js';
 import { parseClassification } from '../validation/classificationSchema.js';
 import { stripMarkdownFences } from '../llm/json.js';
 import { enforceMandatoryIncidents } from '../report/mandatoryIncidents.js';
+
+function formatParseError(error: unknown): string {
+  if (error instanceof Error) {
+    const zodIssues = (error as { zodError?: { issues?: Array<{ path: unknown[]; message: string }> } }).zodError?.issues;
+    const firstIssue = zodIssues?.[0];
+    if (firstIssue) {
+      return `${error.message}: ${firstIssue.path.join('.')} ${firstIssue.message}`;
+    }
+    return error.message;
+  }
+
+  return String(error);
+}
 
 async function attemptParse(
   responseText: string,
@@ -19,11 +33,15 @@ async function attemptParse(
     return parseClassification(parsed);
   } catch (error) {
     if (isRetry) {
-      console.error('[Classify] Retry also failed to parse/validate classification', error);
+      console.error(
+        `[Classify] Retry also failed to parse/validate classification: ${formatParseError(error)}`
+      );
       return null;
     }
 
-    console.warn('[Classify] Initial response invalid, attempting repair retry', error);
+    console.warn(
+      `[Classify] Initial response invalid, attempting repair retry: ${formatParseError(error)}`
+    );
 
     const repairInstruction = `\n\nThe previous response was invalid JSON or did not match the required schema. Please return a valid JSON object matching the exact schema specified in the instructions.`;
     const repairPrompt = (originalPrompt ?? '') + repairInstruction;
@@ -93,7 +111,7 @@ export async function runWithReport(
   const timestamp = new Date().toISOString();
 
   try {
-    return await classifyReport(report, config, timestamp);
+    return await classifyReport(enrichReportWithExactWindow(report), config, timestamp);
   } catch (error) {
     console.error('[Classify] Stage execution failed', error);
     return {

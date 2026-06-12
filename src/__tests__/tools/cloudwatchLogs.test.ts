@@ -77,6 +77,30 @@ describe('cloudwatchLogs query_logs', () => {
     expect(send.mock.calls[1]?.[0]).toBeInstanceOf(GetQueryResultsCommand);
   });
 
+  it('uses absolute start and end times when provided', async () => {
+    const send = vi
+      .fn()
+      .mockResolvedValueOnce({ queryId: 'q-1' })
+      .mockResolvedValueOnce({ status: 'Complete', results: [] });
+    mockClient(send);
+
+    const result = await queryLogsTool.handler(
+      {
+        ...validArgs,
+        start_time: '2026-06-05T11:35:04.000Z',
+        end_time: '2026-06-06T11:35:04.000Z',
+      },
+      ctx
+    );
+
+    const command = send.mock.calls[0]?.[0] as StartQueryCommand;
+    expect(command.input.startTime).toBe(Date.parse('2026-06-05T11:35:04.000Z') / 1000);
+    expect(command.input.endTime).toBe(Date.parse('2026-06-06T11:35:04.000Z') / 1000);
+    expect(result).toContain(
+      'Query window: 2026-06-05T11:35:04.000Z to 2026-06-06T11:35:04.000Z'
+    );
+  });
+
   it('reports zero matching rows clearly', async () => {
     const send = vi
       .fn()

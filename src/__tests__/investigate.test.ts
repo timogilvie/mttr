@@ -89,6 +89,39 @@ const classificationWithFinding: ClassificationResult = {
   ],
 };
 
+const classificationWith5xxIncident: ClassificationResult = {
+  summary: 'ALB 5xx responses detected.',
+  overall_severity: 'HIGH',
+  incidents: [
+    {
+      incident_id: 'mandatory-alb-5xx-data-pipeline-api-0',
+      title: 'ALB 5xx responses for data-pipeline-api',
+      classification: 'APPLICATION_ERROR',
+      severity: 'HIGH',
+      confidence: 0.9,
+      affected_services: ['data-pipeline-api'],
+      evidence: [
+        'Health report shows 10 ALB 5xx responses for hokusai-reg-api-development in the report window.',
+      ],
+      signals: {
+        alarms: [],
+        metrics: ['ALB 5xx responses: 10'],
+        logs: [],
+      },
+      suspected_causes: ['Application returned server errors.'],
+      investigation_plan: {
+        priority: 1,
+        estimated_user_impact: 'PARTIAL',
+        first_actions: ['Inspect logs for 5xx errors.'],
+        questions_to_answer: ['Which endpoint returned 5xx responses?'],
+        suggested_cloudwatch_queries: ['Query 5xx by path.'],
+      },
+      recommended_next_stage: 'INVESTIGATE',
+    },
+  ],
+  findings: [],
+};
+
 describe('investigate stage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -188,6 +221,34 @@ describe('investigate stage', () => {
       expect.objectContaining({ region: 'us-east-1' })
     );
     expect(mockLoop.mock.calls[0]![0].prompt).toContain('standard warning sample');
+  });
+
+  it('pre-gathers 5xx breakdowns over the exact report window when available', async () => {
+    mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+    const input: StageInput = {
+      ...mockInput,
+      reportWindow: {
+        label:
+          'last 24 hours (2026-06-05T11:35:04.000Z to 2026-06-06T11:35:04.000Z)',
+        generatedAt: '2026-06-06T11:35:04.000Z',
+        startTime: '2026-06-05T11:35:04.000Z',
+        endTime: '2026-06-06T11:35:04.000Z',
+      },
+    };
+
+    const result = await investigateStage.run(input, mockConfig, classificationWith5xxIncident);
+
+    expect(result.status).toBe('success');
+    expect(mockQueryLogs).toHaveBeenCalledWith(
+      expect.objectContaining({
+        filter_or_query: expect.stringContaining('status like /^5/'),
+        start_time: '2026-06-05T11:35:04.000Z',
+        end_time: '2026-06-06T11:35:04.000Z',
+      }),
+      expect.objectContaining({ region: 'us-east-1' })
+    );
+    expect(mockLoop.mock.calls[0]![0].prompt).toContain('Health report window');
+    expect(mockLoop.mock.calls[0]![0].prompt).toContain('standard 5xx breakdown');
   });
 
   it('queries multiple non-empty candidate log groups during standard evidence gathering', async () => {

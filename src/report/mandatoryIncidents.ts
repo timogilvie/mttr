@@ -1,4 +1,5 @@
 import type { ClassificationResult, Incident, IncidentClassification, Severity } from '../types.js';
+import { extractReportWindow } from './reportMetadata.js';
 
 interface MandatoryIncidentSpec {
   key: string;
@@ -26,6 +27,7 @@ interface ServiceSection {
 const SERVICE_HEADING_RE = /^### (.+)$/gm;
 const ALARM_ROW_RE = /^\|\s*`([^`]+)`\s*\|\s*`?ALARM`?\s*\|/gm;
 const ALB_ROW_RE = /^\|\s*`?([^|`]+)`?\s*\|\s*([\d,]+|-)\s*\|\s*([\d,]+|-)\s*\|\s*([\d,]+|-)\s*\|\s*([\d,]+|-)\s*\|/gm;
+const ALB_DIMS_RE = /_ALB dims:\s*TargetGroup=`([^`]+)`\s+LoadBalancer=`([^`]+)`_/i;
 
 function splitServiceSections(report: string): ServiceSection[] {
   const matches = [...report.matchAll(SERVICE_HEADING_RE)];
@@ -58,6 +60,17 @@ function severityFor5xx(totalRequests: number | null, fiveXx: number): Severity 
   }
 
   return 'MEDIUM';
+}
+
+function reportWindowText(report: string): string {
+  const window = extractReportWindow(report);
+  if (!window) {
+    return 'the report window';
+  }
+
+  return window.startTime && window.endTime
+    ? `the report window (${window.startTime} to ${window.endTime})`
+    : `the report window (${window.label})`;
 }
 
 function buildIncident(spec: MandatoryIncidentSpec, index: number): Incident {
@@ -145,8 +158,12 @@ function extractActiveAlarmSpecs(report: string): MandatoryIncidentSpec[] {
 }
 
 function extractAlb5xxSpecs(report: string): MandatoryIncidentSpec[] {
+  const windowText = reportWindowText(report);
   return splitServiceSections(report).flatMap(({ service, body }) => {
     const specs: MandatoryIncidentSpec[] = [];
+    const dims = body.match(ALB_DIMS_RE);
+    const targetGroup = dims?.[1];
+    const loadBalancer = dims?.[2];
 
     for (const match of body.matchAll(ALB_ROW_RE)) {
       const target = match[1]?.trim();
@@ -172,20 +189,29 @@ function extractAlb5xxSpecs(report: string): MandatoryIncidentSpec[] {
         severity: severityFor5xx(requests, fiveXx),
         confidence: 0.9,
         affectedService: service,
-        evidence: [`Health report shows ${fiveXx} ALB 5xx responses for ${target}${rate}.`],
-        metrics: [`ALB 5xx responses: ${fiveXx}`],
+        evidence: [`Health report shows ${fiveXx} ALB 5xx responses for ${target}${rate} in ${windowText}.`],
+        metrics: [
+          `ALB 5xx responses: ${fiveXx}`,
+          ...(loadBalancer ? [`LoadBalancer=${loadBalancer}`] : []),
+          ...(targetGroup ? [`TargetGroup=${targetGroup}`] : []),
+        ],
         logs: [],
         suspectedCauses: ['Application or upstream dependency returned server errors behind the load balancer.'],
         firstActions: [
-          `Inspect recent ${service} logs for 5xx errors.`,
-          'Check deployment timing and downstream dependency health for the same window.',
+          `Inspect ${service} logs for 5xx errors in ${windowText}.`,
+          `Check deployment timing and downstream dependency health for ${windowText}.`,
         ],
         questions: [
           'Which endpoint returned the 5xx responses?',
           'Did the errors start after a deploy or dependency change?',
           'Are retries or customers currently affected?',
         ],
-        queries: [`CloudWatch Logs Insights query for ${service} HTTP 5xx responses in the report window.`],
+        queries: [
+          `CloudWatch metric query for AWS/ApplicationELB HTTPCode_Target_5XX_Count in ${windowText}` +
+            `${loadBalancer ? ` with LoadBalancer=${loadBalancer}` : ''}` +
+            `${targetGroup ? ` and TargetGroup=${targetGroup}` : ''}.`,
+          `CloudWatch Logs Insights query for ${service} HTTP 5xx responses in ${windowText}.`,
+        ],
         userImpact: 'PARTIAL',
       });
     }
@@ -195,6 +221,7 @@ function extractAlb5xxSpecs(report: string): MandatoryIncidentSpec[] {
 }
 
 function extractMissingDetectorSpecs(report: string): MandatoryIncidentSpec[] {
+  const windowText = reportWindowText(report);
   return splitServiceSections(report)
     .filter(({ body }) => /No datapoints from the detector's liveness metric/i.test(body))
     .map(({ service }) => ({
@@ -205,14 +232,14 @@ function extractMissingDetectorSpecs(report: string): MandatoryIncidentSpec[] {
       confidence: 0.95,
       affectedService: service,
       evidence: [
-        "Health report says no datapoints were received from the detector's liveness metric in this window.",
+        `Health report says no datapoints were received from the detector's liveness metric in ${windowText}.`,
         'The report states zero datapoints means the detector stopped running and anomalies would go undetected.',
       ],
       metrics: ['Detector liveness metric has zero datapoints.'],
       suspectedCauses: ['Detector runtime, scheduler, permissions, or metric publication path may be broken.'],
       firstActions: [
         'Inspect detector metric history and alarm coverage.',
-        'Locate detector runtime logs or deployment records for the report window.',
+        `Locate detector runtime logs or deployment records for ${windowText}.`,
       ],
       questions: [
         'When did liveness datapoints stop?',

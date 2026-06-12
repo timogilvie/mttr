@@ -78,6 +78,13 @@ const FOUR_XX_QUERY = `fields @timestamp, @message, @logStream
 | sort requests desc
 | limit 25`;
 
+const FIVE_XX_QUERY = `fields @timestamp, @message, @logStream
+| parse @message /"(?<method>\\S+) (?<path>\\S+) HTTP\\/[^"]+" (?<status>\\d{3})/
+| filter status like /^5/
+| stats count(*) as requests by status, path
+| sort requests desc
+| limit 25`;
+
 const WARNING_QUERY = `fields @timestamp, @message, @logStream
 | filter @message like /WARN|Warning|WARNING|warning/
 | sort @timestamp desc
@@ -104,6 +111,10 @@ function itemText(item: Incident | Finding): string {
 
 function needs4xxDrilldown(classification: IncidentClassification, text: string): boolean {
   return classification === 'AUTH_FAILURE' || /\b4xx\b|\b401\b|\b403\b|unauthorized|forbidden/.test(text);
+}
+
+function needs5xxDrilldown(text: string): boolean {
+  return /\b5xx\b|\b50[0-9]\b|server error|application_error/.test(text);
 }
 
 function needsWarningDrilldown(text: string): boolean {
@@ -142,16 +153,38 @@ async function runEvidenceTool(label: string, action: () => Promise<string>): Pr
 
 async function gatherStandardEvidence(
   classification: ClassificationResult,
-  ctx: ToolContext
+  ctx: ToolContext,
+  reportWindow?: StageInput['reportWindow']
 ): Promise<string> {
   const sections: string[] = [];
+  const timeArgs =
+    reportWindow?.startTime && reportWindow.endTime
+      ? { start_time: reportWindow.startTime, end_time: reportWindow.endTime }
+      : { lookback_minutes: ctx.maxLookbackMinutes };
+  const timeLabel =
+    reportWindow?.startTime && reportWindow.endTime
+      ? `${reportWindow.startTime} to ${reportWindow.endTime}`
+      : `${ctx.maxLookbackMinutes} minute lookback`;
+
+  if (reportWindow) {
+    sections.push(
+      [
+        '### Health report window',
+        `label=${reportWindow.label}`,
+        ...(reportWindow.generatedAt ? [`generatedAt=${reportWindow.generatedAt}`] : []),
+        ...(reportWindow.startTime ? [`startTime=${reportWindow.startTime}`] : []),
+        ...(reportWindow.endTime ? [`endTime=${reportWindow.endTime}`] : []),
+      ].join('\n')
+    );
+  }
 
   for (const { id, kind, item } of allItems(classification)) {
     const text = itemText(item);
     const shouldQuery4xx = needs4xxDrilldown(item.classification, text);
+    const shouldQuery5xx = needs5xxDrilldown(text);
     const shouldQueryWarnings = needsWarningDrilldown(text);
 
-    if (!shouldQuery4xx && !shouldQueryWarnings) {
+    if (!shouldQuery4xx && !shouldQuery5xx && !shouldQueryWarnings) {
       continue;
     }
 
@@ -173,13 +206,31 @@ async function gatherStandardEvidence(
         if (shouldQuery4xx) {
           sections.push(
             await runEvidenceTool(
-              `### ${id} ${kind}: standard 4xx/auth breakdown on ${logGroup} (${ctx.maxLookbackMinutes} minute lookback)`,
+              `### ${id} ${kind}: standard 4xx/auth breakdown on ${logGroup} (${timeLabel})`,
               () =>
                 queryLogsTool.handler(
                   {
                     log_group: logGroup,
                     filter_or_query: FOUR_XX_QUERY,
-                    lookback_minutes: ctx.maxLookbackMinutes,
+                    ...timeArgs,
+                    limit: 100,
+                  },
+                  ctx
+                )
+            )
+          );
+        }
+
+        if (shouldQuery5xx) {
+          sections.push(
+            await runEvidenceTool(
+              `### ${id} ${kind}: standard 5xx breakdown on ${logGroup} (${timeLabel})`,
+              () =>
+                queryLogsTool.handler(
+                  {
+                    log_group: logGroup,
+                    filter_or_query: FIVE_XX_QUERY,
+                    ...timeArgs,
                     limit: 100,
                   },
                   ctx
@@ -191,13 +242,13 @@ async function gatherStandardEvidence(
         if (shouldQueryWarnings) {
           sections.push(
             await runEvidenceTool(
-              `### ${id} ${kind}: standard warning sample on ${logGroup} (${ctx.maxLookbackMinutes} minute lookback)`,
+              `### ${id} ${kind}: standard warning sample on ${logGroup} (${timeLabel})`,
               () =>
                 queryLogsTool.handler(
                   {
                     log_group: logGroup,
                     filter_or_query: WARNING_QUERY,
-                    lookback_minutes: ctx.maxLookbackMinutes,
+                    ...timeArgs,
                     limit: 100,
                   },
                   ctx
@@ -232,7 +283,11 @@ export async function run(
     }
 
     const toolContext = buildToolContext(config);
-    const preGatheredEvidence = await gatherStandardEvidence(classification, toolContext);
+    const preGatheredEvidence = await gatherStandardEvidence(
+      classification,
+      toolContext,
+      _input.reportWindow
+    );
     const step1Json = JSON.stringify(classification, null, 2);
     const prompt = buildInvestigatePrompt(step1Json, preGatheredEvidence);
 
