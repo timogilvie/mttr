@@ -202,6 +202,29 @@ const RECENT_ACTIVITY_QUERY = `fields @timestamp, @message, @logStream
 | sort @timestamp desc
 | limit 25`;
 
+const LAMBDA_ERROR_SUMMARY_QUERY = `fields @timestamp, @message, @logStream
+| filter @message like /(?i)(error|exception|traceback|runtimeerror|invalid params|task timed out|failed)/
+| parse @message /(?<errorCode>-\\d{5})/
+| parse @message /(?<rpcError>RPC error\\s+-\\d{5}\\s+[^\\r\\n,\\]]+)/
+| parse @message /(?<exceptionType>[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))[: ]+(?<errorMessage>[^\\r\\n]+)/
+| parse @message /File "(?<file>[^"]+)", line (?<line>\\d+), in (?<function>[^ \\r\\n]+)/
+| stats min(@timestamp) as earliest, max(@timestamp) as latest, count(*) as failures by errorCode, rpcError, exceptionType, errorMessage, file, function, @logStream
+| sort failures desc
+| limit 50`;
+
+const LAMBDA_STACK_FRAME_QUERY = `fields @timestamp, @message, @logStream
+| filter @message like /File "/
+| parse @message /File "(?<file>[^"]+)", line (?<line>\\d+), in (?<function>[^ \\r\\n]+)/
+| stats min(@timestamp) as earliest, max(@timestamp) as latest, count(*) as frames by file, function, @logStream
+| sort frames desc
+| limit 25`;
+
+const LAMBDA_COMPLETION_QUERY = `fields @timestamp, @message, @logStream, @type, @duration, @billedDuration, @maxMemoryUsed
+| filter @type = "REPORT" or @message like /^REPORT RequestId:/
+| stats min(@timestamp) as earliest, max(@timestamp) as latest, count(*) as completedInvocations, avg(@duration) as avgDurationMs, max(@duration) as maxDurationMs, max(@maxMemoryUsed) as maxMemoryUsedMb by @logStream
+| sort latest desc
+| limit 25`;
+
 const ERROR_METRIC_PATTERN = /5xx|4xx|error|fault|failure/i;
 const SPIKE_PADDING_MS = 15 * 60 * 1000;
 
@@ -335,6 +358,21 @@ function rootCauseChangeWindow(ctx: ToolContext): { start_time: string; end_time
   };
 }
 
+function reportWindow(ctx: ToolContext): { start_time: string; end_time: string } | null {
+  if (!ctx.defaultStartTime || !ctx.defaultEndTime) {
+    return null;
+  }
+  const start = new Date(ctx.defaultStartTime).getTime();
+  const end = new Date(ctx.defaultEndTime).getTime();
+  if (Number.isNaN(start) || Number.isNaN(end) || start >= end) {
+    return null;
+  }
+  return {
+    start_time: new Date(start).toISOString(),
+    end_time: new Date(end).toISOString(),
+  };
+}
+
 function extractLogGroups(discoveryResult: string): CandidateLogGroup[] {
   return discoveryResult
     .split('\n')
@@ -459,9 +497,51 @@ async function gatherLambdaRootCauseEvidence(
   id: string,
   kind: InvestigationItem['kind'],
   functionName: string,
+  logWindowArgs: { start_time: string; end_time: string } | { lookback_minutes: number },
+  logWindowLabel: string,
   ctx: ToolContext
 ): Promise<string[]> {
+  const logGroup = `/aws/lambda/${functionName}`;
   const sections = [
+    await runEvidenceTool(
+      `### ${id} ${kind}: Lambda error summary for ${functionName} on ${logGroup} (${logWindowLabel})`,
+      () =>
+        queryLogsTool.handler(
+          {
+            log_group: logGroup,
+            filter_or_query: LAMBDA_ERROR_SUMMARY_QUERY,
+            ...logWindowArgs,
+            limit: 100,
+          },
+          ctx
+        )
+    ),
+    await runEvidenceTool(
+      `### ${id} ${kind}: Lambda stack-frame summary for ${functionName} on ${logGroup} (${logWindowLabel})`,
+      () =>
+        queryLogsTool.handler(
+          {
+            log_group: logGroup,
+            filter_or_query: LAMBDA_STACK_FRAME_QUERY,
+            ...logWindowArgs,
+            limit: 50,
+          },
+          ctx
+        )
+    ),
+    await runEvidenceTool(
+      `### ${id} ${kind}: Lambda completion summary for ${functionName} on ${logGroup} (${logWindowLabel})`,
+      () =>
+        queryLogsTool.handler(
+          {
+            log_group: logGroup,
+            filter_or_query: LAMBDA_COMPLETION_QUERY,
+            ...logWindowArgs,
+            limit: 50,
+          },
+          ctx
+        )
+    ),
     await runEvidenceTool(
       `### ${id} ${kind}: Lambda invocation/error metrics for ${functionName} (root-cause context)`,
       async () => {
@@ -634,9 +714,11 @@ async function gatherStandardEvidence(
     const windowArgs = spike
       ? { start_time: spike.start, end_time: spike.end }
       : { lookback_minutes: ctx.maxLookbackMinutes };
+    const lambdaLogWindowArgs = spike ? windowArgs : reportWindow(ctx) ?? windowArgs;
     const windowLabel = spike
       ? `narrowed to metric spike window ${spike.start}..${spike.end}`
       : `report window or ${ctx.maxLookbackMinutes} minute lookback`;
+    const lambdaLogWindowLabel = spike ? windowLabel : 'report window';
 
     if (shouldQuery5xx) {
       const albDimension = cloudwatchMetrics
@@ -721,7 +803,14 @@ async function gatherStandardEvidence(
           }
           rootCauseFunctionsGathered.add(functionName);
           sections.push(
-            ...(await gatherLambdaRootCauseEvidence(id, kind, functionName, ctx))
+            ...(await gatherLambdaRootCauseEvidence(
+              id,
+              kind,
+              functionName,
+              lambdaLogWindowArgs,
+              lambdaLogWindowLabel,
+              ctx
+            ))
           );
         }
 

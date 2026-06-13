@@ -765,6 +765,33 @@ describe('investigate stage', () => {
         'namespace=AWS/Events, metric=Invocations, dimensions=[RuleName=hokusai-deltaone-anomaly-detector-schedule-development]\n' +
         'namespace=Hokusai/DeltaOneAnomalies, metric=DetectorError, dimensions=[Environment=development]'
     );
+    mockQueryLogs.mockImplementation(async (args) => {
+      if (
+        args.log_group === '/aws/lambda/hokusai-deltaone-anomaly-detector-development' &&
+        args.filter_or_query.includes('RPC error')
+      ) {
+        return (
+          'Query returned 1 row(s):\n' +
+          'earliest=2026-06-12 13:51:20.000, latest=2026-06-12 14:10:05.000, failures=37, errorCode=-32602, rpcError=RPC error -32602 Invalid params, exceptionType=RuntimeError, errorMessage=RPC error -32602 Invalid params, file=deltaone_detector_lambda.py, function=_rpc_call, @logStream=2026/06/12/[$LATEST]abc'
+        );
+      }
+      if (
+        args.log_group === '/aws/lambda/hokusai-deltaone-anomaly-detector-development' &&
+        args.filter_or_query.includes('File "')
+      ) {
+        return (
+          'Query returned 1 row(s):\n' +
+          'file=deltaone_detector_lambda.py, function=_rpc_call, frames=37, @logStream=2026/06/12/[$LATEST]abc'
+        );
+      }
+      if (
+        args.log_group === '/aws/lambda/hokusai-deltaone-anomaly-detector-development' &&
+        args.filter_or_query.includes('completedInvocations')
+      ) {
+        return 'Query returned 1 row(s):\ncompletedInvocations=37, @logStream=2026/06/12/[$LATEST]abc';
+      }
+      return 'Query returned 1 row(s):\nstatus=401, path=/api/probe, requests=12';
+    });
     const observabilityClassification: ClassificationResult = {
       summary: 'Detector liveness missing.',
       overall_severity: 'HIGH',
@@ -840,6 +867,36 @@ describe('investigate stage', () => {
       }),
       expect.anything()
     );
+    expect(mockQueryLogs).toHaveBeenCalledWith(
+      expect.objectContaining({
+        log_group: '/aws/lambda/hokusai-deltaone-anomaly-detector-development',
+        filter_or_query: expect.stringContaining('RPC error'),
+        start_time: '2026-06-12T11:40:38.535Z',
+        end_time: '2026-06-13T11:40:38.535Z',
+        limit: 100,
+      }),
+      expect.anything()
+    );
+    expect(mockQueryLogs).toHaveBeenCalledWith(
+      expect.objectContaining({
+        log_group: '/aws/lambda/hokusai-deltaone-anomaly-detector-development',
+        filter_or_query: expect.stringContaining('File "'),
+        start_time: '2026-06-12T11:40:38.535Z',
+        end_time: '2026-06-13T11:40:38.535Z',
+        limit: 50,
+      }),
+      expect.anything()
+    );
+    expect(mockQueryLogs).toHaveBeenCalledWith(
+      expect.objectContaining({
+        log_group: '/aws/lambda/hokusai-deltaone-anomaly-detector-development',
+        filter_or_query: expect.stringContaining('completedInvocations'),
+        start_time: '2026-06-12T11:40:38.535Z',
+        end_time: '2026-06-13T11:40:38.535Z',
+        limit: 50,
+      }),
+      expect.anything()
+    );
     expect(mockLambdaConfiguration).toHaveBeenCalledTimes(1);
     expect(mockLambdaConfiguration).toHaveBeenCalledWith(
       {
@@ -871,6 +928,10 @@ describe('investigate stage', () => {
     );
 
     const prompt = mockLoop.mock.calls[0]![0].prompt;
+    expect(prompt).toContain('Lambda error summary for hokusai-deltaone-anomaly-detector-development');
+    expect(prompt).toContain('RPC error -32602 Invalid params');
+    expect(prompt).toContain('deltaone_detector_lambda.py');
+    expect(prompt).toContain('Lambda completion summary for hokusai-deltaone-anomaly-detector-development');
     expect(prompt).toContain('Lambda configuration for hokusai-deltaone-anomaly-detector-development');
     expect(prompt).toContain('Lambda deployment metadata for hokusai-deltaone-anomaly-detector-development');
     expect(prompt).toContain('EventBridge rule hokusai-deltaone-anomaly-detector-schedule-development');
