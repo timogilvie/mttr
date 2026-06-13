@@ -5,6 +5,9 @@ import { albAccessLogsTool } from './albAccessLogs.js';
 import { ecsServiceEventsTool } from './ecs.js';
 import { listMetricsTool } from './listMetrics.js';
 import { findAlarmsTool } from './alarms.js';
+import { lambdaConfigurationTool, lambdaDeploymentMetadataTool } from './lambda.js';
+import { eventBridgeRuleTool } from './eventbridge.js';
+import { cloudTrailLookupTool } from './cloudtrail.js';
 
 /**
  * Built-in read-only tools available to the Investigate stage.
@@ -17,6 +20,10 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
   ecsServiceEventsTool as ToolDefinition,
   listMetricsTool as ToolDefinition,
   findAlarmsTool as ToolDefinition,
+  lambdaConfigurationTool as ToolDefinition,
+  cloudTrailLookupTool as ToolDefinition,
+  eventBridgeRuleTool as ToolDefinition,
+  lambdaDeploymentMetadataTool as ToolDefinition,
 ];
 
 export function getTools(): ToolDefinition[] {

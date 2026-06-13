@@ -55,7 +55,8 @@ Required permissions:
 
 - **Classify** reads the health report from S3 (`s3:GetObject` on the report bucket).
 - **Investigate** gathers evidence from CloudWatch Logs Insights and CloudWatch
-  metrics/alarms.
+  metrics/alarms, plus read-only AWS runtime/change metadata for Lambda,
+  EventBridge, ECS, and CloudTrail.
 
 Minimum read-only IAM policy:
 
@@ -90,6 +91,26 @@ Minimum read-only IAM policy:
         "cloudwatch:ListMetrics",
         "cloudwatch:DescribeAlarms",
         "cloudwatch:DescribeAlarmHistory"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "InvestigateRuntimeAndChanges",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:ListAliases",
+        "lambda:ListVersionsByFunction",
+        "events:DescribeRule",
+        "events:ListTargetsByRule",
+        "cloudtrail:LookupEvents",
+        "ecs:ListClusters",
+        "ecs:ListServices",
+        "ecs:DescribeServices",
+        "ecs:ListTasks",
+        "ecs:DescribeTasks",
+        "ecs:DescribeTaskDefinition"
       ],
       "Resource": "*"
     }
