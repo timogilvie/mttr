@@ -29,16 +29,35 @@ const ATTRIBUTE_KEYS = [
 
 const MAX_RESULTS = 50;
 
-const argsSchema = z.object({
-  attribute_key: z.enum(ATTRIBUTE_KEYS).optional(),
-  attribute_value: z.string().min(1).optional(),
+function emptyToUndefined(value: unknown): unknown {
+  return typeof value === 'string' && value.trim() === '' ? undefined : value;
+}
+
+function normalizeArgs(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return value;
+  }
+  const input = value as Record<string, unknown>;
+  return {
+    ...input,
+    attribute_key: emptyToUndefined(input['attribute_key'] ?? input['attributeKey']),
+    attribute_value: emptyToUndefined(input['attribute_value'] ?? input['attributeValue']),
+    resource_name: emptyToUndefined(
+      input['resource_name'] ?? input['resourceName'] ?? input['resource'] ?? input['function_name']
+    ),
+  };
+}
+
+const argsSchema = z.preprocess(normalizeArgs, z.object({
+  attribute_key: z.preprocess(emptyToUndefined, z.enum(ATTRIBUTE_KEYS).optional()),
+  attribute_value: z.preprocess(emptyToUndefined, z.string().min(1).optional()),
   event_names: z.array(z.string().min(1)).optional(),
-  resource_name: z.string().min(1).optional(),
+  resource_name: z.preprocess(emptyToUndefined, z.string().min(1).optional()),
   start_time: z.string().optional(),
   end_time: z.string().optional(),
   lookback_minutes: z.number().optional(),
   limit: z.number().optional(),
-});
+}));
 
 type CloudTrailArgs = z.infer<typeof argsSchema>;
 

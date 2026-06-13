@@ -17,10 +17,28 @@ export class EventBridgeToolError extends Error {
 
 const MAX_TARGETS = 20;
 
-const argsSchema = z.object({
+function emptyToUndefined(value: unknown): unknown {
+  return typeof value === 'string' && value.trim() === '' ? undefined : value;
+}
+
+function normalizeArgs(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return value;
+  }
+  const input = value as Record<string, unknown>;
+  return {
+    ...input,
+    rule_name: input['rule_name'] ?? input['ruleName'] ?? input['rule'] ?? input['name'],
+    event_bus_name: emptyToUndefined(
+      input['event_bus_name'] ?? input['eventBusName'] ?? input['event_bus'] ?? input['eventBus']
+    ),
+  };
+}
+
+const argsSchema = z.preprocess(normalizeArgs, z.object({
   rule_name: z.string().min(1),
-  event_bus_name: z.string().min(1).optional(),
-});
+  event_bus_name: z.preprocess(emptyToUndefined, z.string().min(1).optional()),
+}));
 
 type EventBridgeRuleArgs = z.infer<typeof argsSchema>;
 

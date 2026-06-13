@@ -23,16 +23,37 @@ const MAX_LAYERS_SHOWN = 10;
 const MAX_VERSIONS_SHOWN = 10;
 const MAX_ALIASES_SHOWN = 20;
 
-const functionArgsSchema = z.object({
-  function_name: z.string().min(1),
-  qualifier: z.string().min(1).optional(),
-  include_environment_keys: z.boolean().optional(),
-});
+function emptyToUndefined(value: unknown): unknown {
+  return typeof value === 'string' && value.trim() === '' ? undefined : value;
+}
 
-const deploymentArgsSchema = z.object({
+function normalizeFunctionArgs(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return value;
+  }
+  const input = value as Record<string, unknown>;
+  return {
+    ...input,
+    function_name:
+      input['function_name'] ??
+      input['functionName'] ??
+      input['function'] ??
+      input['lambda_function'] ??
+      input['lambdaFunction'],
+    qualifier: emptyToUndefined(input['qualifier'] ?? input['version'] ?? input['alias']),
+  };
+}
+
+const functionArgsSchema = z.preprocess(normalizeFunctionArgs, z.object({
   function_name: z.string().min(1),
-  qualifier: z.string().min(1).optional(),
-});
+  qualifier: z.preprocess(emptyToUndefined, z.string().min(1).optional()),
+  include_environment_keys: z.boolean().optional(),
+}));
+
+const deploymentArgsSchema = z.preprocess(normalizeFunctionArgs, z.object({
+  function_name: z.string().min(1),
+  qualifier: z.preprocess(emptyToUndefined, z.string().min(1).optional()),
+}));
 
 type FunctionArgs = z.infer<typeof functionArgsSchema>;
 type DeploymentArgs = z.infer<typeof deploymentArgsSchema>;

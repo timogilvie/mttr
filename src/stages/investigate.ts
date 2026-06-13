@@ -15,6 +15,9 @@ import { albAccessLogsTool } from '../tools/albAccessLogs.js';
 import { ecsServiceEventsTool } from '../tools/ecs.js';
 import { listMetricsTool } from '../tools/listMetrics.js';
 import { findAlarmsTool } from '../tools/alarms.js';
+import { lambdaConfigurationTool, lambdaDeploymentMetadataTool } from '../tools/lambda.js';
+import { eventBridgeRuleTool } from '../tools/eventbridge.js';
+import { cloudTrailLookupTool } from '../tools/cloudtrail.js';
 import { parseInvestigation } from '../validation/investigationSchema.js';
 import { stripMarkdownFences } from '../llm/json.js';
 import type { Finding, Incident, IncidentClassification } from '../types.js';
@@ -121,6 +124,17 @@ const SPIKE_PADDING_MS = 15 * 60 * 1000;
 // keeps the call under CloudWatch's 1440-datapoint cap.
 const OBSERVABILITY_METRIC_LOOKBACK_MS = 14 * 24 * 60 * 60 * 1000;
 const OBSERVABILITY_METRIC_PERIOD_SECONDS = 3600;
+const ROOT_CAUSE_CHANGE_LOOKBACK_MS = 72 * 60 * 60 * 1000;
+const LAMBDA_CHANGE_EVENTS = [
+  'CreateFunction',
+  'UpdateFunctionCode',
+  'UpdateFunctionConfiguration',
+  'PublishVersion',
+  'CreateAlias',
+  'UpdateAlias',
+  'TagResource',
+];
+const EVENTBRIDGE_CHANGE_EVENTS = ['PutRule', 'PutTargets', 'EnableRule', 'DisableRule', 'TagResource'];
 
 interface SpikeWindow {
   start: string;
@@ -216,6 +230,21 @@ function extendedMetricWindow(ctx: ToolContext): { start_time: string; end_time:
   };
 }
 
+function rootCauseChangeWindow(ctx: ToolContext): { start_time: string; end_time: string } | null {
+  if (!ctx.defaultStartTime || !ctx.defaultEndTime) {
+    return null;
+  }
+  const start = new Date(ctx.defaultStartTime).getTime();
+  const end = new Date(ctx.defaultEndTime).getTime();
+  if (Number.isNaN(start) || Number.isNaN(end)) {
+    return null;
+  }
+  return {
+    start_time: new Date(start - ROOT_CAUSE_CHANGE_LOOKBACK_MS).toISOString(),
+    end_time: new Date(end).toISOString(),
+  };
+}
+
 function extractLogGroups(discoveryResult: string): CandidateLogGroup[] {
   return discoveryResult
     .split('\n')
@@ -237,6 +266,136 @@ function selectStandardLogGroups(discoveryResult: string): string[] {
     .map((group) => group.name);
 }
 
+function extractMetricDimensionValues(metricDiscovery: string, dimensionName: string): string[] {
+  const values = new Set<string>();
+  const pattern = new RegExp(`(?:^|[,\\[]\\s*)${dimensionName}=([^,\\]]+)`, 'g');
+  for (const line of metricDiscovery.split('\n')) {
+    for (const match of line.matchAll(pattern)) {
+      const value = match[1]?.trim();
+      if (value) {
+        values.add(value);
+      }
+    }
+  }
+  return [...values];
+}
+
+function selectLambdaFunctions(metricDiscovery: string): string[] {
+  return extractMetricDimensionValues(metricDiscovery, 'FunctionName').filter((name) =>
+    /^hokusai-.*-(?:development|staging|production)$/.test(name)
+  );
+}
+
+function selectEventBridgeRules(metricDiscovery: string): string[] {
+  return extractMetricDimensionValues(metricDiscovery, 'RuleName').filter((name) =>
+    /^hokusai-.*-(?:development|staging|production)$/.test(name)
+  );
+}
+
+async function gatherLambdaRootCauseEvidence(
+  id: string,
+  kind: InvestigationItem['kind'],
+  functionName: string,
+  ctx: ToolContext
+): Promise<string[]> {
+  const sections = [
+    await runEvidenceTool(
+      `### ${id} ${kind}: Lambda invocation/error metrics for ${functionName} (root-cause context)`,
+      async () => {
+        const invocations = await metricsAndAlarmsTool.handler(
+          {
+            namespace: 'AWS/Lambda',
+            metric_name: 'Invocations',
+            dimensions: [{ name: 'FunctionName', value: functionName }],
+            stat: 'Sum',
+            period_seconds: OBSERVABILITY_METRIC_PERIOD_SECONDS,
+          },
+          ctx
+        );
+        const errors = await metricsAndAlarmsTool.handler(
+          {
+            namespace: 'AWS/Lambda',
+            metric_name: 'Errors',
+            dimensions: [{ name: 'FunctionName', value: functionName }],
+            stat: 'Sum',
+            period_seconds: OBSERVABILITY_METRIC_PERIOD_SECONDS,
+          },
+          ctx
+        );
+        return `Invocations:\n${invocations}\n\nErrors:\n${errors}`;
+      }
+    ),
+    await runEvidenceTool(
+      `### ${id} ${kind}: Lambda configuration for ${functionName} (root-cause context)`,
+      () =>
+        lambdaConfigurationTool.handler(
+          { function_name: functionName, include_environment_keys: true },
+          ctx
+        )
+    ),
+    await runEvidenceTool(
+      `### ${id} ${kind}: Lambda deployment metadata for ${functionName} (root-cause context)`,
+      () => lambdaDeploymentMetadataTool.handler({ function_name: functionName }, ctx)
+    ),
+  ];
+
+  const changeWindow = rootCauseChangeWindow(ctx);
+  if (changeWindow) {
+    sections.push(
+      await runEvidenceTool(
+        `### ${id} ${kind}: CloudTrail Lambda changes for ${functionName} (72h before report window through window end)`,
+        () =>
+          cloudTrailLookupTool.handler(
+            {
+              resource_name: functionName,
+              event_names: LAMBDA_CHANGE_EVENTS,
+              ...changeWindow,
+              limit: 50,
+            },
+            ctx
+          )
+      )
+    );
+  }
+
+  return sections;
+}
+
+async function gatherEventBridgeRootCauseEvidence(
+  id: string,
+  kind: InvestigationItem['kind'],
+  ruleName: string,
+  ctx: ToolContext
+): Promise<string[]> {
+  const sections = [
+    await runEvidenceTool(
+      `### ${id} ${kind}: EventBridge rule ${ruleName} (root-cause context)`,
+      () => eventBridgeRuleTool.handler({ rule_name: ruleName }, ctx)
+    ),
+  ];
+
+  const changeWindow = rootCauseChangeWindow(ctx);
+  if (changeWindow) {
+    sections.push(
+      await runEvidenceTool(
+        `### ${id} ${kind}: CloudTrail EventBridge changes for ${ruleName} (72h before report window through window end)`,
+        () =>
+          cloudTrailLookupTool.handler(
+            {
+              resource_name: ruleName,
+              event_names: EVENTBRIDGE_CHANGE_EVENTS,
+              ...changeWindow,
+              limit: 50,
+            },
+            ctx
+          )
+      )
+    );
+  }
+
+  return sections;
+}
+
 async function runEvidenceTool(label: string, action: () => Promise<string>): Promise<string> {
   try {
     const result = await action();
@@ -251,6 +410,8 @@ async function gatherStandardEvidence(
   ctx: ToolContext
 ): Promise<string> {
   const sections: string[] = [];
+  const rootCauseFunctionsGathered = new Set<string>();
+  const rootCauseRulesGathered = new Set<string>();
 
   for (const { id, kind, item } of allItems(classification)) {
     const text = itemText(item);
@@ -350,18 +511,37 @@ async function gatherStandardEvidence(
       }
 
       if (shouldQueryObservability) {
-        sections.push(
-          await runEvidenceTool(
-            `### ${id} ${kind}: metric discovery for ${service}`,
-            () => listMetricsTool.handler({ search: service }, ctx)
-          )
+        const metricDiscovery = await runEvidenceTool(
+          `### ${id} ${kind}: metric discovery for ${service}`,
+          () => listMetricsTool.handler({ search: service }, ctx)
         );
+        sections.push(metricDiscovery);
         sections.push(
           await runEvidenceTool(
             `### ${id} ${kind}: alarm coverage for ${service}`,
             () => findAlarmsTool.handler({ search: service }, ctx)
           )
         );
+
+        for (const functionName of selectLambdaFunctions(metricDiscovery)) {
+          if (rootCauseFunctionsGathered.has(functionName)) {
+            continue;
+          }
+          rootCauseFunctionsGathered.add(functionName);
+          sections.push(
+            ...(await gatherLambdaRootCauseEvidence(id, kind, functionName, ctx))
+          );
+        }
+
+        for (const ruleName of selectEventBridgeRules(metricDiscovery)) {
+          if (rootCauseRulesGathered.has(ruleName)) {
+            continue;
+          }
+          rootCauseRulesGathered.add(ruleName);
+          sections.push(
+            ...(await gatherEventBridgeRootCauseEvidence(id, kind, ruleName, ctx))
+          );
+        }
       }
 
       const discovery = await runEvidenceTool(
