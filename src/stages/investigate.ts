@@ -4,6 +4,7 @@ import type {
   StageResult,
   ClassificationResult,
   InvestigationResult,
+  Investigation,
 } from '../types.js';
 import { buildInvestigatePrompt } from '../prompts/investigatePrompt.js';
 import { callOpenRouterWithTools, type ToolLoopOptions } from '../llm/toolLoop.js';
@@ -68,6 +69,83 @@ function tryParse(text: string): InvestigationResult | null {
   } catch {
     return null;
   }
+}
+
+function hasExecutableNextSteps(investigation: Investigation): boolean {
+  return investigation.recommended_next_investigation_steps.some((step) => {
+    const text = `${step.action} ${step.expected_signal}`;
+    return EXECUTABLE_NEXT_STEP_PATTERN.test(text) && !NON_EXECUTABLE_NEXT_STEP_PATTERN.test(text);
+  });
+}
+
+function needsRootCauseClosure(result: InvestigationResult): boolean {
+  return result.investigations.some(
+    (investigation) =>
+      investigation.requires_more_evidence_before_mitigation &&
+      hasExecutableNextSteps(investigation)
+  );
+}
+
+function buildRootCauseClosurePrompt(
+  originalPrompt: string,
+  draft: InvestigationResult,
+  maxToolCalls: number
+): string {
+  return `${originalPrompt}
+
+## Root-Cause Closure Pass
+
+You already produced this draft investigation JSON:
+
+${JSON.stringify(draft, null, 2)}
+
+Before finalizing, resolve avoidable deferrals. For any investigation where requires_more_evidence_before_mitigation=true and recommended_next_investigation_steps contains a step executable with the available read-only tools, call the relevant tool now and fold the result into the final JSON.
+
+Hard limits for this closure pass:
+- Use at most ${maxToolCalls} tool call(s) total.
+- Only run read-only evidence calls available in this stage: CloudWatch logs, metrics, alarms, Lambda metadata, EventBridge, ECS, ALB access logs, and CloudTrail.
+- Do not remediate, mutate infrastructure, inspect secret values, or request human-only actions as tool work.
+- If the root trigger remains unknown after the closure calls, keep requires_more_evidence_before_mitigation=true and make the remaining unknowns precise.
+- Return the full revised JSON object only.`;
+}
+
+async function maybeRunRootCauseClosure(
+  draft: InvestigationResult,
+  loopOptions: ToolLoopOptions,
+  originalPrompt: string,
+  config: Config
+): Promise<InvestigationResult> {
+  if (!config.investigate.closureEnabled || !needsRootCauseClosure(draft)) {
+    return draft;
+  }
+
+  const maxIterations = Math.max(1, config.investigate.closureMaxToolIterations);
+  const maxToolCalls = Math.max(0, config.investigate.closureMaxToolCalls);
+  if (maxToolCalls === 0) {
+    return draft;
+  }
+
+  console.log(
+    `[Investigate] Starting root-cause closure pass (max ${maxIterations} iteration(s), ${maxToolCalls} tool call(s))`
+  );
+
+  const closure = await callOpenRouterWithTools({
+    ...loopOptions,
+    prompt: buildRootCauseClosurePrompt(originalPrompt, draft, maxToolCalls),
+    maxIterations,
+    maxToolCalls,
+  });
+  console.log(
+    `[Investigate] Root-cause closure pass completed: ${closure.iterations} iteration(s), ${closure.toolCalls} tool call(s)` +
+      (closure.usedFallback ? ' (used fallback model)' : '')
+  );
+
+  const revised = tryParse(closure.content);
+  if (!revised) {
+    console.warn('[Investigate] Root-cause closure response invalid; keeping first-pass draft');
+    return draft;
+  }
+  return revised;
 }
 
 type InvestigationItem =
@@ -135,6 +213,10 @@ const LAMBDA_CHANGE_EVENTS = [
   'TagResource',
 ];
 const EVENTBRIDGE_CHANGE_EVENTS = ['PutRule', 'PutTargets', 'EnableRule', 'DisableRule', 'TagResource'];
+const EXECUTABLE_NEXT_STEP_PATTERN =
+  /\b(?:cloudwatch|metric|alarm|logs?|lambda|eventbridge|cloudtrail|ecs|alb|query|lookup|inspect|discover|get_metrics_and_alarms|find_alarms|query_logs|list_metrics|get_lambda_configuration|get_lambda_deployment_metadata|get_eventbridge_rule|lookup_cloudtrail_events|get_ecs_service_events|query_alb_access_logs)\b/i;
+const NON_EXECUTABLE_NEXT_STEP_PATTERN =
+  /\b(?:human|manual|review source|source code|code review|patch|deploy|rollback|restart|contact|vendor|ssh|database write|write|mutate|secret value|credentials?|api key|runbook outside|external system)\b/i;
 
 interface SpikeWindow {
   start: string;
@@ -701,7 +783,8 @@ export async function run(
 
     const parsed = tryParse(first.content);
     if (parsed) {
-      return { stage: 'Investigate', status: 'success', timestamp, data: parsed };
+      const closed = await maybeRunRootCauseClosure(parsed, loopOptions, prompt, config);
+      return { stage: 'Investigate', status: 'success', timestamp, data: closed };
     }
 
     // One repair retry: ask for valid JSON only, with no tools (we already have
@@ -720,7 +803,8 @@ export async function run(
 
     const repaired = tryParse(repair.content);
     if (repaired) {
-      return { stage: 'Investigate', status: 'success', timestamp, data: repaired };
+      const closed = await maybeRunRootCauseClosure(repaired, loopOptions, prompt, config);
+      return { stage: 'Investigate', status: 'success', timestamp, data: closed };
     }
 
     console.error('[Investigate] Repair retry also failed to parse/validate');

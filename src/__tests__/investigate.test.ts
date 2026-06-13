@@ -93,6 +93,9 @@ const mockConfig: Config = {
     modelFallback: 'test-fallback-model',
     maxToolIterations: 6,
     maxToolCalls: 12,
+    closureEnabled: true,
+    closureMaxToolIterations: 2,
+    closureMaxToolCalls: 3,
     consecutiveFailureLimit: 3,
     llmTimeoutMs: 120000,
   },
@@ -119,6 +122,102 @@ const validInvestigationJson = JSON.stringify({
   investigations: [],
   cross_cutting_observations: [],
   priority_order: [],
+});
+
+function investigationJsonWithClosureNeed(summary = 'Draft needs closure.'): string {
+  return JSON.stringify({
+    summary,
+    overall_assessment: 'ACTIVE_INCIDENT',
+    overall_severity: 'HIGH',
+    investigations: [
+      {
+        incident_id: 'incident-1',
+        title: 'Detector failing',
+        original_classification: 'OBSERVABILITY_FAILURE',
+        investigation_status: 'CONFIRMED_INCIDENT',
+        severity: 'HIGH',
+        confidence: 0.95,
+        affected_services: ['deltaone-anomaly-detection'],
+        confirmed_facts: ['Lambda is failing.'],
+        supporting_evidence: ['Errors equal invocations.'],
+        contradicting_evidence: [],
+        likely_causes: [
+          {
+            cause: 'RPC request is rejected.',
+            confidence: 0.8,
+            evidence: ['Runtime logs show Invalid params.'],
+          },
+        ],
+        unknowns: ['Whether a CloudTrail configuration change caused this.'],
+        additional_data_needed: [],
+        recommended_next_investigation_steps: [
+          {
+            priority: 1,
+            action: 'Query CloudTrail and CloudWatch metrics for the detector.',
+            expected_signal: 'A dependency or metric change around failure onset.',
+          },
+        ],
+        requires_more_evidence_before_mitigation: true,
+        possible_future_remediation: [],
+      },
+    ],
+    cross_cutting_observations: [],
+    priority_order: [
+      {
+        rank: 1,
+        incident_id: 'incident-1',
+        title: 'Detector failing',
+        reason: 'High-severity confirmed detector failure.',
+      },
+    ],
+  });
+}
+
+const closedInvestigationJson = JSON.stringify({
+  summary: 'Closure evidence gathered.',
+  overall_assessment: 'ACTIVE_INCIDENT',
+  overall_severity: 'HIGH',
+  investigations: [
+    {
+      incident_id: 'incident-1',
+      title: 'Detector failing',
+      original_classification: 'OBSERVABILITY_FAILURE',
+      investigation_status: 'CONFIRMED_INCIDENT',
+      severity: 'HIGH',
+      confidence: 0.95,
+      affected_services: ['deltaone-anomaly-detection'],
+      confirmed_facts: ['Closure pass queried CloudTrail.'],
+      supporting_evidence: ['No CloudTrail changes were found.'],
+      contradicting_evidence: [],
+      likely_causes: [
+        {
+          cause: 'RPC request is rejected.',
+          confidence: 0.8,
+          evidence: ['Runtime logs show Invalid params.'],
+        },
+      ],
+      unknowns: ['Root trigger remains outside available evidence.'],
+      additional_data_needed: [],
+      recommended_next_investigation_steps: [
+        {
+          priority: 1,
+          action: 'Review source code and upstream RPC contract manually.',
+          expected_signal: 'A parameter-schema mismatch.',
+        },
+      ],
+      requires_more_evidence_before_mitigation: true,
+      possible_future_remediation: [],
+    },
+  ],
+  cross_cutting_observations: [],
+  priority_order: [
+    {
+      rank: 1,
+      incident_id: 'incident-1',
+      title: 'Detector failing',
+      reason: 'High-severity confirmed detector failure.',
+    },
+  ],
 });
 
 function loopResult(content: string) {
@@ -715,6 +814,81 @@ describe('investigate stage', () => {
 
     expect(result.status).toBe('success');
     expect((result.data as InvestigationResult).overall_assessment).toBe('POSSIBLE_INCIDENT');
+  });
+
+  it('runs one bounded root-cause closure pass when the draft defers executable evidence', async () => {
+    mockLoop
+      .mockResolvedValueOnce(loopResult(investigationJsonWithClosureNeed()))
+      .mockResolvedValueOnce(loopResult(closedInvestigationJson));
+
+    const result = await investigateStage.run(mockInput, mockConfig, classificationWithFinding);
+
+    expect(result.status).toBe('success');
+    expect(mockLoop).toHaveBeenCalledTimes(2);
+    expect(mockLoop.mock.calls[1]![0]).toEqual(
+      expect.objectContaining({
+        maxIterations: mockConfig.investigate.closureMaxToolIterations,
+        maxToolCalls: mockConfig.investigate.closureMaxToolCalls,
+      })
+    );
+    expect(mockLoop.mock.calls[1]![0].prompt).toContain('Root-Cause Closure Pass');
+    expect(mockLoop.mock.calls[1]![0].prompt).toContain('Draft needs closure.');
+    expect((result.data as InvestigationResult).summary).toBe('Closure evidence gathered.');
+  });
+
+  it('does not run repeated closure passes even if closure output still defers executable evidence', async () => {
+    mockLoop
+      .mockResolvedValueOnce(loopResult(investigationJsonWithClosureNeed('Draft needs closure.')))
+      .mockResolvedValueOnce(loopResult(investigationJsonWithClosureNeed('Still needs closure.')));
+
+    const result = await investigateStage.run(mockInput, mockConfig, classificationWithFinding);
+
+    expect(result.status).toBe('success');
+    expect(mockLoop).toHaveBeenCalledTimes(2);
+    expect((result.data as InvestigationResult).summary).toBe('Still needs closure.');
+  });
+
+  it('skips closure when remaining investigation steps are not tool-executable', async () => {
+    const humanOnlyDraft = JSON.parse(investigationJsonWithClosureNeed()) as InvestigationResult;
+    humanOnlyDraft.investigations[0]!.recommended_next_investigation_steps = [
+      {
+        priority: 1,
+        action: 'Review source code manually with the owning team.',
+        expected_signal: 'A code-level RPC parameter mismatch.',
+      },
+    ];
+    mockLoop.mockResolvedValue(loopResult(JSON.stringify(humanOnlyDraft)));
+
+    const result = await investigateStage.run(mockInput, mockConfig, classificationWithFinding);
+
+    expect(result.status).toBe('success');
+    expect(mockLoop).toHaveBeenCalledTimes(1);
+    expect((result.data as InvestigationResult).summary).toBe('Draft needs closure.');
+  });
+
+  it('keeps the first-pass draft when closure returns invalid JSON', async () => {
+    mockLoop
+      .mockResolvedValueOnce(loopResult(investigationJsonWithClosureNeed()))
+      .mockResolvedValueOnce(loopResult('not valid json'));
+
+    const result = await investigateStage.run(mockInput, mockConfig, classificationWithFinding);
+
+    expect(result.status).toBe('success');
+    expect(mockLoop).toHaveBeenCalledTimes(2);
+    expect((result.data as InvestigationResult).summary).toBe('Draft needs closure.');
+  });
+
+  it('skips closure when disabled by config', async () => {
+    mockLoop.mockResolvedValue(loopResult(investigationJsonWithClosureNeed()));
+
+    const result = await investigateStage.run(mockInput, {
+      ...mockConfig,
+      investigate: { ...mockConfig.investigate, closureEnabled: false },
+    }, classificationWithFinding);
+
+    expect(result.status).toBe('success');
+    expect(mockLoop).toHaveBeenCalledTimes(1);
+    expect((result.data as InvestigationResult).summary).toBe('Draft needs closure.');
   });
 
   it('repairs once on invalid JSON and succeeds', async () => {

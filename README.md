@@ -42,7 +42,11 @@ Commonly tuned (with defaults):
 
 The Investigate stage's tool loop and rate-limit behaviour are bounded by several budgets
 (`INVESTIGATE_MAX_TOOL_ITERATIONS`, `INVESTIGATE_MAX_TOOL_CALLS`, `INVESTIGATE_LLM_TIMEOUT_MS`,
-`INVESTIGATE_CONSECUTIVE_FAILURE_LIMIT`, `TOOL_*`, `OPENROUTER_*`, `AWS_MAX_ATTEMPTS`). See
+`INVESTIGATE_CONSECUTIVE_FAILURE_LIMIT`, `TOOL_*`, `OPENROUTER_*`, `AWS_MAX_ATTEMPTS`). When a
+draft investigation defers tool-executable root-cause checks while
+`requires_more_evidence_before_mitigation=true`, Investigate may run one bounded closure pass
+controlled by `INVESTIGATE_CLOSURE_ENABLED`, `INVESTIGATE_CLOSURE_MAX_TOOL_ITERATIONS`, and
+`INVESTIGATE_CLOSURE_MAX_TOOL_CALLS`. See
 `.env.example` for all of them.
 
 ## AWS access (read-only)
@@ -142,6 +146,8 @@ telemetry") and the stage degrades to a triage / data-request result rather than
 The Investigate stage drives read-only tools through a multi-turn loop that cannot run away:
 
 - per-run iteration and global tool-call budgets, then a forced final answer with no tools;
+- at most one smaller root-cause closure pass when the first valid JSON still defers
+  executable evidence-gathering steps;
 - a whole-loop timeout (`INVESTIGATE_LLM_TIMEOUT_MS`);
 - a circuit breaker on consecutive failing tool turns;
 - 429/5xx backoff on OpenRouter and adaptive throttling-retry on AWS clients;

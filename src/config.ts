@@ -12,6 +12,9 @@ export interface Config {
     modelFallback: string;
     maxToolIterations: number;
     maxToolCalls: number;
+    closureEnabled: boolean;
+    closureMaxToolIterations: number;
+    closureMaxToolCalls: number;
     consecutiveFailureLimit: number;
     llmTimeoutMs: number;
   };
@@ -64,6 +67,20 @@ function getEnvNumber(key: string, defaultValue: number): number {
   return parsed;
 }
 
+function getEnvBoolean(key: string, defaultValue: boolean): boolean {
+  const value = process.env[key];
+  if (value === undefined || value === '') {
+    return defaultValue;
+  }
+  if (/^(?:1|true|yes|on)$/i.test(value)) {
+    return true;
+  }
+  if (/^(?:0|false|no|off)$/i.test(value)) {
+    return false;
+  }
+  throw new Error(`Environment variable ${key} must be a valid boolean, got: ${value}`);
+}
+
 export function loadConfig(): Config {
   return {
     openrouter: {
@@ -79,6 +96,9 @@ export function loadConfig(): Config {
       modelFallback: getEnv('INVESTIGATE_MODEL_FALLBACK', 'anthropic/claude-3.5-sonnet'),
       maxToolIterations: getEnvNumber('INVESTIGATE_MAX_TOOL_ITERATIONS', 6),
       maxToolCalls: getEnvNumber('INVESTIGATE_MAX_TOOL_CALLS', 12),
+      closureEnabled: getEnvBoolean('INVESTIGATE_CLOSURE_ENABLED', true),
+      closureMaxToolIterations: getEnvNumber('INVESTIGATE_CLOSURE_MAX_TOOL_ITERATIONS', 2),
+      closureMaxToolCalls: getEnvNumber('INVESTIGATE_CLOSURE_MAX_TOOL_CALLS', 3),
       consecutiveFailureLimit: getEnvNumber('INVESTIGATE_CONSECUTIVE_FAILURE_LIMIT', 3),
       llmTimeoutMs: getEnvNumber('INVESTIGATE_LLM_TIMEOUT_MS', 120000),
     },
