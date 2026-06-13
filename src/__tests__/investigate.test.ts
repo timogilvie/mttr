@@ -7,6 +7,9 @@ import { albAccessLogsTool } from '../tools/albAccessLogs.js';
 import { ecsServiceEventsTool } from '../tools/ecs.js';
 import { listMetricsTool } from '../tools/listMetrics.js';
 import { findAlarmsTool } from '../tools/alarms.js';
+import { lambdaConfigurationTool, lambdaDeploymentMetadataTool } from '../tools/lambda.js';
+import { eventBridgeRuleTool } from '../tools/eventbridge.js';
+import { cloudTrailLookupTool } from '../tools/cloudtrail.js';
 import type { Config } from '../config.js';
 import type { StageInput, ClassificationResult, InvestigationResult } from '../types.js';
 
@@ -44,6 +47,24 @@ vi.mock('../tools/alarms.js', () => ({
     handler: vi.fn(),
   },
 }));
+vi.mock('../tools/lambda.js', () => ({
+  lambdaConfigurationTool: {
+    handler: vi.fn(),
+  },
+  lambdaDeploymentMetadataTool: {
+    handler: vi.fn(),
+  },
+}));
+vi.mock('../tools/eventbridge.js', () => ({
+  eventBridgeRuleTool: {
+    handler: vi.fn(),
+  },
+}));
+vi.mock('../tools/cloudtrail.js', () => ({
+  cloudTrailLookupTool: {
+    handler: vi.fn(),
+  },
+}));
 
 const mockLoop = vi.mocked(callOpenRouterWithTools);
 const mockDiscoverLogGroups = vi.mocked(discoverLogGroupsTool.handler);
@@ -53,6 +74,10 @@ const mockAlbAccessLogs = vi.mocked(albAccessLogsTool.handler);
 const mockEcsServiceEvents = vi.mocked(ecsServiceEventsTool.handler);
 const mockListMetrics = vi.mocked(listMetricsTool.handler);
 const mockFindAlarms = vi.mocked(findAlarmsTool.handler);
+const mockLambdaConfiguration = vi.mocked(lambdaConfigurationTool.handler);
+const mockLambdaDeploymentMetadata = vi.mocked(lambdaDeploymentMetadataTool.handler);
+const mockEventBridgeRule = vi.mocked(eventBridgeRuleTool.handler);
+const mockCloudTrailLookup = vi.mocked(cloudTrailLookupTool.handler);
 
 const mockConfig: Config = {
   openrouter: {
@@ -194,6 +219,16 @@ describe('investigate stage', () => {
       'Found 1 metric(s):\nnamespace=Hokusai/Detectors, metric=DetectorLiveness, dimensions=[Detector=deltaone-anomaly-detection]'
     );
     mockFindAlarms.mockResolvedValue('No alarms found for search "deltaone-anomaly-detection".');
+    mockLambdaConfiguration.mockResolvedValue(
+      'function=hokusai-deltaone-anomaly-detector-development\nruntime=python3.12'
+    );
+    mockLambdaDeploymentMetadata.mockResolvedValue(
+      'Current function artifact:\ncodeSha256=abc123'
+    );
+    mockEventBridgeRule.mockResolvedValue(
+      'rule=hokusai-deltaone-anomaly-detector-schedule-development\nstate=ENABLED'
+    );
+    mockCloudTrailLookup.mockResolvedValue('No CloudTrail events found.');
   });
 
   it('short-circuits on empty classification with no LLM call', async () => {
@@ -531,6 +566,126 @@ describe('investigate stage', () => {
     expect(prompt).toContain('alarm coverage for deltaone-anomaly-detection');
     expect(prompt).toContain('extended 14-day history for Hokusai/Detectors/DetectorLiveness');
     expect(prompt).toContain('recent runtime activity sample');
+  });
+
+  it('pre-gathers Lambda and scheduler root-cause evidence for discovered detector workloads', async () => {
+    mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+    mockListMetrics.mockResolvedValue(
+      'Found 3 metric(s):\n' +
+        'namespace=AWS/Lambda, metric=Errors, dimensions=[FunctionName=hokusai-deltaone-anomaly-detector-development]\n' +
+        'namespace=AWS/Events, metric=Invocations, dimensions=[RuleName=hokusai-deltaone-anomaly-detector-schedule-development]\n' +
+        'namespace=Hokusai/DeltaOneAnomalies, metric=DetectorError, dimensions=[Environment=development]'
+    );
+    const observabilityClassification: ClassificationResult = {
+      summary: 'Detector liveness missing.',
+      overall_severity: 'HIGH',
+      report_context: {
+        window_start: '2026-06-12T11:40:38.535Z',
+        window_end: '2026-06-13T11:40:38.535Z',
+      },
+      incidents: [
+        {
+          incident_id: 'mandatory-missing-detector-liveness-deltaone-anomaly-detection-1',
+          title: 'No detector liveness datapoints for deltaone-anomaly-detection',
+          classification: 'OBSERVABILITY_FAILURE',
+          severity: 'HIGH',
+          confidence: 0.95,
+          affected_services: ['deltaone-anomaly-detection'],
+          evidence: ['No datapoints received from the detector liveness metric in this window.'],
+          signals: {
+            alarms: [],
+            metrics: ['Detector liveness metric has zero datapoints.'],
+            logs: [],
+            cloudwatch_metrics: [],
+          },
+          suspected_causes: ['Detector runtime or metric publication path broken.'],
+          investigation_plan: {
+            priority: 1,
+            estimated_user_impact: 'SIGNIFICANT',
+            first_actions: [],
+            questions_to_answer: [],
+            suggested_cloudwatch_queries: [],
+          },
+          recommended_next_stage: 'INVESTIGATE',
+        },
+      ],
+      findings: [
+        {
+          title: 'High number of detector errors in deltaone-anomaly-detection',
+          classification: 'OBSERVABILITY_FAILURE',
+          severity: 'MEDIUM',
+          confidence: 0.7,
+          affected_services: ['deltaone-anomaly-detection'],
+          evidence: ['3923 detector error(s) reported.'],
+          reason_not_incident: 'No direct user impact confirmed.',
+        },
+      ],
+    };
+
+    const result = await investigateStage.run(
+      mockInput,
+      mockConfig,
+      observabilityClassification
+    );
+
+    expect(result.status).toBe('success');
+    expect(mockMetricsAndAlarms).toHaveBeenCalledWith(
+      expect.objectContaining({
+        namespace: 'AWS/Lambda',
+        metric_name: 'Invocations',
+        dimensions: [
+          { name: 'FunctionName', value: 'hokusai-deltaone-anomaly-detector-development' },
+        ],
+        stat: 'Sum',
+        period_seconds: 3600,
+      }),
+      expect.anything()
+    );
+    expect(mockMetricsAndAlarms).toHaveBeenCalledWith(
+      expect.objectContaining({
+        namespace: 'AWS/Lambda',
+        metric_name: 'Errors',
+        dimensions: [
+          { name: 'FunctionName', value: 'hokusai-deltaone-anomaly-detector-development' },
+        ],
+      }),
+      expect.anything()
+    );
+    expect(mockLambdaConfiguration).toHaveBeenCalledTimes(1);
+    expect(mockLambdaConfiguration).toHaveBeenCalledWith(
+      {
+        function_name: 'hokusai-deltaone-anomaly-detector-development',
+        include_environment_keys: true,
+      },
+      expect.anything()
+    );
+    expect(mockLambdaDeploymentMetadata).toHaveBeenCalledTimes(1);
+    expect(mockEventBridgeRule).toHaveBeenCalledWith(
+      { rule_name: 'hokusai-deltaone-anomaly-detector-schedule-development' },
+      expect.anything()
+    );
+    expect(mockCloudTrailLookup).toHaveBeenCalledWith(
+      expect.objectContaining({
+        resource_name: 'hokusai-deltaone-anomaly-detector-development',
+        start_time: '2026-06-09T11:40:38.535Z',
+        end_time: '2026-06-13T11:40:38.535Z',
+      }),
+      expect.anything()
+    );
+    expect(mockCloudTrailLookup).toHaveBeenCalledWith(
+      expect.objectContaining({
+        resource_name: 'hokusai-deltaone-anomaly-detector-schedule-development',
+        start_time: '2026-06-09T11:40:38.535Z',
+        end_time: '2026-06-13T11:40:38.535Z',
+      }),
+      expect.anything()
+    );
+
+    const prompt = mockLoop.mock.calls[0]![0].prompt;
+    expect(prompt).toContain('Lambda configuration for hokusai-deltaone-anomaly-detector-development');
+    expect(prompt).toContain('Lambda deployment metadata for hokusai-deltaone-anomaly-detector-development');
+    expect(prompt).toContain('EventBridge rule hokusai-deltaone-anomaly-detector-schedule-development');
+    expect(mockLambdaConfiguration).toHaveBeenCalledTimes(1);
   });
 
   it('falls back to the report window when no error-metric datapoints localize a spike', async () => {

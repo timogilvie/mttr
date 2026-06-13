@@ -1,4 +1,4 @@
-import type { ZodType } from 'zod';
+import type { ZodType, ZodTypeDef } from 'zod';
 
 /**
  * Runtime context passed to every tool handler. Carries the bounds that keep a
@@ -26,7 +26,7 @@ export interface ToolDefinition<A = unknown> {
   name: string;
   description: string;
   parametersJsonSchema: Record<string, unknown>;
-  argsSchema: ZodType<A>;
+  argsSchema: ZodType<A, ZodTypeDef, unknown>;
   handler: (args: A, ctx: ToolContext) => Promise<string>;
 }
 

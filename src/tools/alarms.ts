@@ -20,21 +20,45 @@ export class FindAlarmsToolError extends Error {
 const MAX_ALARMS = 50;
 const MAX_PAGES = 10;
 
-const argsSchema = z
+function emptyToUndefined(value: unknown): unknown {
+  return typeof value === 'string' && value.trim() === '' ? undefined : value;
+}
+
+function normalizeArgs(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return value;
+  }
+  const input = value as Record<string, unknown>;
+  const namespace = emptyToUndefined(input['namespace']);
+  const metricName = emptyToUndefined(input['metric_name'] ?? input['metricName'] ?? input['metric']);
+  const search = emptyToUndefined(input['search'] ?? input['service'] ?? input['service_name']);
+  const alarmNamePrefix = emptyToUndefined(
+    input['alarm_name_prefix'] ?? input['alarmNamePrefix'] ?? input['prefix']
+  );
+  return {
+    ...input,
+    namespace,
+    metric_name: metricName,
+    search: search ?? (!(namespace && metricName) ? metricName ?? namespace : undefined),
+    alarm_name_prefix: alarmNamePrefix,
+  };
+}
+
+const argsSchema = z.preprocess(normalizeArgs, z
   .object({
-    namespace: z.string().min(1).optional(),
-    metric_name: z.string().min(1).optional(),
+    namespace: z.preprocess(emptyToUndefined, z.string().min(1).optional()),
+    metric_name: z.preprocess(emptyToUndefined, z.string().min(1).optional()),
     dimensions: z
       .array(z.object({ name: z.string().min(1), value: z.string() }))
       .optional(),
-    search: z.string().min(1).optional(),
-    alarm_name_prefix: z.string().min(1).optional(),
+    search: z.preprocess(emptyToUndefined, z.string().min(1).optional()),
+    alarm_name_prefix: z.preprocess(emptyToUndefined, z.string().min(1).optional()),
   })
   .refine(
     (args) =>
       Boolean(args.search || args.alarm_name_prefix || (args.namespace && args.metric_name)),
     { message: 'Provide search, alarm_name_prefix, or both namespace and metric_name' }
-  );
+  ));
 
 type FindAlarmsArgs = z.infer<typeof argsSchema>;
 

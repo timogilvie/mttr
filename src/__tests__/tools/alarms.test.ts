@@ -139,7 +139,7 @@ describe('alarms find_alarms', () => {
 
   it('requires search, alarm_name_prefix, or a namespace + metric_name pair', () => {
     expect(findAlarmsTool.argsSchema.safeParse({}).success).toBe(false);
-    expect(findAlarmsTool.argsSchema.safeParse({ namespace: 'AWS/Lambda' }).success).toBe(false);
+    expect(findAlarmsTool.argsSchema.safeParse({ namespace: 'AWS/Lambda' }).success).toBe(true);
     expect(
       findAlarmsTool.argsSchema.safeParse({ namespace: 'AWS/Lambda', metric_name: 'Errors' })
         .success
@@ -148,5 +148,20 @@ describe('alarms find_alarms', () => {
     expect(findAlarmsTool.argsSchema.safeParse({ alarm_name_prefix: 'deltaone-' }).success).toBe(
       true
     );
+  });
+
+  it('normalizes common aliases and empty optional fields', () => {
+    expect(
+      findAlarmsTool.argsSchema.safeParse({
+        metricName: 'Errors',
+        alarmNamePrefix: '',
+      }).success
+    ).toBe(true);
+    expect(
+      findAlarmsTool.argsSchema.safeParse({
+        service_name: 'deltaone-anomaly-detection',
+        namespace: '',
+      }).success
+    ).toBe(true);
   });
 });

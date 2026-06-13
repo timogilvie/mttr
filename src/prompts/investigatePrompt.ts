@@ -36,7 +36,7 @@ Use suggested_cloudwatch_queries and signals to target your queries. For finding
 - Prefer aggregation queries (e.g. stats count(*) by status, path) over raw newest-N row dumps, and exclude health-check endpoints (e.g. /health) when sampling raw logs — otherwise routine health checks drown out the signal.
 - A log query that returns only healthy traffic is NOT evidence that the errors did not happen. Narrow the window to the metric spike, filter for error status codes, and retry before concluding the logs are silent.
 - If Step 1 reports a missing or zero-datapoint metric (e.g. detector liveness) or an OBSERVABILITY_FAILURE, do not stop at "no data". Use list_metrics to recover the exact metric namespace/name/dimensions, then get_metrics_and_alarms with an explicit start_time well before the report window (use period_seconds=3600 for multi-day scans) to find when datapoints stopped. Use find_alarms to check whether any alarm covers the signal, and discover_log_groups + query_logs to check whether the workload still ran: recent runtime logs without metric datapoints indicate a metric-emission failure, while silent logs indicate the workload stopped.
-- If evidence points to a failing Lambda, inspect get_lambda_configuration and get_lambda_deployment_metadata before concluding root cause. Use lookup_cloudtrail_events around the first bad timestamp to check for UpdateFunctionCode, UpdateFunctionConfiguration, PutRule, PutTargets, TagResource, IAM, SSM, or Secrets Manager changes. If the Lambda is schedule-driven, use get_eventbridge_rule to validate the rule target input, retries, and DLQ.
+- If evidence points to a failing Lambda, prioritize root-cause evidence before additional broad sampling: inspect get_lambda_configuration and get_lambda_deployment_metadata before concluding root cause. Use lookup_cloudtrail_events around the first bad timestamp and the 1-3 days before the report window to check for UpdateFunctionCode, UpdateFunctionConfiguration, PutRule, PutTargets, TagResource, IAM, SSM, or Secrets Manager changes. If the Lambda is schedule-driven, use get_eventbridge_rule to validate the rule target input, retries, and DLQ.
 - If log group discovery or log queries fail or return no matching rows, record that as an observability gap and keep the investigation conservative.
 
 ## Evidence discipline
@@ -95,7 +95,7 @@ Return valid JSON only. Do not include markdown. Use this schema:
 
 - Be conservative; do not claim root cause unless evidence supports it.
 - Do not ignore LOW findings that indicate observability blind spots.
-- Set requires_more_evidence_before_mitigation=false ONLY for CONFIRMED_INCIDENT items whose root cause is supported by gathered evidence; otherwise true.
+- Set requires_more_evidence_before_mitigation=false ONLY for CONFIRMED_INCIDENT items whose root cause is supported by gathered evidence. A repeated application error is a proximate failure, not a root cause, unless deployment/configuration/schema/API-contract evidence explains why it started; otherwise keep this true and name the missing root-cause evidence.
 - You MAY raise overall_severity above the Step 1 overall_severity when findings warrant it.
 - Emit one investigations[] entry per Step 1 incident and finding.
 

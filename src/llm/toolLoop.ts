@@ -69,6 +69,11 @@ interface TurnResult {
   toolCalls: ToolCall[];
 }
 
+function summarizeToolFailure(content: string): string {
+  const firstLine = content.replace(/^Error:\s*/, '').split('\n')[0]?.trim() ?? 'unknown error';
+  return firstLine.length > 300 ? `${firstLine.slice(0, 300)}...[truncated]` : firstLine;
+}
+
 async function mapWithConcurrency<I, O>(
   items: I[],
   limit: number,
@@ -223,6 +228,9 @@ export async function callOpenRouterWithTools(opts: ToolLoopOptions): Promise<To
           console.log(
             `[ToolLoop] Tool ${call.function.name} ${content.startsWith('Error:') ? 'failed' : 'succeeded'}`
           );
+          if (content.startsWith('Error:')) {
+            console.warn(`[ToolLoop] ${call.function.name} error: ${summarizeToolFailure(content)}`);
+          }
           return { id: call.id, content, failed: content.startsWith('Error:') };
         }
       );
