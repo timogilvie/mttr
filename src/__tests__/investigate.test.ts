@@ -15,7 +15,12 @@ import {
 import { eventBridgeRuleTool } from '../tools/eventbridge.js';
 import { cloudTrailLookupTool } from '../tools/cloudtrail.js';
 import type { Config } from '../config.js';
-import type { StageInput, ClassificationResult, InvestigationResult } from '../types.js';
+import type {
+  StageInput,
+  ClassificationResult,
+  InvestigationResult,
+  EvidenceRequirementType,
+} from '../types.js';
 
 vi.mock('../llm/toolLoop.js');
 vi.mock('../tools/cloudwatchLogs.js', () => ({
@@ -158,6 +163,13 @@ function investigationJsonWithClosureNeed(summary = 'Draft needs closure.'): str
         ],
         unknowns: ['Whether a CloudTrail configuration change caused this.'],
         additional_data_needed: [],
+        unresolved_evidence_requirements: [
+          {
+            type: 'CHANGE_EVENT_DETAILS',
+            description: 'Inspect CloudTrail change events around the detector failure onset.',
+            tool_hint: 'Use lookup_cloudtrail_events for the detector Lambda and schedule.',
+          },
+        ],
         recommended_next_investigation_steps: [
           {
             priority: 1,
@@ -206,6 +218,7 @@ const closedInvestigationJson = JSON.stringify({
       ],
       unknowns: ['Root trigger remains outside available evidence.'],
       additional_data_needed: [],
+      unresolved_evidence_requirements: [],
       recommended_next_investigation_steps: [
         {
           priority: 1,
@@ -988,6 +1001,118 @@ describe('investigate stage', () => {
     expect((result.data as InvestigationResult).overall_assessment).toBe('POSSIBLE_INCIDENT');
   });
 
+  it('filters unresolved evidence requirements by status and draft mitigation need', () => {
+    const draft = JSON.parse(investigationJsonWithClosureNeed()) as InvestigationResult;
+    const pending = investigateStage.createEvidenceRequirement({
+      id: 'incident-1:CUSTOM_METRIC_HISTORY:metric-a',
+      type: 'CUSTOM_METRIC_HISTORY',
+      status: 'pending',
+    });
+    const satisfied = investigateStage.createEvidenceRequirement({
+      id: 'incident-1:ALARM_COVERAGE:service-a',
+      type: 'ALARM_COVERAGE',
+      status: 'satisfied',
+    });
+    const unavailable = investigateStage.createEvidenceRequirement({
+      id: 'incident-1:CHANGE_EVENT_DETAILS:function-a',
+      type: 'CHANGE_EVENT_DETAILS',
+      status: 'unavailable',
+    });
+    const otherIncident = investigateStage.createEvidenceRequirement({
+      id: 'incident-2:DEPLOYMENT_PROVENANCE:function-b',
+      incident_id: 'incident-2',
+      type: 'DEPLOYMENT_PROVENANCE',
+      status: 'pending',
+    });
+
+    expect(
+      investigateStage.unresolvedRequirementsForDraft(draft, [
+        pending,
+        satisfied,
+        unavailable,
+        otherIncident,
+      ])
+    ).toEqual([pending]);
+  });
+
+  it('constructs closure prompts from every structured requirement type', () => {
+    const draft = JSON.parse(investigationJsonWithClosureNeed()) as InvestigationResult;
+    const requirementTypes: EvidenceRequirementType[] = [
+      'CUSTOM_METRIC_HISTORY',
+      'FIRST_BAD_LOG_TIMESTAMP',
+      'LAMBDA_FAILURE_SUMMARY',
+      'CHANGE_EVENT_DETAILS',
+      'DEPLOYMENT_PROVENANCE',
+      'ALARM_COVERAGE',
+    ];
+    const requirements = requirementTypes.map((type, index) =>
+      investigateStage.createEvidenceRequirement({
+        id: `incident-1:${type}:target-${index}`,
+        type,
+        description: `Requirement ${type}`,
+        tool_hint: `Tool hint ${type}`,
+      })
+    );
+
+    expect(investigateStage.needsRootCauseClosure(draft, requirements)).toBe(true);
+
+    const prompt = investigateStage.buildRootCauseClosurePrompt(
+      'original prompt',
+      draft,
+      requirements,
+      3
+    );
+
+    expect(prompt).toContain('Unresolved evidence requirements');
+    expect(prompt).toContain('use these objects, not recommended_next_investigation_steps prose');
+    expect(prompt).toContain('Human-only recommended_next_investigation_steps');
+    for (const requirement of requirements) {
+      expect(prompt).toContain(requirement.type);
+      expect(prompt).toContain(requirement.description);
+      expect(prompt).toContain(requirement.tool_hint);
+    }
+  });
+
+  it('extracts structured draft requirements without using recommendation text', () => {
+    const draft = JSON.parse(investigationJsonWithClosureNeed()) as InvestigationResult;
+    draft.investigations[0]!.recommended_next_investigation_steps = [
+      {
+        priority: 1,
+        action: 'Review source code manually with the owning team.',
+        expected_signal: 'A code-level RPC parameter mismatch.',
+      },
+    ];
+
+    const requirements = investigateStage.structuredRequirementsFromDraft(draft);
+
+    expect(requirements).toEqual([
+      expect.objectContaining({
+        incident_id: 'incident-1',
+        type: 'CHANGE_EVENT_DETAILS',
+        status: 'pending',
+      }),
+    ]);
+  });
+
+  it('does not trigger closure from executable-looking recommendation prose alone', async () => {
+    const proseOnlyDraft = JSON.parse(investigationJsonWithClosureNeed()) as InvestigationResult;
+    proseOnlyDraft.investigations[0]!.unresolved_evidence_requirements = [];
+    proseOnlyDraft.investigations[0]!.recommended_next_investigation_steps = [
+      {
+        priority: 1,
+        action: 'Query CloudTrail and CloudWatch metrics for the detector.',
+        expected_signal: 'A dependency or metric change around failure onset.',
+      },
+    ];
+    mockLoop.mockResolvedValue(loopResult(JSON.stringify(proseOnlyDraft)));
+
+    const result = await investigateStage.run(mockInput, mockConfig, classificationWithFinding);
+
+    expect(result.status).toBe('success');
+    expect(mockLoop).toHaveBeenCalledTimes(1);
+    expect((result.data as InvestigationResult).summary).toBe('Draft needs closure.');
+  });
+
   it('runs one bounded root-cause closure pass when the draft defers executable evidence', async () => {
     mockLoop
       .mockResolvedValueOnce(loopResult(investigationJsonWithClosureNeed()))
@@ -1005,6 +1130,7 @@ describe('investigate stage', () => {
     );
     expect(mockLoop.mock.calls[1]![0].prompt).toContain('Root-Cause Closure Pass');
     expect(mockLoop.mock.calls[1]![0].prompt).toContain('Draft needs closure.');
+    expect(mockLoop.mock.calls[1]![0].prompt).toContain('CHANGE_EVENT_DETAILS');
     expect((result.data as InvestigationResult).summary).toBe('Closure evidence gathered.');
   });
 
@@ -1022,6 +1148,7 @@ describe('investigate stage', () => {
 
   it('skips closure when remaining investigation steps are not tool-executable', async () => {
     const humanOnlyDraft = JSON.parse(investigationJsonWithClosureNeed()) as InvestigationResult;
+    humanOnlyDraft.investigations[0]!.unresolved_evidence_requirements = [];
     humanOnlyDraft.investigations[0]!.recommended_next_investigation_steps = [
       {
         priority: 1,

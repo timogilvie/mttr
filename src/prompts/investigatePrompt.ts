@@ -44,7 +44,7 @@ Use suggested_cloudwatch_queries and signals to target your queries. For finding
 
 - Treat the Pre-gathered Tool Evidence section as actual tool output. Use it before deciding whether more tool calls are needed.
 - Pre-gathered evidence is a starting point, not a substitute for investigation. Do NOT return investigation_status INSUFFICIENT_EVIDENCE for an item, and do NOT leave a question in additional_data_needed or unknowns, while an available tool could plausibly answer it and you have tool budget remaining. Attempt the relevant tool calls first; INSUFFICIENT_EVIDENCE is only valid after the attempted calls failed, returned nothing, or the data is genuinely outside your tools' reach — and in that case name the calls you attempted in confirmed_facts or unknowns.
-- Before finalising each item, re-read your own recommended_next_investigation_steps: if a step is executable with your tools right now (a log query, a metric read, an alarm lookup), execute it and fold the result into the investigation instead of deferring it. Only steps that require access you do not have belong in recommended_next_investigation_steps.
+- Before finalising each item, do not defer tool-answerable evidence in prose. If a root-cause gap is still answerable by an available tool after your current budget, add it to unresolved_evidence_requirements using one of these types: CUSTOM_METRIC_HISTORY, FIRST_BAD_LOG_TIMESTAMP, LAMBDA_FAILURE_SUMMARY, CHANGE_EVENT_DETAILS, DEPLOYMENT_PROVENANCE, ALARM_COVERAGE. Keep human-only work in recommended_next_investigation_steps; human-only steps do not trigger tool closure.
 - Every entry in confirmed_facts and supporting_evidence MUST be traceable to a specific Step 1 field or a tool result you actually received. Quote or reference it. If you have no evidence beyond Step 1, leave the array empty and record the gap in unknowns.
 - Do NOT assign a per-item confidence higher than that item's Step 1 confidence unless you obtained corroborating evidence from a tool.
 - Do not fabricate logs, metrics, timestamps, or service names. Preserve service names exactly as given in Step 1.
@@ -83,6 +83,7 @@ Return valid JSON only. Do not include markdown. Use this schema:
 "likely_causes": [ { "cause": "", "confidence": 0.0, "evidence": [] } ],
 "unknowns": [],
 "additional_data_needed": [ { "data": "", "reason": "", "suggested_query_or_source": "" } ],
+"unresolved_evidence_requirements": [ { "type": "CUSTOM_METRIC_HISTORY | FIRST_BAD_LOG_TIMESTAMP | LAMBDA_FAILURE_SUMMARY | CHANGE_EVENT_DETAILS | DEPLOYMENT_PROVENANCE | ALARM_COVERAGE", "description": "", "tool_hint": "" } ],
 "recommended_next_investigation_steps": [ { "priority": 1, "action": "", "expected_signal": "" } ],
 "requires_more_evidence_before_mitigation": true,
 "possible_future_remediation": []
