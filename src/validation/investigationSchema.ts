@@ -38,6 +38,21 @@ const NextInvestigationStepSchema = z.object({
   expected_signal: z.string(),
 });
 
+const EvidenceRequirementTypeSchema = z.enum([
+  'CUSTOM_METRIC_HISTORY',
+  'FIRST_BAD_LOG_TIMESTAMP',
+  'LAMBDA_FAILURE_SUMMARY',
+  'CHANGE_EVENT_DETAILS',
+  'DEPLOYMENT_PROVENANCE',
+  'ALARM_COVERAGE',
+]);
+
+const UnresolvedEvidenceRequirementSchema = z.object({
+  type: EvidenceRequirementTypeSchema,
+  description: z.string(),
+  tool_hint: z.string(),
+});
+
 const PriorityItemSchema = z.object({
   rank: z.number(),
   incident_id: z.string(),
@@ -59,6 +74,7 @@ const InvestigationSchema = z.object({
   likely_causes: z.array(LikelyCauseSchema),
   unknowns: z.array(z.string()),
   additional_data_needed: z.array(AdditionalDataNeededSchema),
+  unresolved_evidence_requirements: z.array(UnresolvedEvidenceRequirementSchema).default([]),
   recommended_next_investigation_steps: z.array(NextInvestigationStepSchema),
   requires_more_evidence_before_mitigation: z.boolean(),
   possible_future_remediation: z.array(z.string()),

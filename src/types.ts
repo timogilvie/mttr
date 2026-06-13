@@ -120,6 +120,20 @@ export interface NextInvestigationStep {
   expected_signal: string;
 }
 
+export type EvidenceRequirementType =
+  | 'CUSTOM_METRIC_HISTORY'
+  | 'FIRST_BAD_LOG_TIMESTAMP'
+  | 'LAMBDA_FAILURE_SUMMARY'
+  | 'CHANGE_EVENT_DETAILS'
+  | 'DEPLOYMENT_PROVENANCE'
+  | 'ALARM_COVERAGE';
+
+export interface UnresolvedEvidenceRequirement {
+  type: EvidenceRequirementType;
+  description: string;
+  tool_hint: string;
+}
+
 export interface PriorityItem {
   rank: number;
   incident_id: string;
@@ -141,6 +155,7 @@ export interface Investigation {
   likely_causes: LikelyCause[];
   unknowns: string[];
   additional_data_needed: AdditionalDataNeeded[];
+  unresolved_evidence_requirements: UnresolvedEvidenceRequirement[];
   recommended_next_investigation_steps: NextInvestigationStep[];
   requires_more_evidence_before_mitigation: boolean;
   possible_future_remediation: string[];

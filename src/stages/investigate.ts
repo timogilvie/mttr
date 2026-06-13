@@ -4,7 +4,7 @@ import type {
   StageResult,
   ClassificationResult,
   InvestigationResult,
-  Investigation,
+  EvidenceRequirementType,
 } from '../types.js';
 import { buildInvestigatePrompt } from '../prompts/investigatePrompt.js';
 import { callOpenRouterWithTools, type ToolLoopOptions } from '../llm/toolLoop.js';
@@ -75,24 +75,149 @@ function tryParse(text: string): InvestigationResult | null {
   }
 }
 
-function hasExecutableNextSteps(investigation: Investigation): boolean {
-  return investigation.recommended_next_investigation_steps.some((step) => {
-    const text = `${step.action} ${step.expected_signal}`;
-    return EXECUTABLE_NEXT_STEP_PATTERN.test(text) && !NON_EXECUTABLE_NEXT_STEP_PATTERN.test(text);
-  });
+export type EvidenceRequirementStatus = 'pending' | 'satisfied' | 'unavailable';
+
+export interface EvidenceRequirement {
+  id: string;
+  incident_id: string;
+  type: EvidenceRequirementType;
+  description: string;
+  tool_hint: string;
+  status: EvidenceRequirementStatus;
+  evidence_label?: string | undefined;
+  unavailable_reason?: string | undefined;
 }
 
-function needsRootCauseClosure(result: InvestigationResult): boolean {
+class EvidenceRequirementTracker {
+  private readonly requirements = new Map<string, EvidenceRequirement>();
+
+  require(
+    incidentId: string,
+    type: EvidenceRequirementType,
+    target: string,
+    description: string,
+    toolHint: string
+  ): string {
+    const id = requirementId(incidentId, type, target);
+    if (!this.requirements.has(id)) {
+      this.requirements.set(id, {
+        id,
+        incident_id: incidentId,
+        type,
+        description,
+        tool_hint: toolHint,
+        status: 'pending',
+      });
+    }
+    return id;
+  }
+
+  markSatisfied(id: string, evidenceLabel: string): void {
+    const requirement = this.requirements.get(id);
+    if (requirement && requirement.status === 'pending') {
+      requirement.status = 'satisfied';
+      requirement.evidence_label = evidenceLabel;
+    }
+  }
+
+  markUnavailable(id: string, evidenceLabel: string, reason: string): void {
+    const requirement = this.requirements.get(id);
+    if (requirement && requirement.status === 'pending') {
+      requirement.status = 'unavailable';
+      requirement.evidence_label = evidenceLabel;
+      requirement.unavailable_reason = reason;
+    }
+  }
+
+  all(): EvidenceRequirement[] {
+    return [...this.requirements.values()];
+  }
+}
+
+function requirementId(
+  incidentId: string,
+  type: EvidenceRequirementType,
+  target: string
+): string {
+  return `${incidentId}:${type}:${target.toLowerCase().replace(/[^a-z0-9:./_-]+/g, '-')}`;
+}
+
+export function createEvidenceRequirement(
+  overrides: Partial<EvidenceRequirement> = {}
+): EvidenceRequirement {
+  return {
+    id: overrides.id ?? 'incident-1:CUSTOM_METRIC_HISTORY:metric',
+    incident_id: overrides.incident_id ?? 'incident-1',
+    type: overrides.type ?? 'CUSTOM_METRIC_HISTORY',
+    description: overrides.description ?? 'Fetch extended custom metric history.',
+    tool_hint: overrides.tool_hint ?? 'Use get_metrics_and_alarms.',
+    status: overrides.status ?? 'pending',
+    evidence_label: overrides.evidence_label,
+    unavailable_reason: overrides.unavailable_reason,
+  };
+}
+
+export function needsRootCauseClosure(
+  result: InvestigationResult,
+  unresolvedRequirements: EvidenceRequirement[]
+): boolean {
+  if (unresolvedRequirements.length === 0) {
+    return false;
+  }
+  const unresolvedIds = new Set(unresolvedRequirements.map((requirement) => requirement.incident_id));
   return result.investigations.some(
     (investigation) =>
       investigation.requires_more_evidence_before_mitigation &&
-      hasExecutableNextSteps(investigation)
+      unresolvedIds.has(investigation.incident_id)
   );
 }
 
-function buildRootCauseClosurePrompt(
+export function unresolvedRequirementsForDraft(
+  result: InvestigationResult,
+  requirements: EvidenceRequirement[]
+): EvidenceRequirement[] {
+  const needsEvidence = new Set(
+    result.investigations
+      .filter((investigation) => investigation.requires_more_evidence_before_mitigation)
+      .map((investigation) => investigation.incident_id)
+  );
+  return requirements.filter(
+    (requirement) =>
+      requirement.status === 'pending' && needsEvidence.has(requirement.incident_id)
+  );
+}
+
+export function structuredRequirementsFromDraft(
+  result: InvestigationResult
+): EvidenceRequirement[] {
+  return result.investigations.flatMap((investigation) =>
+    investigation.unresolved_evidence_requirements.map((requirement, index) =>
+      createEvidenceRequirement({
+        id: `${investigation.incident_id}:${requirement.type}:draft-${index + 1}`,
+        incident_id: investigation.incident_id,
+        type: requirement.type,
+        description: requirement.description,
+        tool_hint: requirement.tool_hint,
+        status: 'pending',
+      })
+    )
+  );
+}
+
+function closureRequirementsForDraft(
+  result: InvestigationResult,
+  preGatheredRequirements: EvidenceRequirement[]
+): EvidenceRequirement[] {
+  return [
+    ...unresolvedRequirementsForDraft(result, preGatheredRequirements),
+    ...unresolvedRequirementsForDraft(result, structuredRequirementsFromDraft(result)),
+  ];
+}
+
+export function buildRootCauseClosurePrompt(
   originalPrompt: string,
   draft: InvestigationResult,
+  unresolvedRequirements: EvidenceRequirement[],
   maxToolCalls: number
 ): string {
   return `${originalPrompt}
@@ -103,23 +228,31 @@ You already produced this draft investigation JSON:
 
 ${JSON.stringify(draft, null, 2)}
 
-Before finalizing, resolve avoidable deferrals. For any investigation where requires_more_evidence_before_mitigation=true and recommended_next_investigation_steps contains a step executable with the available read-only tools, call the relevant tool now and fold the result into the final JSON.
+Before finalizing, resolve avoidable deferrals. The deterministic pre-gather already attempted known evidence requirements where it had enough target data. The remaining tool-executable requirements are listed below as structured objects; use these objects, not recommended_next_investigation_steps prose, to decide which tool calls are eligible for this closure pass.
+
+Unresolved evidence requirements:
+${JSON.stringify(unresolvedRequirements, null, 2)}
 
 Hard limits for this closure pass:
 - Use at most ${maxToolCalls} tool call(s) total.
 - Only run read-only evidence calls available in this stage: CloudWatch logs, metrics, alarms, Lambda metadata, EventBridge, ECS, ALB access logs, and CloudTrail.
 - Do not remediate, mutate infrastructure, inspect secret values, or request human-only actions as tool work.
+- Human-only recommended_next_investigation_steps are out of scope for this closure pass and must not consume tool budget.
 - If the root trigger remains unknown after the closure calls, keep requires_more_evidence_before_mitigation=true and make the remaining unknowns precise.
 - Return the full revised JSON object only.`;
 }
 
 async function maybeRunRootCauseClosure(
   draft: InvestigationResult,
+  unresolvedRequirements: EvidenceRequirement[],
   loopOptions: ToolLoopOptions,
   originalPrompt: string,
   config: Config
 ): Promise<InvestigationResult> {
-  if (!config.investigate.closureEnabled || !needsRootCauseClosure(draft)) {
+  if (
+    !config.investigate.closureEnabled ||
+    !needsRootCauseClosure(draft, unresolvedRequirements)
+  ) {
     return draft;
   }
 
@@ -135,7 +268,12 @@ async function maybeRunRootCauseClosure(
 
   const closure = await callOpenRouterWithTools({
     ...loopOptions,
-    prompt: buildRootCauseClosurePrompt(originalPrompt, draft, maxToolCalls),
+    prompt: buildRootCauseClosurePrompt(
+      originalPrompt,
+      draft,
+      unresolvedRequirements,
+      maxToolCalls
+    ),
     maxIterations,
     maxToolCalls,
   });
@@ -199,6 +337,13 @@ const ERROR_CONTEXT_QUERY = `fields @timestamp, @message, @logStream
 | sort @timestamp desc
 | limit 50`;
 
+const FIRST_BAD_LOG_TIMESTAMP_QUERY = `fields @timestamp, @message, @logStream
+| filter @message like /(?i)(error|exception|timeout|traceback|unavailable|refused|fatal|invalid params)/
+| filter @message not like /\\/health/
+| stats min(@timestamp) as firstBadTimestamp, max(@timestamp) as latestBadTimestamp, count(*) as badEvents by @logStream
+| sort firstBadTimestamp asc
+| limit 25`;
+
 // Newest raw lines regardless of level. For observability incidents this shows
 // whether the workload ran at all in the window: recent logs without metric
 // datapoints indicate emission failure; silent logs indicate stoppage.
@@ -248,10 +393,6 @@ const LAMBDA_CHANGE_EVENTS = [
   'TagResource',
 ];
 const EVENTBRIDGE_CHANGE_EVENTS = ['PutRule', 'PutTargets', 'EnableRule', 'DisableRule', 'TagResource'];
-const EXECUTABLE_NEXT_STEP_PATTERN =
-  /\b(?:cloudwatch|metric|alarm|logs?|lambda|eventbridge|cloudtrail|ecs|alb|query|lookup|inspect|discover|get_metrics_and_alarms|find_alarms|query_logs|list_metrics|get_lambda_configuration|get_lambda_deployment_metadata|get_eventbridge_rule|lookup_cloudtrail_events|get_ecs_service_events|query_alb_access_logs)\b/i;
-const NON_EXECUTABLE_NEXT_STEP_PATTERN =
-  /\b(?:human|manual|review source|source code|code review|patch|deploy|rollback|restart|contact|vendor|ssh|database write|write|mutate|secret value|credentials?|api key|runbook outside|external system)\b/i;
 
 interface SpikeWindow {
   start: string;
@@ -503,13 +644,30 @@ async function gatherLambdaRootCauseEvidence(
   functionName: string,
   logWindowArgs: { start_time: string; end_time: string } | { lookback_minutes: number },
   logWindowLabel: string,
-  ctx: ToolContext
+  ctx: ToolContext,
+  tracker: EvidenceRequirementTracker
 ): Promise<string[]> {
   const logGroup = `/aws/lambda/${functionName}`;
   const provenanceWindow = rootCauseChangeWindow(ctx) ?? {};
+  const failureSummaryRequirement = tracker.require(
+    id,
+    'LAMBDA_FAILURE_SUMMARY',
+    functionName,
+    `Summarize Lambda runtime failures for ${functionName}.`,
+    'Use query_logs against the Lambda log group with the Lambda error summary query.'
+  );
+  const deploymentProvenanceRequirement = tracker.require(
+    id,
+    'DEPLOYMENT_PROVENANCE',
+    functionName,
+    `Connect Lambda ${functionName} to deployment source, image, and rollout metadata.`,
+    'Use get_deployment_provenance for the Lambda function.'
+  );
   const sections = [
-    await runEvidenceTool(
+    await runRequiredEvidenceTool(
       `### ${id} ${kind}: Lambda error summary for ${functionName} on ${logGroup} (${logWindowLabel})`,
+      failureSummaryRequirement,
+      tracker,
       () =>
         queryLogsTool.handler(
           {
@@ -585,8 +743,10 @@ async function gatherLambdaRootCauseEvidence(
       `### ${id} ${kind}: Lambda deployment metadata for ${functionName} (root-cause context)`,
       () => lambdaDeploymentMetadataTool.handler({ function_name: functionName }, ctx)
     ),
-    await runEvidenceTool(
+    await runRequiredEvidenceTool(
       `### ${id} ${kind}: Lambda deployment provenance for ${functionName} (root-cause context)`,
+      deploymentProvenanceRequirement,
+      tracker,
       () =>
         lambdaDeploymentProvenanceTool.handler(
           { function_name: functionName, ...provenanceWindow },
@@ -597,9 +757,18 @@ async function gatherLambdaRootCauseEvidence(
 
   const changeWindow = rootCauseChangeWindow(ctx);
   if (changeWindow) {
+    const changeDetailsRequirement = tracker.require(
+      id,
+      'CHANGE_EVENT_DETAILS',
+      functionName,
+      `Inspect Lambda deployment/configuration change events for ${functionName}.`,
+      'Use lookup_cloudtrail_events for Lambda change event details.'
+    );
     sections.push(
-      await runEvidenceTool(
+      await runRequiredEvidenceTool(
         `### ${id} ${kind}: CloudTrail Lambda changes for ${functionName} (72h before report window through window end)`,
+        changeDetailsRequirement,
+        tracker,
         () =>
           cloudTrailLookupTool.handler(
             {
@@ -621,7 +790,8 @@ async function gatherEventBridgeRootCauseEvidence(
   id: string,
   kind: InvestigationItem['kind'],
   ruleName: string,
-  ctx: ToolContext
+  ctx: ToolContext,
+  tracker: EvidenceRequirementTracker
 ): Promise<string[]> {
   const sections = [
     await runEvidenceTool(
@@ -632,9 +802,18 @@ async function gatherEventBridgeRootCauseEvidence(
 
   const changeWindow = rootCauseChangeWindow(ctx);
   if (changeWindow) {
+    const changeDetailsRequirement = tracker.require(
+      id,
+      'CHANGE_EVENT_DETAILS',
+      ruleName,
+      `Inspect EventBridge schedule/target change events for ${ruleName}.`,
+      'Use lookup_cloudtrail_events for EventBridge change event details.'
+    );
     sections.push(
-      await runEvidenceTool(
+      await runRequiredEvidenceTool(
         `### ${id} ${kind}: CloudTrail EventBridge changes for ${ruleName} (72h before report window through window end)`,
+        changeDetailsRequirement,
+        tracker,
         () =>
           cloudTrailLookupTool.handler(
             {
@@ -661,10 +840,28 @@ async function runEvidenceTool(label: string, action: () => Promise<string>): Pr
   }
 }
 
+async function runRequiredEvidenceTool(
+  label: string,
+  requirementIdValue: string,
+  tracker: EvidenceRequirementTracker,
+  action: () => Promise<string>
+): Promise<string> {
+  try {
+    const result = await action();
+    tracker.markSatisfied(requirementIdValue, label);
+    return `${label}\n${result}`;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    tracker.markUnavailable(requirementIdValue, label, reason);
+    return `${label}\nError: ${reason}`;
+  }
+}
+
 async function gatherStandardEvidence(
   classification: ClassificationResult,
-  ctx: ToolContext
-): Promise<string> {
+  ctx: ToolContext,
+  tracker = new EvidenceRequirementTracker()
+): Promise<{ evidence: string; requirements: EvidenceRequirement[] }> {
   const sections: string[] = [];
   const rootCauseFunctionsGathered = new Set<string>();
   const rootCauseRulesGathered = new Set<string>();
@@ -702,9 +899,18 @@ async function gatherStandardEvidence(
       if (shouldQueryObservability) {
         const extendedWindow = extendedMetricWindow(ctx);
         if (extendedWindow) {
+          const customMetricHistoryRequirement = tracker.require(
+            id,
+            'CUSTOM_METRIC_HISTORY',
+            metricKey(metric),
+            `Fetch extended history for ${metric.namespace}/${metric.metric_name} to locate the last datapoint before the report window.`,
+            'Use get_metrics_and_alarms with a multi-day window and period_seconds=3600.'
+          );
           sections.push(
-            await runEvidenceTool(
+            await runRequiredEvidenceTool(
               `### ${id} ${kind}: extended 14-day history for ${metric.namespace}/${metric.metric_name} (locates the last datapoint before the report window)`,
+              customMetricHistoryRequirement,
+              tracker,
               () =>
                 metricsAndAlarmsTool.handler(
                   {
@@ -783,9 +989,18 @@ async function gatherStandardEvidence(
             service,
             knownMetricKeys
           )) {
+            const customMetricHistoryRequirement = tracker.require(
+              id,
+              'CUSTOM_METRIC_HISTORY',
+              metricKey(metric),
+              `Fetch extended history for discovered liveness metric ${metric.namespace}/${metric.metric_name}.`,
+              'Use get_metrics_and_alarms with a multi-day window and period_seconds=3600.'
+            );
             sections.push(
-              await runEvidenceTool(
+              await runRequiredEvidenceTool(
                 `### ${id} ${kind}: discovered liveness metric 14-day history for ${metric.namespace}/${metric.metric_name} (locates the last datapoint before the report window)`,
+                customMetricHistoryRequirement,
+                tracker,
                 () =>
                   metricsAndAlarmsTool.handler(
                     {
@@ -803,9 +1018,18 @@ async function gatherStandardEvidence(
           }
         }
 
+        const alarmCoverageRequirement = tracker.require(
+          id,
+          'ALARM_COVERAGE',
+          service,
+          `Check alarm coverage for ${service}.`,
+          'Use find_alarms by service search or exact metric identity.'
+        );
         sections.push(
-          await runEvidenceTool(
+          await runRequiredEvidenceTool(
             `### ${id} ${kind}: alarm coverage for ${service}`,
+            alarmCoverageRequirement,
+            tracker,
             () => findAlarmsTool.handler({ search: service }, ctx)
           )
         );
@@ -822,7 +1046,8 @@ async function gatherStandardEvidence(
               functionName,
               lambdaLogWindowArgs,
               lambdaLogWindowLabel,
-              ctx
+              ctx,
+              tracker
             ))
           );
         }
@@ -833,7 +1058,7 @@ async function gatherStandardEvidence(
           }
           rootCauseRulesGathered.add(ruleName);
           sections.push(
-            ...(await gatherEventBridgeRootCauseEvidence(id, kind, ruleName, ctx))
+            ...(await gatherEventBridgeRootCauseEvidence(id, kind, ruleName, ctx, tracker))
           );
         }
       }
@@ -899,6 +1124,30 @@ async function gatherStandardEvidence(
                 )
             )
           );
+          const firstBadLogRequirement = tracker.require(
+            id,
+            'FIRST_BAD_LOG_TIMESTAMP',
+            logGroup,
+            `Find the first bad log timestamp in ${logGroup}.`,
+            'Use query_logs with an aggregate min(@timestamp) over error/exception/timeout lines.'
+          );
+          sections.push(
+            await runRequiredEvidenceTool(
+              `### ${id} ${kind}: first bad log timestamp on ${logGroup} (${windowLabel})`,
+              firstBadLogRequirement,
+              tracker,
+              () =>
+                queryLogsTool.handler(
+                  {
+                    log_group: logGroup,
+                    filter_or_query: FIRST_BAD_LOG_TIMESTAMP_QUERY,
+                    ...windowArgs,
+                    limit: 25,
+                  },
+                  ctx
+                )
+            )
+          );
         }
 
         if (shouldQueryWarnings) {
@@ -940,7 +1189,7 @@ async function gatherStandardEvidence(
     }
   }
 
-  return sections.join('\n\n');
+  return { evidence: sections.join('\n\n'), requirements: tracker.all() };
 }
 
 export async function run(
@@ -963,9 +1212,9 @@ export async function run(
     }
 
     const toolContext = buildToolContext(config, classification);
-    const preGatheredEvidence = await gatherStandardEvidence(classification, toolContext);
+    const preGathered = await gatherStandardEvidence(classification, toolContext);
     const step1Json = JSON.stringify(classification, null, 2);
-    const prompt = buildInvestigatePrompt(step1Json, preGatheredEvidence);
+    const prompt = buildInvestigatePrompt(step1Json, preGathered.evidence);
 
     const loopOptions: ToolLoopOptions = {
       prompt,
@@ -995,7 +1244,13 @@ export async function run(
 
     const parsed = tryParse(first.content);
     if (parsed) {
-      const closed = await maybeRunRootCauseClosure(parsed, loopOptions, prompt, config);
+      const closed = await maybeRunRootCauseClosure(
+        parsed,
+        closureRequirementsForDraft(parsed, preGathered.requirements),
+        loopOptions,
+        prompt,
+        config
+      );
       return { stage: 'Investigate', status: 'success', timestamp, data: closed };
     }
 
@@ -1015,7 +1270,13 @@ export async function run(
 
     const repaired = tryParse(repair.content);
     if (repaired) {
-      const closed = await maybeRunRootCauseClosure(repaired, loopOptions, prompt, config);
+      const closed = await maybeRunRootCauseClosure(
+        repaired,
+        closureRequirementsForDraft(repaired, preGathered.requirements),
+        loopOptions,
+        prompt,
+        config
+      );
       return { stage: 'Investigate', status: 'success', timestamp, data: closed };
     }
 

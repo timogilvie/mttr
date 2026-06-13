@@ -57,7 +57,8 @@ describe('investigatePrompt', () => {
 
     expect(prompt).toContain('Do NOT return investigation_status INSUFFICIENT_EVIDENCE');
     expect(prompt).toContain('tool budget remaining');
-    expect(prompt).toContain('re-read your own recommended_next_investigation_steps');
+    expect(prompt).toContain('unresolved_evidence_requirements');
+    expect(prompt).toContain('Keep human-only work in recommended_next_investigation_steps');
   });
 
   it('instructs active drill-down for missing-metric observability incidents', () => {
