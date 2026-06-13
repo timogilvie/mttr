@@ -667,6 +667,96 @@ describe('investigate stage', () => {
     expect(prompt).toContain('recent runtime activity sample');
   });
 
+  it('fetches extended history for liveness metrics recovered from metric discovery', async () => {
+    mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+    mockListMetrics.mockResolvedValue(
+      'Found 4 metric(s):\n' +
+        'namespace=Hokusai/Detectors, metric=DetectorLiveness, dimensions=[Detector=deltaone-anomaly-detection]\n' +
+        'namespace=Hokusai/Detectors, metric=DetectorHeartbeat, dimensions=[Detector=deltaone-anomaly-detection]\n' +
+        'namespace=Hokusai/Detectors, metric=DetectorLiveness, dimensions=[Detector=other-detector]\n' +
+        'namespace=AWS/Lambda, metric=Errors, dimensions=[FunctionName=hokusai-deltaone-anomaly-detector-development]'
+    );
+    const observabilityClassification: ClassificationResult = {
+      summary: 'Detector liveness missing.',
+      overall_severity: 'HIGH',
+      report_context: {
+        window_start: '2026-06-12T11:40:38.535Z',
+        window_end: '2026-06-13T11:40:38.535Z',
+      },
+      incidents: [
+        {
+          incident_id: 'mandatory-missing-detector-liveness-deltaone-anomaly-detection-1',
+          title: 'No detector liveness datapoints for deltaone-anomaly-detection',
+          classification: 'OBSERVABILITY_FAILURE',
+          severity: 'HIGH',
+          confidence: 0.95,
+          affected_services: ['deltaone-anomaly-detection'],
+          evidence: ['No datapoints received from the detector liveness metric in this window.'],
+          signals: {
+            alarms: [],
+            metrics: ['Detector liveness metric has zero datapoints.'],
+            logs: [],
+            cloudwatch_metrics: [],
+          },
+          suspected_causes: ['Detector runtime or metric publication path broken.'],
+          investigation_plan: {
+            priority: 1,
+            estimated_user_impact: 'SIGNIFICANT',
+            first_actions: [],
+            questions_to_answer: [],
+            suggested_cloudwatch_queries: [],
+          },
+          recommended_next_stage: 'INVESTIGATE',
+        },
+      ],
+      findings: [],
+    };
+
+    const result = await investigateStage.run(
+      mockInput,
+      mockConfig,
+      observabilityClassification
+    );
+
+    expect(result.status).toBe('success');
+    expect(mockMetricsAndAlarms).toHaveBeenCalledWith(
+      expect.objectContaining({
+        namespace: 'Hokusai/Detectors',
+        metric_name: 'DetectorLiveness',
+        dimensions: [{ name: 'Detector', value: 'deltaone-anomaly-detection' }],
+        stat: 'Sum',
+        period_seconds: 3600,
+        start_time: '2026-05-29T11:40:38.535Z',
+        end_time: '2026-06-13T11:40:38.535Z',
+      }),
+      expect.anything()
+    );
+    expect(mockMetricsAndAlarms).toHaveBeenCalledWith(
+      expect.objectContaining({
+        namespace: 'Hokusai/Detectors',
+        metric_name: 'DetectorHeartbeat',
+        dimensions: [{ name: 'Detector', value: 'deltaone-anomaly-detection' }],
+      }),
+      expect.anything()
+    );
+    expect(mockMetricsAndAlarms).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        namespace: 'Hokusai/Detectors',
+        metric_name: 'DetectorLiveness',
+        dimensions: [{ name: 'Detector', value: 'other-detector' }],
+      }),
+      expect.anything()
+    );
+
+    const prompt = mockLoop.mock.calls[0]![0].prompt;
+    expect(prompt).toContain(
+      'discovered liveness metric 14-day history for Hokusai/Detectors/DetectorLiveness'
+    );
+    expect(prompt).toContain(
+      'discovered liveness metric 14-day history for Hokusai/Detectors/DetectorHeartbeat'
+    );
+  });
+
   it('pre-gathers Lambda and scheduler root-cause evidence for discovered detector workloads', async () => {
     mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
     mockListMetrics.mockResolvedValue(
