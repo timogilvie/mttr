@@ -7,7 +7,11 @@ import { albAccessLogsTool } from '../tools/albAccessLogs.js';
 import { ecsServiceEventsTool } from '../tools/ecs.js';
 import { listMetricsTool } from '../tools/listMetrics.js';
 import { findAlarmsTool } from '../tools/alarms.js';
-import { lambdaConfigurationTool, lambdaDeploymentMetadataTool } from '../tools/lambda.js';
+import {
+  lambdaConfigurationTool,
+  lambdaDeploymentMetadataTool,
+  lambdaDeploymentProvenanceTool,
+} from '../tools/lambda.js';
 import { eventBridgeRuleTool } from '../tools/eventbridge.js';
 import { cloudTrailLookupTool } from '../tools/cloudtrail.js';
 import type { Config } from '../config.js';
@@ -54,6 +58,9 @@ vi.mock('../tools/lambda.js', () => ({
   lambdaDeploymentMetadataTool: {
     handler: vi.fn(),
   },
+  lambdaDeploymentProvenanceTool: {
+    handler: vi.fn(),
+  },
 }));
 vi.mock('../tools/eventbridge.js', () => ({
   eventBridgeRuleTool: {
@@ -76,6 +83,7 @@ const mockListMetrics = vi.mocked(listMetricsTool.handler);
 const mockFindAlarms = vi.mocked(findAlarmsTool.handler);
 const mockLambdaConfiguration = vi.mocked(lambdaConfigurationTool.handler);
 const mockLambdaDeploymentMetadata = vi.mocked(lambdaDeploymentMetadataTool.handler);
+const mockLambdaDeploymentProvenance = vi.mocked(lambdaDeploymentProvenanceTool.handler);
 const mockEventBridgeRule = vi.mocked(eventBridgeRuleTool.handler);
 const mockCloudTrailLookup = vi.mocked(cloudTrailLookupTool.handler);
 
@@ -323,6 +331,9 @@ describe('investigate stage', () => {
     );
     mockLambdaDeploymentMetadata.mockResolvedValue(
       'Current function artifact:\ncodeSha256=abc123'
+    );
+    mockLambdaDeploymentProvenance.mockResolvedValue(
+      'Lambda deployment provenance:\nimageUri=repo:tag\nCloudFormation stack events in window'
     );
     mockEventBridgeRule.mockResolvedValue(
       'rule=hokusai-deltaone-anomaly-detector-schedule-development\nstate=ENABLED'
@@ -906,6 +917,15 @@ describe('investigate stage', () => {
       expect.anything()
     );
     expect(mockLambdaDeploymentMetadata).toHaveBeenCalledTimes(1);
+    expect(mockLambdaDeploymentProvenance).toHaveBeenCalledTimes(1);
+    expect(mockLambdaDeploymentProvenance).toHaveBeenCalledWith(
+      {
+        function_name: 'hokusai-deltaone-anomaly-detector-development',
+        start_time: '2026-06-09T11:40:38.535Z',
+        end_time: '2026-06-13T11:40:38.535Z',
+      },
+      expect.anything()
+    );
     expect(mockEventBridgeRule).toHaveBeenCalledWith(
       { rule_name: 'hokusai-deltaone-anomaly-detector-schedule-development' },
       expect.anything()
@@ -934,6 +954,7 @@ describe('investigate stage', () => {
     expect(prompt).toContain('Lambda completion summary for hokusai-deltaone-anomaly-detector-development');
     expect(prompt).toContain('Lambda configuration for hokusai-deltaone-anomaly-detector-development');
     expect(prompt).toContain('Lambda deployment metadata for hokusai-deltaone-anomaly-detector-development');
+    expect(prompt).toContain('Lambda deployment provenance for hokusai-deltaone-anomaly-detector-development');
     expect(prompt).toContain('EventBridge rule hokusai-deltaone-anomaly-detector-schedule-development');
     expect(mockLambdaConfiguration).toHaveBeenCalledTimes(1);
   });
