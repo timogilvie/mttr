@@ -157,7 +157,15 @@ interface CandidateLogGroup {
   storedBytes?: number;
 }
 
+interface MetricCandidate {
+  namespace: string;
+  metric_name: string;
+  dimensions: Array<{ name: string; value: string }>;
+  stat: 'Sum';
+}
+
 const MAX_STANDARD_LOG_GROUPS = 2;
+const MAX_LIVENESS_METRIC_CANDIDATES = 3;
 
 const FOUR_XX_QUERY = `fields @timestamp, @message, @logStream
 | parse @message /"(?<method>\\S+) (?<path>\\S+) HTTP\\/[^"]+" (?<status>\\d{3})/
@@ -362,6 +370,79 @@ function extractMetricDimensionValues(metricDiscovery: string, dimensionName: st
   return [...values];
 }
 
+function parseMetricDiscoveryLine(line: string): MetricCandidate | null {
+  const namespace = line.match(/\bnamespace=([^,\n]+)/)?.[1]?.trim();
+  const metricName = line.match(/\bmetric=([^,\n]+)/)?.[1]?.trim();
+  if (!namespace || !metricName) {
+    return null;
+  }
+
+  const dimensionsText = line.match(/\bdimensions=\[([^\]]*)\]/)?.[1] ?? '';
+  const dimensions = dimensionsText
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const [name, ...valueParts] = part.split('=');
+      const value = valueParts.join('=');
+      return name && value !== '' ? { name: name.trim(), value: value.trim() } : null;
+    })
+    .filter((dimension): dimension is { name: string; value: string } => dimension !== null);
+
+  return { namespace, metric_name: metricName, dimensions, stat: 'Sum' };
+}
+
+function metricKey(metric: Pick<MetricCandidate, 'namespace' | 'metric_name' | 'dimensions'>): string {
+  const dimensions = [...(metric.dimensions ?? [])]
+    .sort((a, b) => a.name.localeCompare(b.name) || a.value.localeCompare(b.value))
+    .map((dimension) => `${dimension.name}=${dimension.value}`)
+    .join(',');
+  return `${metric.namespace}/${metric.metric_name}/${dimensions}`;
+}
+
+function selectLivenessMetricCandidates(
+  metricDiscovery: string,
+  service: string,
+  knownMetricKeys: Set<string>
+): MetricCandidate[] {
+  const candidates: MetricCandidate[] = [];
+  const seen = new Set<string>();
+  const serviceLower = service.toLowerCase();
+
+  for (const line of metricDiscovery.split('\n')) {
+    const candidate = parseMetricDiscoveryLine(line);
+    if (!candidate) {
+      continue;
+    }
+
+    const haystack = [
+      candidate.namespace,
+      candidate.metric_name,
+      ...candidate.dimensions.flatMap((dimension) => [dimension.name, dimension.value]),
+    ]
+      .join(' ')
+      .toLowerCase();
+    if (!/(?:liveness|heartbeat|heart[-_ ]?beat)/i.test(haystack)) {
+      continue;
+    }
+    if (!haystack.includes(serviceLower) && !candidate.dimensions.some((d) => d.value === service)) {
+      continue;
+    }
+
+    const key = metricKey(candidate);
+    if (knownMetricKeys.has(key) || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    candidates.push(candidate);
+    if (candidates.length >= MAX_LIVENESS_METRIC_CANDIDATES) {
+      break;
+    }
+  }
+
+  return candidates;
+}
+
 function selectLambdaFunctions(metricDiscovery: string): string[] {
   return extractMetricDimensionValues(metricDiscovery, 'FunctionName').filter((name) =>
     /^hokusai-.*-(?:development|staging|production)$/.test(name)
@@ -502,6 +583,7 @@ async function gatherStandardEvidence(
     const shouldQueryWarnings = needsWarningDrilldown(text);
     const shouldQueryObservability = needsObservabilityDrilldown(item.classification, text);
     const cloudwatchMetrics = 'signals' in item ? item.signals.cloudwatch_metrics ?? [] : [];
+    const knownMetricKeys = new Set(cloudwatchMetrics.map(metricKey));
 
     const errorMetricEvidence: string[] = [];
     for (const metric of cloudwatchMetrics) {
@@ -598,6 +680,34 @@ async function gatherStandardEvidence(
           () => listMetricsTool.handler({ search: service }, ctx)
         );
         sections.push(metricDiscovery);
+
+        const extendedWindow = extendedMetricWindow(ctx);
+        if (extendedWindow) {
+          for (const metric of selectLivenessMetricCandidates(
+            metricDiscovery,
+            service,
+            knownMetricKeys
+          )) {
+            sections.push(
+              await runEvidenceTool(
+                `### ${id} ${kind}: discovered liveness metric 14-day history for ${metric.namespace}/${metric.metric_name} (locates the last datapoint before the report window)`,
+                () =>
+                  metricsAndAlarmsTool.handler(
+                    {
+                      namespace: metric.namespace,
+                      metric_name: metric.metric_name,
+                      dimensions: metric.dimensions,
+                      stat: metric.stat,
+                      period_seconds: OBSERVABILITY_METRIC_PERIOD_SECONDS,
+                      ...extendedWindow,
+                    },
+                    ctx
+                  )
+              )
+            );
+          }
+        }
+
         sections.push(
           await runEvidenceTool(
             `### ${id} ${kind}: alarm coverage for ${service}`,
