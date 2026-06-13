@@ -49,6 +49,7 @@ describe('investigatePrompt', () => {
     expect(prompt).toContain('get_metrics_and_alarms');
     expect(prompt).toContain('list_metrics');
     expect(prompt).toContain('find_alarms');
+    expect(prompt).toContain('get_deployment_provenance');
   });
 
   it('requires tool attempts before declaring INSUFFICIENT_EVIDENCE', () => {

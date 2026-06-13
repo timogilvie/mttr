@@ -65,9 +65,10 @@ describe('tools/registry', () => {
           'lookup_cloudtrail_events',
           'get_eventbridge_rule',
           'get_lambda_deployment_metadata',
+          'get_deployment_provenance',
         ])
       );
-      expect(names).toHaveLength(11);
+      expect(names).toHaveLength(12);
     });
   });
 

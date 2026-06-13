@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@aws-sdk/client-cloudformation':
+        specifier: ^3.1068.0
+        version: 3.1068.0
       '@aws-sdk/client-cloudtrail':
         specifier: ^3.1068.0
         version: 3.1068.0
@@ -17,6 +20,9 @@ importers:
       '@aws-sdk/client-cloudwatch-logs':
         specifier: ^3.1063.0
         version: 3.1063.0
+      '@aws-sdk/client-ecr':
+        specifier: ^3.1068.0
+        version: 3.1068.0
       '@aws-sdk/client-ecs':
         specifier: ^3.1067.0
         version: 3.1067.0
@@ -90,6 +96,10 @@ packages:
     resolution: {integrity: sha512-PIha+kauTbp6IRmOpYktPTrlfrrSqDVixvhO/EUOFOf62DPX81CaJoHJreuA1m9HYpSKyXf99BKjU1dvJPeUfw==}
     engines: {node: '>=20.0.0'}
 
+  '@aws-sdk/client-cloudformation@3.1068.0':
+    resolution: {integrity: sha512-Q79jGs2wgXoepAO1KcyKOiIQkfVfxz0QFgWavVO2hAetdoC+oTDrraOTaLE8iG8b9+N3BURam29nUn1j/YNs2w==}
+    engines: {node: '>=20.0.0'}
+
   '@aws-sdk/client-cloudtrail@3.1068.0':
     resolution: {integrity: sha512-0akEhNfOJIkcaA+oJYyAWA/Plefl6kGKd5a3Zy00TMO+MOm5LGsVtElgi8XEyzVStlnrHKfrAqvL6PJ7ip8N1w==}
     engines: {node: '>=20.0.0'}
@@ -100,6 +110,10 @@ packages:
 
   '@aws-sdk/client-cloudwatch@3.1063.0':
     resolution: {integrity: sha512-A/PG9D709oSFwutfP5CyATQJzc2IyhicMirByvkLkrj8ezSunB0/+ZRJdPibONolE0P2+kneQqHttanspULpAw==}
+    engines: {node: '>=20.0.0'}
+
+  '@aws-sdk/client-ecr@3.1068.0':
+    resolution: {integrity: sha512-oAjm3mjeaM5NHRYvH/KfEoKP6A74pi0mylElmat3qVCcGWIGKdhAURwTk9d0nTLQNzfgbCe9dheG+Yob0lRhTw==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/client-ecs@3.1067.0':
@@ -1418,13 +1432,13 @@ snapshots:
   '@aws-crypto/crc32@5.2.0':
     dependencies:
       '@aws-crypto/util': 5.2.0
-      '@aws-sdk/types': 3.973.11
+      '@aws-sdk/types': 3.973.12
       tslib: 2.8.1
 
   '@aws-crypto/crc32c@5.2.0':
     dependencies:
       '@aws-crypto/util': 5.2.0
-      '@aws-sdk/types': 3.973.11
+      '@aws-sdk/types': 3.973.12
       tslib: 2.8.1
 
   '@aws-crypto/sha1-browser@5.2.0':
@@ -1458,7 +1472,7 @@ snapshots:
 
   '@aws-crypto/util@5.2.0':
     dependencies:
-      '@aws-sdk/types': 3.973.11
+      '@aws-sdk/types': 3.973.12
       '@smithy/util-utf8': 2.3.0
       tslib: 2.8.1
 
@@ -1467,9 +1481,22 @@ snapshots:
       '@aws-crypto/crc32': 5.2.0
       '@aws-crypto/crc32c': 5.2.0
       '@aws-crypto/util': 5.2.0
-      '@aws-sdk/core': 3.974.18
-      '@aws-sdk/types': 3.973.11
+      '@aws-sdk/core': 3.974.20
+      '@aws-sdk/types': 3.973.12
       '@smithy/core': 3.24.6
+      '@smithy/types': 4.14.3
+      tslib: 2.8.1
+
+  '@aws-sdk/client-cloudformation@3.1068.0':
+    dependencies:
+      '@aws-crypto/sha256-browser': 5.2.0
+      '@aws-crypto/sha256-js': 5.2.0
+      '@aws-sdk/core': 3.974.20
+      '@aws-sdk/credential-provider-node': 3.972.55
+      '@aws-sdk/types': 3.973.12
+      '@smithy/core': 3.24.6
+      '@smithy/fetch-http-handler': 5.4.6
+      '@smithy/node-http-handler': 4.7.7
       '@smithy/types': 4.14.3
       tslib: 2.8.1
 
@@ -1509,6 +1536,19 @@ snapshots:
       '@smithy/core': 3.24.6
       '@smithy/fetch-http-handler': 5.4.6
       '@smithy/middleware-compression': 4.4.6
+      '@smithy/node-http-handler': 4.7.7
+      '@smithy/types': 4.14.3
+      tslib: 2.8.1
+
+  '@aws-sdk/client-ecr@3.1068.0':
+    dependencies:
+      '@aws-crypto/sha256-browser': 5.2.0
+      '@aws-crypto/sha256-js': 5.2.0
+      '@aws-sdk/core': 3.974.20
+      '@aws-sdk/credential-provider-node': 3.972.55
+      '@aws-sdk/types': 3.973.12
+      '@smithy/core': 3.24.6
+      '@smithy/fetch-http-handler': 5.4.6
       '@smithy/node-http-handler': 4.7.7
       '@smithy/types': 4.14.3
       tslib: 2.8.1
@@ -1607,8 +1647,8 @@ snapshots:
 
   '@aws-sdk/credential-provider-env@3.972.44':
     dependencies:
-      '@aws-sdk/core': 3.974.18
-      '@aws-sdk/types': 3.973.11
+      '@aws-sdk/core': 3.974.20
+      '@aws-sdk/types': 3.973.12
       '@smithy/core': 3.24.6
       '@smithy/types': 4.14.3
       tslib: 2.8.1
@@ -1623,8 +1663,8 @@ snapshots:
 
   '@aws-sdk/credential-provider-http@3.972.46':
     dependencies:
-      '@aws-sdk/core': 3.974.18
-      '@aws-sdk/types': 3.973.11
+      '@aws-sdk/core': 3.974.20
+      '@aws-sdk/types': 3.973.12
       '@smithy/core': 3.24.6
       '@smithy/fetch-http-handler': 5.4.6
       '@smithy/node-http-handler': 4.7.7
@@ -1643,7 +1683,7 @@ snapshots:
 
   '@aws-sdk/credential-provider-ini@3.972.50':
     dependencies:
-      '@aws-sdk/core': 3.974.18
+      '@aws-sdk/core': 3.974.20
       '@aws-sdk/credential-provider-env': 3.972.44
       '@aws-sdk/credential-provider-http': 3.972.46
       '@aws-sdk/credential-provider-login': 3.972.49
@@ -1651,7 +1691,7 @@ snapshots:
       '@aws-sdk/credential-provider-sso': 3.972.49
       '@aws-sdk/credential-provider-web-identity': 3.972.49
       '@aws-sdk/nested-clients': 3.997.17
-      '@aws-sdk/types': 3.973.11
+      '@aws-sdk/types': 3.973.12
       '@smithy/core': 3.24.6
       '@smithy/credential-provider-imds': 4.3.8
       '@smithy/types': 4.14.3
@@ -1721,8 +1761,8 @@ snapshots:
 
   '@aws-sdk/credential-provider-process@3.972.44':
     dependencies:
-      '@aws-sdk/core': 3.974.18
-      '@aws-sdk/types': 3.973.11
+      '@aws-sdk/core': 3.974.20
+      '@aws-sdk/types': 3.973.12
       '@smithy/core': 3.24.6
       '@smithy/types': 4.14.3
       tslib: 2.8.1
@@ -1737,10 +1777,10 @@ snapshots:
 
   '@aws-sdk/credential-provider-sso@3.972.49':
     dependencies:
-      '@aws-sdk/core': 3.974.18
+      '@aws-sdk/core': 3.974.20
       '@aws-sdk/nested-clients': 3.997.17
       '@aws-sdk/token-providers': 3.1063.0
-      '@aws-sdk/types': 3.973.11
+      '@aws-sdk/types': 3.973.12
       '@smithy/core': 3.24.6
       '@smithy/types': 4.14.3
       tslib: 2.8.1
@@ -1757,9 +1797,9 @@ snapshots:
 
   '@aws-sdk/credential-provider-web-identity@3.972.49':
     dependencies:
-      '@aws-sdk/core': 3.974.18
+      '@aws-sdk/core': 3.974.20
       '@aws-sdk/nested-clients': 3.997.17
-      '@aws-sdk/types': 3.973.11
+      '@aws-sdk/types': 3.973.12
       '@smithy/core': 3.24.6
       '@smithy/types': 4.14.3
       tslib: 2.8.1

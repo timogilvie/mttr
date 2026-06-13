@@ -5,7 +5,11 @@ import { albAccessLogsTool } from './albAccessLogs.js';
 import { ecsServiceEventsTool } from './ecs.js';
 import { listMetricsTool } from './listMetrics.js';
 import { findAlarmsTool } from './alarms.js';
-import { lambdaConfigurationTool, lambdaDeploymentMetadataTool } from './lambda.js';
+import {
+  lambdaConfigurationTool,
+  lambdaDeploymentMetadataTool,
+  lambdaDeploymentProvenanceTool,
+} from './lambda.js';
 import { eventBridgeRuleTool } from './eventbridge.js';
 import { cloudTrailLookupTool } from './cloudtrail.js';
 
@@ -24,6 +28,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
   cloudTrailLookupTool as ToolDefinition,
   eventBridgeRuleTool as ToolDefinition,
   lambdaDeploymentMetadataTool as ToolDefinition,
+  lambdaDeploymentProvenanceTool as ToolDefinition,
 ];
 
 export function getTools(): ToolDefinition[] {

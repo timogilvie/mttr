@@ -16,7 +16,11 @@ import { albAccessLogsTool } from '../tools/albAccessLogs.js';
 import { ecsServiceEventsTool } from '../tools/ecs.js';
 import { listMetricsTool } from '../tools/listMetrics.js';
 import { findAlarmsTool } from '../tools/alarms.js';
-import { lambdaConfigurationTool, lambdaDeploymentMetadataTool } from '../tools/lambda.js';
+import {
+  lambdaConfigurationTool,
+  lambdaDeploymentMetadataTool,
+  lambdaDeploymentProvenanceTool,
+} from '../tools/lambda.js';
 import { eventBridgeRuleTool } from '../tools/eventbridge.js';
 import { cloudTrailLookupTool } from '../tools/cloudtrail.js';
 import { parseInvestigation } from '../validation/investigationSchema.js';
@@ -502,6 +506,7 @@ async function gatherLambdaRootCauseEvidence(
   ctx: ToolContext
 ): Promise<string[]> {
   const logGroup = `/aws/lambda/${functionName}`;
+  const provenanceWindow = rootCauseChangeWindow(ctx) ?? {};
   const sections = [
     await runEvidenceTool(
       `### ${id} ${kind}: Lambda error summary for ${functionName} on ${logGroup} (${logWindowLabel})`,
@@ -579,6 +584,14 @@ async function gatherLambdaRootCauseEvidence(
     await runEvidenceTool(
       `### ${id} ${kind}: Lambda deployment metadata for ${functionName} (root-cause context)`,
       () => lambdaDeploymentMetadataTool.handler({ function_name: functionName }, ctx)
+    ),
+    await runEvidenceTool(
+      `### ${id} ${kind}: Lambda deployment provenance for ${functionName} (root-cause context)`,
+      () =>
+        lambdaDeploymentProvenanceTool.handler(
+          { function_name: functionName, ...provenanceWindow },
+          ctx
+        )
     ),
   ];
 
