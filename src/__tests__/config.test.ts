@@ -37,6 +37,9 @@ describe('config', () => {
       'INVESTIGATE_MODEL_FALLBACK',
       'INVESTIGATE_MAX_TOOL_ITERATIONS',
       'INVESTIGATE_MAX_TOOL_CALLS',
+      'INVESTIGATE_CLOSURE_ENABLED',
+      'INVESTIGATE_CLOSURE_MAX_TOOL_ITERATIONS',
+      'INVESTIGATE_CLOSURE_MAX_TOOL_CALLS',
       'INVESTIGATE_CONSECUTIVE_FAILURE_LIMIT',
       'INVESTIGATE_LLM_TIMEOUT_MS',
       'TOOL_TIMEOUT_MS',
@@ -59,6 +62,9 @@ describe('config', () => {
     expect(config.investigate.modelFallback).toBe('anthropic/claude-3.5-sonnet');
     expect(config.investigate.maxToolIterations).toBe(6);
     expect(config.investigate.maxToolCalls).toBe(12);
+    expect(config.investigate.closureEnabled).toBe(true);
+    expect(config.investigate.closureMaxToolIterations).toBe(2);
+    expect(config.investigate.closureMaxToolCalls).toBe(3);
     expect(config.investigate.consecutiveFailureLimit).toBe(3);
     expect(config.investigate.llmTimeoutMs).toBe(120000);
     expect(config.tools.timeoutMs).toBe(20000);
@@ -84,11 +90,31 @@ describe('config', () => {
     expect(config.investigate.modelFallback).toBe('custom/fallback');
   });
 
+  it('reads investigate closure overrides from env', () => {
+    process.env['OPENROUTER_API_KEY'] = 'test-key';
+    process.env['INVESTIGATE_CLOSURE_ENABLED'] = 'false';
+    process.env['INVESTIGATE_CLOSURE_MAX_TOOL_ITERATIONS'] = '1';
+    process.env['INVESTIGATE_CLOSURE_MAX_TOOL_CALLS'] = '2';
+
+    const config = loadConfig();
+
+    expect(config.investigate.closureEnabled).toBe(false);
+    expect(config.investigate.closureMaxToolIterations).toBe(1);
+    expect(config.investigate.closureMaxToolCalls).toBe(2);
+  });
+
   it('non-numeric investigate budget throws with variable name', () => {
     process.env['OPENROUTER_API_KEY'] = 'test-key';
     process.env['INVESTIGATE_MAX_TOOL_CALLS'] = 'lots';
 
     expect(() => loadConfig()).toThrow('INVESTIGATE_MAX_TOOL_CALLS');
+  });
+
+  it('invalid investigate closure boolean throws with variable name', () => {
+    process.env['OPENROUTER_API_KEY'] = 'test-key';
+    process.env['INVESTIGATE_CLOSURE_ENABLED'] = 'maybe';
+
+    expect(() => loadConfig()).toThrow('INVESTIGATE_CLOSURE_ENABLED');
   });
 
   it('non-numeric AWS_MAX_ATTEMPTS throws with variable name', () => {
