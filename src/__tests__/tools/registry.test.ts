@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { z } from 'zod';
-import { toOpenAITools, dispatchToolCall } from '../../tools/registry.js';
+import { toOpenAITools, dispatchToolCall, getTools } from '../../tools/registry.js';
 import { clampLookback } from '../../tools/types.js';
 import type { ToolContext, ToolDefinition } from '../../tools/types.js';
 
@@ -47,6 +47,27 @@ describe('tools/registry', () => {
           },
         },
       ]);
+    });
+
+    it('exposes the built-in investigation tools', () => {
+      const names = getTools().map((tool) => tool.name);
+
+      expect(names).toEqual(
+        expect.arrayContaining([
+          'query_logs',
+          'discover_log_groups',
+          'get_metrics_and_alarms',
+          'query_alb_access_logs',
+          'get_ecs_service_events',
+          'list_metrics',
+          'find_alarms',
+          'get_lambda_configuration',
+          'lookup_cloudtrail_events',
+          'get_eventbridge_rule',
+          'get_lambda_deployment_metadata',
+        ])
+      );
+      expect(names).toHaveLength(11);
     });
   });
 
