@@ -23,6 +23,7 @@ import {
 } from '../tools/lambda.js';
 import { eventBridgeRuleTool } from '../tools/eventbridge.js';
 import { cloudTrailLookupTool } from '../tools/cloudtrail.js';
+import { serviceSearchTerms } from '../tools/serviceNames.js';
 import { parseInvestigation } from '../validation/investigationSchema.js';
 import { stripMarkdownFences } from '../llm/json.js';
 import type { Finding, Incident, IncidentClassification } from '../types.js';
@@ -306,6 +307,16 @@ interface MetricCandidate {
   stat: 'Sum';
 }
 
+interface MetricDiscoveryRequest {
+  label: string;
+  args: {
+    namespace?: string;
+    metric_name?: string;
+    search?: string;
+    limit?: number;
+  };
+}
+
 const MAX_STANDARD_LOG_GROUPS = 2;
 const MAX_LIVENESS_METRIC_CANDIDATES = 3;
 
@@ -583,6 +594,109 @@ function metricKey(metric: Pick<MetricCandidate, 'namespace' | 'metric_name' | '
   return `${metric.namespace}/${metric.metric_name}/${dimensions}`;
 }
 
+function uniqueValues(values: Array<string | null | undefined>): string[] {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const value of values) {
+    const trimmed = value?.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(trimmed);
+  }
+  return unique;
+}
+
+function detectorBaseName(service: string): string | null {
+  const normalized = service.toLowerCase();
+  const base = normalized
+    .replace(/[-_]+anomaly[-_]+detection$/, '')
+    .replace(/[-_]+anomaly[-_]+detector$/, '')
+    .replace(/[-_]+detector$/, '');
+  return base && base !== normalized ? base : null;
+}
+
+function livenessMetricTargetTerms(service: string): string[] {
+  const genericDetectorTokens = new Set(['anomaly', 'detection', 'detector', 'service']);
+  return uniqueValues([
+    service.toLowerCase(),
+    detectorBaseName(service),
+    ...serviceSearchTerms(service).filter((term) => !genericDetectorTokens.has(term)),
+  ]).map((term) => term.toLowerCase());
+}
+
+function buildLivenessMetricDiscoveryRequests(service: string): MetricDiscoveryRequest[] {
+  const targetTerms = livenessMetricTargetTerms(service);
+  const searchTerms = uniqueValues([service, detectorBaseName(service), ...targetTerms]);
+  const requests: MetricDiscoveryRequest[] = [
+    ...searchTerms.map((search) => ({
+      label: `search=${search}`,
+      args: { search, limit: 100 },
+    })),
+    {
+      label: 'search=liveness',
+      args: { search: 'liveness', limit: 100 },
+    },
+    {
+      label: 'search=heartbeat',
+      args: { search: 'heartbeat', limit: 100 },
+    },
+    {
+      label: 'metric_name=DetectorLiveness',
+      args: { metric_name: 'DetectorLiveness', limit: 100 },
+    },
+    {
+      label: 'metric_name=DetectorHeartbeat',
+      args: { metric_name: 'DetectorHeartbeat', limit: 100 },
+    },
+  ];
+
+  const seen = new Set<string>();
+  return requests.filter((request) => {
+    const key = JSON.stringify(request.args).toLowerCase();
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function formatMetricDiscoveryRequestArgs(args: MetricDiscoveryRequest['args']): string {
+  return Object.entries(args)
+    .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
+    .join(', ');
+}
+
+async function gatherExpandedLivenessMetricDiscovery(
+  id: string,
+  kind: InvestigationItem['kind'],
+  service: string,
+  ctx: ToolContext
+): Promise<string> {
+  const requests = buildLivenessMetricDiscoveryRequests(service);
+  const sections: string[] = [
+    `### ${id} ${kind}: expanded liveness metric discovery for ${service}`,
+    `Requests: ${requests.map((request) => request.label).join(', ')}`,
+  ];
+
+  for (const request of requests) {
+    sections.push(
+      await runEvidenceTool(
+        `#### list_metrics(${formatMetricDiscoveryRequestArgs(request.args)})`,
+        () => listMetricsTool.handler(request.args, ctx)
+      )
+    );
+  }
+
+  return sections.join('\n');
+}
+
 function selectLivenessMetricCandidates(
   metricDiscovery: string,
   service: string,
@@ -590,7 +704,7 @@ function selectLivenessMetricCandidates(
 ): MetricCandidate[] {
   const candidates: MetricCandidate[] = [];
   const seen = new Set<string>();
-  const serviceLower = service.toLowerCase();
+  const targetTerms = livenessMetricTargetTerms(service);
 
   for (const line of metricDiscovery.split('\n')) {
     const candidate = parseMetricDiscoveryLine(line);
@@ -608,7 +722,10 @@ function selectLivenessMetricCandidates(
     if (!/(?:liveness|heartbeat|heart[-_ ]?beat)/i.test(haystack)) {
       continue;
     }
-    if (!haystack.includes(serviceLower) && !candidate.dimensions.some((d) => d.value === service)) {
+    if (
+      !targetTerms.some((term) => haystack.includes(term)) &&
+      !candidate.dimensions.some((d) => d.value === service)
+    ) {
       continue;
     }
 
@@ -976,19 +1093,36 @@ async function gatherStandardEvidence(
       }
 
       if (shouldQueryObservability) {
-        const metricDiscovery = await runEvidenceTool(
-          `### ${id} ${kind}: metric discovery for ${service}`,
-          () => listMetricsTool.handler({ search: service }, ctx)
-        );
+        const metricDiscovery = await gatherExpandedLivenessMetricDiscovery(id, kind, service, ctx);
         sections.push(metricDiscovery);
 
         const extendedWindow = extendedMetricWindow(ctx);
         if (extendedWindow) {
-          for (const metric of selectLivenessMetricCandidates(
+          const livenessMetricCandidates = selectLivenessMetricCandidates(
             metricDiscovery,
             service,
             knownMetricKeys
-          )) {
+          );
+          if (livenessMetricCandidates.length === 0) {
+            const customMetricHistoryRequirement = tracker.require(
+              id,
+              'CUSTOM_METRIC_HISTORY',
+              `${service}:expanded-liveness-discovery`,
+              `Find a liveness or heartbeat metric for ${service} and fetch extended history.`,
+              'Expanded pre-gather searched by service, detector base name, liveness/heartbeat terms, and known detector metric names.'
+            );
+            tracker.markUnavailable(
+              customMetricHistoryRequirement,
+              `### ${id} ${kind}: expanded liveness metric discovery for ${service}`,
+              `No liveness/heartbeat custom metric candidates found after bounded discovery searches for ${service}.`
+            );
+            sections.push(
+              `### ${id} ${kind}: liveness metric history unavailable for ${service}\n` +
+                `No liveness/heartbeat custom metric candidates found after bounded discovery searches for ${service}.`
+            );
+          }
+
+          for (const metric of livenessMetricCandidates) {
             const customMetricHistoryRequirement = tracker.require(
               id,
               'CUSTOM_METRIC_HISTORY',

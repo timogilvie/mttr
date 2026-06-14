@@ -664,7 +664,27 @@ describe('investigate stage', () => {
       expect.anything()
     );
     expect(mockListMetrics).toHaveBeenCalledWith(
-      { search: 'deltaone-anomaly-detection' },
+      { search: 'deltaone-anomaly-detection', limit: 100 },
+      expect.objectContaining({ region: 'us-east-1' })
+    );
+    expect(mockListMetrics).toHaveBeenCalledWith(
+      { search: 'deltaone', limit: 100 },
+      expect.objectContaining({ region: 'us-east-1' })
+    );
+    expect(mockListMetrics).toHaveBeenCalledWith(
+      { search: 'liveness', limit: 100 },
+      expect.objectContaining({ region: 'us-east-1' })
+    );
+    expect(mockListMetrics).toHaveBeenCalledWith(
+      { search: 'heartbeat', limit: 100 },
+      expect.objectContaining({ region: 'us-east-1' })
+    );
+    expect(mockListMetrics).toHaveBeenCalledWith(
+      { metric_name: 'DetectorLiveness', limit: 100 },
+      expect.objectContaining({ region: 'us-east-1' })
+    );
+    expect(mockListMetrics).toHaveBeenCalledWith(
+      { metric_name: 'DetectorHeartbeat', limit: 100 },
       expect.objectContaining({ region: 'us-east-1' })
     );
     expect(mockFindAlarms).toHaveBeenCalledWith(
@@ -685,7 +705,8 @@ describe('investigate stage', () => {
     );
 
     const prompt = mockLoop.mock.calls[0]![0].prompt;
-    expect(prompt).toContain('metric discovery for deltaone-anomaly-detection');
+    expect(prompt).toContain('expanded liveness metric discovery for deltaone-anomaly-detection');
+    expect(prompt).toContain('Requests: search=deltaone-anomaly-detection');
     expect(prompt).toContain('alarm coverage for deltaone-anomaly-detection');
     expect(prompt).toContain('extended 14-day history for Hokusai/Detectors/DetectorLiveness');
     expect(prompt).toContain('recent runtime activity sample');
