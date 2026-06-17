@@ -1,7 +1,10 @@
 import type { Config } from './config.js';
-import type { StageInput, ClassificationResult, InvestigationResult } from './types.js';
+import type { StageInput, ClassificationResult, InvestigationResult, DecisionResult } from './types.js';
 import * as classifyStage from './stages/classify.js';
 import * as investigateStage from './stages/investigate.js';
+import * as decideStage from './stages/decide.js';
+import * as verifyStage from './stages/verify.js';
+import { mitigateStage } from './stages/stubs.js';
 import { fetchReport } from './report/fetchReport.js';
 import {
   hashReportContent,
@@ -164,6 +167,7 @@ export class Orchestrator {
             `(severity ${data.overall_severity}, ${data.investigations.length} investigation(s))`
         );
         console.log(JSON.stringify(result.data, null, 2));
+        await this.runDecide(data);
       } else if (result.status === 'error') {
         console.error('[Orchestrator] Investigate stage failed:', result.error);
       }
@@ -171,6 +175,74 @@ export class Orchestrator {
       console.error('[Orchestrator] Unhandled error in Investigate stage:', error);
     } finally {
       this.investigateInFlight = false;
+    }
+  }
+
+  private async runDecide(investigation: InvestigationResult): Promise<void> {
+    const input: StageInput = {
+      stage: 'Decide',
+      timestamp: new Date().toISOString(),
+    };
+
+    const result = await decideStage.run(input, investigation);
+
+    if (result.status === 'success' && result.data) {
+      const data = result.data as DecisionResult;
+      console.log(
+        `[Orchestrator] Decide stage completed: next=${data.overall_next_stage} ` +
+          `(${data.decisions.length} decision(s))`
+      );
+      console.log(JSON.stringify(result.data, null, 2));
+      await this.runSelectedResponseStage(data);
+    } else if (result.status === 'error') {
+      console.error('[Orchestrator] Decide stage failed:', result.error);
+    }
+  }
+
+  private async runSelectedResponseStage(decision: DecisionResult): Promise<void> {
+    if (decision.overall_next_stage === 'None') {
+      console.log('[Orchestrator] Decide selected no downstream response stage');
+      return;
+    }
+
+    if (decision.overall_next_stage === 'Investigate') {
+      console.log(
+        '[Orchestrator] Decide requested further investigation; waiting for next report cycle'
+      );
+      return;
+    }
+
+    const input: StageInput = {
+      stage: decision.overall_next_stage,
+      timestamp: new Date().toISOString(),
+    };
+
+    const result =
+      decision.overall_next_stage === 'Mitigate'
+        ? await mitigateStage(input, decision)
+        : await verifyStage.run(input, this.config, decision);
+
+    console.log(
+      `[Orchestrator] ${result.stage} stage returned ${result.status}` +
+        (result.data ? `: ${JSON.stringify(result.data)}` : '')
+    );
+
+    if (result.stage === 'Verify' && result.status === 'success' && result.data) {
+      const verification = result.data;
+      if (
+        'overall_next_stage' in verification &&
+        verification.overall_next_stage === 'Mitigate'
+      ) {
+        const mitigationInput: StageInput = {
+          stage: 'Mitigate',
+          timestamp: new Date().toISOString(),
+        };
+        const mitigation = await mitigateStage(mitigationInput, decision);
+        console.log(
+          `[Orchestrator] ${mitigation.stage} stage returned ${mitigation.status}` +
+            (mitigation.data ? `: ${JSON.stringify(mitigation.data)}` : '')
+        );
+      }
     }
   }
 }

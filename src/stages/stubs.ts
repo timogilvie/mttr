@@ -1,25 +1,25 @@
-import type { StageInput, StageResult } from '../types.js';
+import type { DecisionResult, StageInput, StageResult } from '../types.js';
 
-export async function mitigateStage(_input: StageInput): Promise<StageResult> {
+export async function mitigateStage(
+  _input: StageInput,
+  _decision?: DecisionResult
+): Promise<StageResult> {
   return {
     stage: 'Mitigate',
     status: 'not_implemented',
     timestamp: new Date().toISOString(),
+    data: { message: 'Mitigate stage is not implemented.' },
   };
 }
 
-export async function restoreStage(_input: StageInput): Promise<StageResult> {
+export async function restoreStage(
+  _input: StageInput,
+  _decision?: DecisionResult
+): Promise<StageResult> {
   return {
     stage: 'Restore',
     status: 'not_implemented',
     timestamp: new Date().toISOString(),
-  };
-}
-
-export async function verifyStage(_input: StageInput): Promise<StageResult> {
-  return {
-    stage: 'Verify',
-    status: 'not_implemented',
-    timestamp: new Date().toISOString(),
+    data: { message: 'Restore stage is not implemented.' },
   };
 }

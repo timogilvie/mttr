@@ -1,12 +1,13 @@
 const CLASSIFY_PROMPT_TEMPLATE = `You are the Classify stage of the Hokusai Monitoring Agent.
 
-The monitoring agent has five stages:
+The monitoring agent has six stages:
 
 1. Classify
 2. Investigate
-3. Mitigate
-4. Restore
-5. Verify
+3. Decide
+4. Mitigate
+5. Restore
+6. Verify
 
 You are only responsible for the Classify stage.
 

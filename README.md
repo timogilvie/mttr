@@ -144,9 +144,14 @@ telemetry") and the stage degrades to a triage / data-request result rather than
    bounded, read-only agentic tool loop (CloudWatch Logs Insights + CloudWatch
    metrics/alarms over OpenRouter), producing a validated investigation with likely causes,
    evidence, data requests, and a per-item "ready for mitigation" signal. It never remediates.
-3. **Mitigate** (stub): Future mitigation actions.
-4. **Restore** (stub): Future service restoration.
-5. **Verify** (stub): Future recovery verification.
+3. **Decide** (implemented): Deterministically turns investigation output into a response
+   disposition: mitigate, verify, continue investigation, close/downgrade, or open an
+   observability follow-up.
+4. **Mitigate** (stub): Future mitigation actions.
+5. **Restore** (stub): Future service restoration.
+6. **Verify** (implemented): Read-only current-state checks for decisions that need
+   validation before closure or mitigation. The first version checks current alarm state,
+   ECS service health/events, and ALB error evidence where the decision handoff asks for it.
 
 ### Investigate tool loop — bounded by design
 

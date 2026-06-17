@@ -1,4 +1,4 @@
-const INVESTIGATE_PROMPT_TEMPLATE = `You are the Investigate stage of the Hokusai Monitoring Agent (stage 2 of 5: Classify, Investigate, Mitigate, Restore, Verify).
+const INVESTIGATE_PROMPT_TEMPLATE = `You are the Investigate stage of the Hokusai Monitoring Agent (stage 2 of 6: Classify, Investigate, Decide, Mitigate, Restore, Verify).
 
 You investigate potential infrastructure health issues identified by the Classify stage. You do NOT remediate.
 

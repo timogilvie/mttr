@@ -2,7 +2,7 @@
   "name": "hokusai-monitoring-agent",
   "version": "1.0.0",
   "type": "module",
-  "description": "Hokusai monitoring agent with five-stage incident classification and response",
+  "description": "Hokusai monitoring agent with staged incident classification and response",
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
