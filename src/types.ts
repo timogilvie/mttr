@@ -170,7 +170,67 @@ export interface InvestigationResult {
   priority_order: PriorityItem[];
 }
 
-export type Stage = 'Classify' | 'Investigate' | 'Mitigate' | 'Restore' | 'Verify';
+export type DecisionDisposition =
+  | 'MITIGATE'
+  | 'VERIFY'
+  | 'CONTINUE_INVESTIGATION'
+  | 'OPEN_OBSERVABILITY_FOLLOWUP'
+  | 'CLOSE_TRANSIENT'
+  | 'CLOSE_NON_INCIDENT';
+
+export type DecisionNextStage = 'Investigate' | 'Mitigate' | 'Verify' | 'None';
+
+export interface IncidentDecision {
+  incident_id: string;
+  title: string;
+  disposition: DecisionDisposition;
+  next_stage: DecisionNextStage;
+  severity: Severity;
+  affected_services: string[];
+  rationale: string;
+  evidence_to_pass: string[];
+  follow_up_actions: string[];
+}
+
+export interface DecisionResult {
+  summary: string;
+  overall_next_stage: DecisionNextStage;
+  decisions: IncidentDecision[];
+  handoff_notes: string[];
+}
+
+export type VerificationStatus =
+  | 'VERIFIED_ACTIVE_INCIDENT'
+  | 'VERIFIED_RECOVERED_TRANSIENT'
+  | 'VERIFIED_OBSERVABILITY_ISSUE'
+  | 'VERIFIED_NON_INCIDENT'
+  | 'STILL_INCONCLUSIVE';
+
+export interface VerificationCheck {
+  tool: string;
+  target: string;
+  status: 'passed' | 'failed' | 'warning' | 'inconclusive';
+  evidence: string;
+}
+
+export interface IncidentVerification {
+  incident_id: string;
+  title: string;
+  status: VerificationStatus;
+  severity: Severity;
+  rationale: string;
+  checks: VerificationCheck[];
+  recommended_next_stage: DecisionNextStage;
+}
+
+export interface VerificationResult {
+  summary: string;
+  overall_status: VerificationStatus;
+  overall_next_stage: DecisionNextStage;
+  verifications: IncidentVerification[];
+}
+
+export type Stage = 'Classify' | 'Investigate' | 'Decide' | 'Mitigate' | 'Restore' | 'Verify';
 
 export interface StageInput {
   stage: Stage;
@@ -181,6 +241,6 @@ export interface StageResult {
   stage: Stage;
   status: 'success' | 'error' | 'not_implemented';
   timestamp: string;
-  data?: ClassificationResult | InvestigationResult | { message: string };
+  data?: ClassificationResult | InvestigationResult | DecisionResult | VerificationResult | { message: string };
   error?: string;
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { mitigateStage, restoreStage, verifyStage } from '../stages/stubs.js';
+import { mitigateStage, restoreStage } from '../stages/stubs.js';
 import type { StageInput } from '../types.js';
 
 const mockInput: StageInput = {
@@ -22,10 +22,4 @@ describe('stage stubs', () => {
     expect(result.status).toBe('not_implemented');
   });
 
-  it('Verify returns not_implemented', async () => {
-    const result = await verifyStage(mockInput);
-
-    expect(result.stage).toBe('Verify');
-    expect(result.status).toBe('not_implemented');
-  });
 });
