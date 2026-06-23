@@ -202,7 +202,7 @@ _ALB dims: TargetGroup=\`targetgroup/hokusai-reg-api-development/abc123\` LoadBa
       }>;
     };
 
-    expect(data.overall_severity).toBe('HIGH');
+    expect(data.overall_severity).toBe('CRITICAL');
     expect(data.report_context).toEqual({
       window_label: 'last 24 hours',
       generated_at: '2026-06-06T11:35:04.881Z',
@@ -241,6 +241,75 @@ _ALB dims: TargetGroup=\`targetgroup/hokusai-reg-api-development/abc123\` LoadBa
     ]);
     expect(data.incidents.find((incident) => incident.title.includes('deltaone'))?.classification).toBe(
       'OBSERVABILITY_FAILURE'
+    );
+  });
+
+  it('adds a critical mandatory incident when an ECS service has no running tasks', async () => {
+    const { fetchReport } = await import('../report/fetchReport.js');
+    const { callOpenRouter } = await import('../llm/openrouter.js');
+
+    vi.mocked(fetchReport).mockResolvedValue(`# Hokusai Service Health Report
+
+- Window: last 24 hours
+- Generated: \`2026-06-23T14:00:00.000000+00:00\`
+
+## Service Details
+
+### API/relayer
+
+- ECS service: \`hokusai-contracts-development\`
+- Status: \`ACTIVE\`
+- Tasks: \`0/1\` running, \`0\` pending
+- Task definition: \`hokusai-contracts-development:42\`
+
+| Alarm | State |
+| --- | --- |
+| \`hokusai-contracts-development-task-health\` | \`ALARM\` |
+`);
+    vi.mocked(callOpenRouter).mockResolvedValue(
+      JSON.stringify({
+        summary: 'No actionable incidents detected.',
+        overall_severity: 'NONE',
+        incidents: [],
+        findings: [],
+      })
+    );
+
+    const result = await classifyStage.run(mockInput, mockConfig);
+
+    expect(result.status).toBe('success');
+    const data = result.data as {
+      overall_severity: string;
+      incidents: Array<{
+        title: string;
+        severity: string;
+        affected_services: string[];
+        evidence: string[];
+        signals: { alarms: string[]; metrics: string[] };
+      }>;
+    };
+
+    expect(data.overall_severity).toBe('CRITICAL');
+    expect(data.incidents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          title: 'ECS service unavailable for API/relayer',
+          severity: 'CRITICAL',
+          affected_services: ['hokusai-contracts-development'],
+          evidence: expect.arrayContaining([
+            'Health report shows 0/1 ECS tasks running for API/relayer.',
+            'ECS service is hokusai-contracts-development.',
+          ]),
+        }),
+        expect.objectContaining({
+          title: 'Active alarm for API/relayer: hokusai-contracts-development-task-health',
+          severity: 'CRITICAL',
+          affected_services: ['hokusai-contracts-development'],
+          signals: expect.objectContaining({
+            alarms: ['hokusai-contracts-development-task-health'],
+          }),
+        }),
+      ])
     );
   });
 });

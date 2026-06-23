@@ -13,6 +13,7 @@ interface MandatoryIncidentSpec {
   severity: Severity;
   confidence: number;
   affectedService: string;
+  serviceAliases?: string[];
   evidence: string[];
   alarms?: string[];
   metrics?: string[];
@@ -34,6 +35,8 @@ const SERVICE_HEADING_RE = /^### (.+)$/gm;
 const ALARM_ROW_RE = /^\|\s*`([^`]+)`\s*\|\s*`?ALARM`?\s*\|/gm;
 const ALB_ROW_RE = /^\|\s*`?([^|`]+)`?\s*\|\s*([\d,]+|-)\s*\|\s*([\d,]+|-)\s*\|\s*([\d,]+|-)\s*\|\s*([\d,]+|-)\s*\|/gm;
 const ALB_DIMS_RE = /_ALB dims:\s*TargetGroup=`([^`]+)`\s+LoadBalancer=`([^`]+)`_/i;
+const ECS_SERVICE_RE = /^-\s*ECS service:\s*`([^`]+)`/im;
+const ECS_TASKS_RE = /^-\s*Tasks:\s*`?(\d+)`?\s*\/\s*`?(\d+)`?\s*running,\s*`?(\d+)`?\s*pending/im;
 
 function splitServiceSections(report: string): ServiceSection[] {
   const matches = [...report.matchAll(SERVICE_HEADING_RE)];
@@ -103,6 +106,32 @@ function extractAlbDimensions(body: string): { targetGroup: string; loadBalancer
   return { targetGroup: match[1], loadBalancer: match[2] };
 }
 
+function extractEcsServiceName(body: string): string | undefined {
+  return body.match(ECS_SERVICE_RE)?.[1]?.trim();
+}
+
+function extractEcsTaskCounts(body: string): { running: number; desired: number; pending: number } | undefined {
+  const match = body.match(ECS_TASKS_RE);
+  if (!match?.[1] || !match[2] || !match[3]) {
+    return undefined;
+  }
+
+  const running = Number.parseInt(match[1], 10);
+  const desired = Number.parseInt(match[2], 10);
+  const pending = Number.parseInt(match[3], 10);
+  if ([running, desired, pending].some(Number.isNaN)) {
+    return undefined;
+  }
+
+  return { running, desired, pending };
+}
+
+function isTaskHealthAlarm(alarmName: string): boolean {
+  return /(?:task|service|target|container)[-_ ]?(?:health|unhealthy)|(?:health|unhealthy)[-_ ]?(?:task|service|target|container)/i.test(
+    alarmName
+  );
+}
+
 function incidentCoversSpec(incident: Incident, spec: MandatoryIncidentSpec): boolean {
   const haystack = [
     incident.title,
@@ -116,21 +145,27 @@ function incidentCoversSpec(incident: Incident, spec: MandatoryIncidentSpec): bo
     .join(' ')
     .toLowerCase();
 
-  const service = spec.affectedService.toLowerCase();
+  const services = [spec.affectedService, ...(spec.serviceAliases ?? [])].map((service) => service.toLowerCase());
   const signal = [...(spec.alarms ?? []), ...(spec.metrics ?? []), ...spec.evidence]
     .join(' ')
     .toLowerCase();
 
-  return haystack.includes(service) && signal.split(/\s+/).some((token) => token.length > 8 && haystack.includes(token));
+  return (
+    services.some((service) => haystack.includes(service)) &&
+    signal.split(/\s+/).some((token) => token.length > 8 && haystack.includes(token))
+  );
 }
 
 function findingCoversSpec(findingText: string, spec: MandatoryIncidentSpec): boolean {
-  const service = spec.affectedService.toLowerCase();
+  const services = [spec.affectedService, ...(spec.serviceAliases ?? [])].map((service) => service.toLowerCase());
   const signal = [...(spec.alarms ?? []), ...(spec.metrics ?? []), ...spec.evidence]
     .join(' ')
     .toLowerCase();
 
-  return findingText.includes(service) && signal.split(/\s+/).some((token) => token.length > 8 && findingText.includes(token));
+  return (
+    services.some((service) => findingText.includes(service)) &&
+    signal.split(/\s+/).some((token) => token.length > 8 && findingText.includes(token))
+  );
 }
 
 function mergeCloudWatchMetrics(
@@ -188,29 +223,81 @@ function enrichIncidentWithSpec(incident: Incident, spec: MandatoryIncidentSpec)
 
 function extractActiveAlarmSpecs(report: string): MandatoryIncidentSpec[] {
   return splitServiceSections(report).flatMap(({ service, body }) => {
+    const ecsService = extractEcsServiceName(body);
     const alarms = [...body.matchAll(ALARM_ROW_RE)]
       .map((match) => match[1]?.trim())
       .filter((alarmName): alarmName is string => Boolean(alarmName));
 
-    return alarms.map((alarmName) => ({
-      key: `active-alarm-${alarmName.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`,
-      title: `Active alarm for ${service}: ${alarmName}`,
-      classification: 'UNKNOWN' as const,
-      severity: 'HIGH' as const,
-      confidence: 0.95,
-      affectedService: service,
-      evidence: [`Health report lists alarm ${alarmName} in ALARM state for ${service}.`],
-      alarms: [alarmName],
-      suspectedCauses: ['CloudWatch alarm threshold is currently breached.'],
-      firstActions: [`Inspect CloudWatch alarm ${alarmName} history and reason.`],
-      questions: [
-        'When did the alarm enter ALARM state?',
-        'Which underlying metric or event triggered the alarm?',
-        'Is the alarm correlated with task health, deploys, errors, or traffic changes?',
-      ],
-      queries: [`CloudWatch alarm history and metric data for ${alarmName}.`],
-      userImpact: 'PARTIAL' as const,
-    }));
+    return alarms.map((alarmName) => {
+      const taskHealthAlarm = isTaskHealthAlarm(alarmName);
+      const affectedService = ecsService ?? service;
+      return {
+        key: `active-alarm-${alarmName.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`,
+        title: `Active alarm for ${service}: ${alarmName}`,
+        classification: 'UNKNOWN' as const,
+        severity: taskHealthAlarm ? ('CRITICAL' as const) : ('HIGH' as const),
+        confidence: 0.95,
+        affectedService,
+        serviceAliases: ecsService && ecsService !== service ? [service] : [],
+        evidence: [
+          `Health report lists alarm ${alarmName} in ALARM state for ${service}.`,
+          ...(ecsService && ecsService !== service ? [`ECS service is ${ecsService}.`] : []),
+        ],
+        alarms: [alarmName],
+        suspectedCauses: ['CloudWatch alarm threshold is currently breached.'],
+        firstActions: [`Inspect CloudWatch alarm ${alarmName} history and reason.`],
+        questions: [
+          'When did the alarm enter ALARM state?',
+          'Which underlying metric or event triggered the alarm?',
+          'Is the alarm correlated with task health, deploys, errors, or traffic changes?',
+        ],
+        queries: [`CloudWatch alarm history and metric data for ${alarmName}.`],
+        userImpact: taskHealthAlarm ? ('COMPLETE' as const) : ('PARTIAL' as const),
+      };
+    });
+  });
+}
+
+function extractUnavailableEcsServiceSpecs(report: string): MandatoryIncidentSpec[] {
+  return splitServiceSections(report).flatMap(({ service, body }) => {
+    const taskCounts = extractEcsTaskCounts(body);
+    if (!taskCounts || taskCounts.desired <= 0 || taskCounts.running > 0) {
+      return [];
+    }
+
+    const ecsService = extractEcsServiceName(body);
+    const affectedService = ecsService ?? service;
+    return [
+      {
+        key: `ecs-service-unavailable-${affectedService.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`,
+        title: `ECS service unavailable for ${service}`,
+        classification: 'UNKNOWN' as const,
+        severity: 'CRITICAL' as const,
+        confidence: 0.99,
+        affectedService,
+        serviceAliases: ecsService && ecsService !== service ? [service] : [],
+        evidence: [
+          `Health report shows ${taskCounts.running}/${taskCounts.desired} ECS tasks running for ${service}.`,
+          `Pending tasks: ${taskCounts.pending}.`,
+          ...(ecsService && ecsService !== service ? [`ECS service is ${ecsService}.`] : []),
+        ],
+        metrics: [`ECS desired tasks: ${taskCounts.desired}`, `ECS running tasks: ${taskCounts.running}`],
+        suspectedCauses: [
+          'The ECS service has no healthy running tasks, so the service is unavailable until tasks recover.',
+        ],
+        firstActions: [
+          `Inspect ECS service events for ${affectedService}.`,
+          'Check stopped-task reasons, failed health checks, deployment state, and image/runtime errors.',
+        ],
+        questions: [
+          'When did the last healthy task stop?',
+          'Are replacement tasks failing to start or failing load balancer health checks?',
+          'Did this coincide with a deployment, configuration change, or dependency outage?',
+        ],
+        queries: [`ECS service events and stopped-task reasons for ${affectedService}.`],
+        userImpact: 'COMPLETE' as const,
+      },
+    ];
   });
 }
 
@@ -318,6 +405,7 @@ function extractMissingDetectorSpecs(report: string): MandatoryIncidentSpec[] {
 
 function mandatoryIncidentSpecs(report: string): MandatoryIncidentSpec[] {
   return [
+    ...extractUnavailableEcsServiceSpecs(report),
     ...extractActiveAlarmSpecs(report),
     ...extractAlb5xxSpecs(report),
     ...extractMissingDetectorSpecs(report),
