@@ -66,9 +66,10 @@ describe('tools/registry', () => {
           'get_eventbridge_rule',
           'get_lambda_deployment_metadata',
           'get_deployment_provenance',
+          'contract_read',
         ])
       );
-      expect(names).toHaveLength(12);
+      expect(names).toHaveLength(13);
     });
   });
 

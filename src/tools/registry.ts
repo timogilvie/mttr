@@ -12,6 +12,7 @@ import {
 } from './lambda.js';
 import { eventBridgeRuleTool } from './eventbridge.js';
 import { cloudTrailLookupTool } from './cloudtrail.js';
+import { contractReadTool } from './contractRead.js';
 
 /**
  * Built-in read-only tools available to the Investigate stage.
@@ -29,6 +30,7 @@ const BUILTIN_TOOLS: ToolDefinition[] = [
   eventBridgeRuleTool as ToolDefinition,
   lambdaDeploymentMetadataTool as ToolDefinition,
   lambdaDeploymentProvenanceTool as ToolDefinition,
+  contractReadTool as ToolDefinition,
 ];
 
 export function getTools(): ToolDefinition[] {
