@@ -255,6 +255,43 @@ function isTransientCandidate(investigation: Investigation): boolean {
   );
 }
 
+function rootCauseClosureGaps(investigation: Investigation): string[] {
+  const text = investigationText(investigation).toLowerCase();
+  const gaps: string[] = [];
+
+  if (
+    investigation.semantics?.customer_impact &&
+    investigation.semantics.customer_impact !== 'CONFIRMED_CUSTOMER_IMPACT' &&
+    investigation.investigation_status === 'CONFIRMED_INCIDENT'
+  ) {
+    gaps.push('customer impact is not confirmed in incident semantics');
+  }
+
+  if (
+    investigation.semantics?.evidence_role === 'OBSERVABILITY_FAILURE' ||
+    investigation.semantics?.observability_reliability === 'UNRELIABLE'
+  ) {
+    gaps.push('primary signal is an observability failure or unreliable telemetry');
+  }
+
+  if (
+    investigation.requires_more_evidence_before_mitigation ||
+    /\b(root trigger|root cause|deeper trigger|auth-side trigger|specific dependency)\b.*\b(unknown|unresolved|not identified|not established)\b/i.test(text) ||
+    /\bunknowns?\b.*\b(root|trigger|dependency|cause)\b/i.test(text)
+  ) {
+    gaps.push('root cause is not closed by gathered evidence');
+  }
+
+  if (
+    (text.includes('auth service request timed out') || text.includes('dependency timed out')) &&
+    !/(database|redis|deployment|configuration|resource|upstream).*(caused|triggered|explains)/i.test(text)
+  ) {
+    gaps.push('proximate dependency timeout lacks deeper trigger evidence');
+  }
+
+  return [...new Set(gaps)];
+}
+
 function decideInvestigation(investigation: Investigation): IncidentDecision {
   const actions = unresolvedActions(investigation);
   const base = {
@@ -270,6 +307,17 @@ function decideInvestigation(investigation: Investigation): IncidentDecision {
     investigation.investigation_status === 'CONFIRMED_INCIDENT' &&
     !investigation.requires_more_evidence_before_mitigation
   ) {
+    const closureGaps = rootCauseClosureGaps(investigation);
+    if (closureGaps.length > 0) {
+      return {
+        ...base,
+        disposition: 'CONTINUE_INVESTIGATION',
+        next_stage: 'Investigate',
+        rationale: `Root-cause closure gate blocked mitigation: ${closureGaps.join('; ')}.`,
+        follow_up_actions: [...actions, ...closureGaps.map((gap) => `Close evidence gap: ${gap}.`)],
+      };
+    }
+
     return {
       ...base,
       disposition: 'MITIGATE',

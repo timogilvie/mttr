@@ -123,12 +123,57 @@ describe('Decide stage', () => {
           requires_more_evidence_before_mitigation: false,
           unresolved_evidence_requirements: [],
           additional_data_needed: [],
+          confirmed_facts: ['Deployment config change triggered all observed 503s.'],
+          supporting_evidence: ['Customer 5xx impact was confirmed and the deployment rollback resolved the errors.'],
+          semantics: {
+            customer_impact: 'CONFIRMED_CUSTOMER_IMPACT',
+            evidence_role: 'PRIMARY_INCIDENT',
+            currentness: 'ACTIVE',
+            duplicate_of: null,
+            root_incident_id: 'INC-001',
+            upstream_incident_ids: [],
+            downstream_incident_ids: [],
+            observability_reliability: 'TRUSTED',
+            observability_notes: [],
+          },
         }),
       ])
     );
 
     expect(decision.overall_next_stage).toBe('Mitigate');
     expect(decision.decisions[0]?.disposition).toBe('MITIGATE');
+  });
+
+  it('blocks mitigation when only the proximate timeout is known', () => {
+    const decision = decide(
+      result([
+        investigation({
+          investigation_status: 'CONFIRMED_INCIDENT',
+          requires_more_evidence_before_mitigation: false,
+          unresolved_evidence_requirements: [],
+          additional_data_needed: [],
+          confirmed_facts: [
+            'Application logs show "Auth service request timed out" immediately before each 503 response.',
+          ],
+          unknowns: ['The exact auth-side trigger remains unknown.'],
+          semantics: {
+            customer_impact: 'CONFIRMED_CUSTOMER_IMPACT',
+            evidence_role: 'PRIMARY_INCIDENT',
+            currentness: 'HISTORICAL',
+            duplicate_of: null,
+            root_incident_id: 'INC-001',
+            upstream_incident_ids: ['finding-0'],
+            downstream_incident_ids: [],
+            observability_reliability: 'TRUSTED',
+            observability_notes: [],
+          },
+        }),
+      ])
+    );
+
+    expect(decision.overall_next_stage).toBe('Investigate');
+    expect(decision.decisions[0]?.disposition).toBe('CONTINUE_INVESTIGATION');
+    expect(decision.decisions[0]?.rationale).toContain('Root-cause closure gate blocked mitigation');
   });
 
   it('routes observability gaps to follow-up work without response stages', () => {
