@@ -27,6 +27,7 @@ import { serviceSearchTerms } from '../tools/serviceNames.js';
 import { parseInvestigation } from '../validation/investigationSchema.js';
 import { stripMarkdownFences } from '../llm/json.js';
 import type { Finding, Incident, IncidentClassification } from '../types.js';
+import { correlateInvestigations } from './correlate.js';
 
 function isNonActionable(classification: ClassificationResult): boolean {
   return classification.incidents.length === 0 && classification.findings.length === 0;
@@ -1385,7 +1386,12 @@ export async function run(
         prompt,
         config
       );
-      return { stage: 'Investigate', status: 'success', timestamp, data: closed };
+      return {
+        stage: 'Investigate',
+        status: 'success',
+        timestamp,
+        data: correlateInvestigations(closed),
+      };
     }
 
     // One repair retry: ask for valid JSON only, with no tools (we already have
@@ -1411,7 +1417,12 @@ export async function run(
         prompt,
         config
       );
-      return { stage: 'Investigate', status: 'success', timestamp, data: closed };
+      return {
+        stage: 'Investigate',
+        status: 'success',
+        timestamp,
+        data: correlateInvestigations(closed),
+      };
     }
 
     console.error('[Investigate] Repair retry also failed to parse/validate');
