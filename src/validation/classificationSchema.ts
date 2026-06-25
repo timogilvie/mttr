@@ -25,6 +25,51 @@ export const IncidentClassificationSchema = z.enum([
 
 const UserImpactSchema = z.enum(['NONE', 'MINIMAL', 'PARTIAL', 'SIGNIFICANT', 'COMPLETE']);
 
+export const CustomerImpactStatusSchema = z.enum([
+  'NONE',
+  'POSSIBLE_CUSTOMER_IMPACT',
+  'CONFIRMED_CUSTOMER_IMPACT',
+  'NOT_CUSTOMER_IMPACT',
+  'UNKNOWN',
+]);
+
+export const EvidenceRoleSchema = z.enum([
+  'PRIMARY_INCIDENT',
+  'DUPLICATE_EVIDENCE',
+  'UPSTREAM_SUSPECT',
+  'DOWNSTREAM_SYMPTOM',
+  'OBSERVABILITY_FAILURE',
+  'NOISE_OR_NON_INCIDENT',
+  'UNKNOWN',
+]);
+
+export const SignalCurrentnessSchema = z.enum([
+  'ACTIVE',
+  'RECOVERED_TRANSIENT',
+  'HISTORICAL',
+  'STALE',
+  'UNKNOWN',
+]);
+
+export const ObservabilityReliabilitySchema = z.enum([
+  'TRUSTED',
+  'PARTIAL',
+  'UNRELIABLE',
+  'UNKNOWN',
+]);
+
+export const IncidentSemanticsSchema = z.object({
+  customer_impact: CustomerImpactStatusSchema,
+  evidence_role: EvidenceRoleSchema,
+  currentness: SignalCurrentnessSchema,
+  duplicate_of: z.string().nullable().optional(),
+  root_incident_id: z.string().nullable().optional(),
+  upstream_incident_ids: z.array(z.string()).default([]),
+  downstream_incident_ids: z.array(z.string()).default([]),
+  observability_reliability: ObservabilityReliabilitySchema,
+  observability_notes: z.array(z.string()).default([]),
+});
+
 const IncidentSignalsSchema = z.object({
   alarms: z.array(z.string()),
   metrics: z.array(z.string()),
@@ -59,6 +104,7 @@ const IncidentSchema = z.object({
   affected_services: z.array(z.string()),
   evidence: z.array(z.string()),
   signals: IncidentSignalsSchema,
+  semantics: IncidentSemanticsSchema.optional(),
   suspected_causes: z.array(z.string()),
   investigation_plan: InvestigationPlanSchema,
   recommended_next_stage: z.string(),
@@ -71,6 +117,7 @@ const FindingSchema = z.object({
   confidence: z.number().min(0).max(1),
   affected_services: z.array(z.string()),
   evidence: z.array(z.string()),
+  semantics: IncidentSemanticsSchema.optional(),
   reason_not_incident: z.string(),
 });
 

@@ -91,8 +91,20 @@ describe('investigatePrompt', () => {
 
     expect(prompt).toContain('overall_assessment');
     expect(prompt).toContain('investigation_status');
+    expect(prompt).toContain('semantics');
+    expect(prompt).toContain('CONFIRMED_CUSTOMER_IMPACT');
+    expect(prompt).toContain('DUPLICATE_EVIDENCE');
+    expect(prompt).toContain('observability_reliability');
     expect(prompt).toContain('requires_more_evidence_before_mitigation');
     expect(prompt).toContain('NO_ACTIONABLE_INCIDENT');
+  });
+
+  it('instructs the model to distrust missing-data alarms without corroboration', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('treats missing data as breaching');
+    expect(prompt).toContain('UNRELIABLE or PARTIAL');
+    expect(prompt).toContain('not by itself confirmed customer impact');
   });
 
   it('instructs identifier carry-through and finding id synthesis', () => {

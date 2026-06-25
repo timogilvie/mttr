@@ -21,6 +21,47 @@ export type IncidentClassification =
 
 export type UserImpact = 'NONE' | 'MINIMAL' | 'PARTIAL' | 'SIGNIFICANT' | 'COMPLETE';
 
+export type CustomerImpactStatus =
+  | 'NONE'
+  | 'POSSIBLE_CUSTOMER_IMPACT'
+  | 'CONFIRMED_CUSTOMER_IMPACT'
+  | 'NOT_CUSTOMER_IMPACT'
+  | 'UNKNOWN';
+
+export type EvidenceRole =
+  | 'PRIMARY_INCIDENT'
+  | 'DUPLICATE_EVIDENCE'
+  | 'UPSTREAM_SUSPECT'
+  | 'DOWNSTREAM_SYMPTOM'
+  | 'OBSERVABILITY_FAILURE'
+  | 'NOISE_OR_NON_INCIDENT'
+  | 'UNKNOWN';
+
+export type SignalCurrentness =
+  | 'ACTIVE'
+  | 'RECOVERED_TRANSIENT'
+  | 'HISTORICAL'
+  | 'STALE'
+  | 'UNKNOWN';
+
+export type ObservabilityReliability =
+  | 'TRUSTED'
+  | 'PARTIAL'
+  | 'UNRELIABLE'
+  | 'UNKNOWN';
+
+export interface IncidentSemantics {
+  customer_impact: CustomerImpactStatus;
+  evidence_role: EvidenceRole;
+  currentness: SignalCurrentness;
+  duplicate_of?: string | null | undefined;
+  root_incident_id?: string | null | undefined;
+  upstream_incident_ids: string[];
+  downstream_incident_ids: string[];
+  observability_reliability: ObservabilityReliability;
+  observability_notes: string[];
+}
+
 export interface IncidentSignals {
   alarms: string[];
   metrics: string[];
@@ -58,6 +99,7 @@ export interface Incident {
   affected_services: string[];
   evidence: string[];
   signals: IncidentSignals;
+  semantics?: IncidentSemantics | undefined;
   suspected_causes: string[];
   investigation_plan: InvestigationPlan;
   recommended_next_stage: string;
@@ -70,6 +112,7 @@ export interface Finding {
   confidence: number;
   affected_services: string[];
   evidence: string[];
+  semantics?: IncidentSemantics | undefined;
   reason_not_incident: string;
 }
 
@@ -152,6 +195,7 @@ export interface Investigation {
   confirmed_facts: string[];
   supporting_evidence: string[];
   contradicting_evidence: string[];
+  semantics?: IncidentSemantics | undefined;
   likely_causes: LikelyCause[];
   unknowns: string[];
   additional_data_needed: AdditionalDataNeeded[];

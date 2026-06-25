@@ -86,7 +86,75 @@ describe('investigationSchema', () => {
     expect(result.investigations[0]?.incident_id).toBe('INC-001');
     expect(result.investigations[0]?.original_classification).toBe('AUTH_FAILURE');
     expect(result.investigations[0]?.requires_more_evidence_before_mitigation).toBe(true);
+    expect(result.investigations[0]?.semantics).toEqual({
+      customer_impact: 'UNKNOWN',
+      evidence_role: 'UNKNOWN',
+      currentness: 'UNKNOWN',
+      upstream_incident_ids: [],
+      downstream_incident_ids: [],
+      observability_reliability: 'UNKNOWN',
+      observability_notes: [],
+    });
     expect(result.priority_order[0]?.incident_id).toBe('INC-001');
+  });
+
+  it('accepts explicit customer-impact semantics for a confirmed 503 incident', () => {
+    const result = parseInvestigation(
+      validResult({
+        investigations: [
+          validInvestigation({
+            title: 'data-pipeline-api returned 503s on MLflow endpoints',
+            investigation_status: 'CONFIRMED_INCIDENT',
+            semantics: {
+              customer_impact: 'CONFIRMED_CUSTOMER_IMPACT',
+              evidence_role: 'PRIMARY_INCIDENT',
+              currentness: 'HISTORICAL',
+              duplicate_of: null,
+              root_incident_id: 'INC-001',
+              upstream_incident_ids: ['finding-0'],
+              downstream_incident_ids: [],
+              observability_reliability: 'TRUSTED',
+              observability_notes: ['ALB access logs and application logs agree on the 11 target 503s.'],
+            },
+          }),
+        ],
+      })
+    );
+
+    expect(result.investigations[0]?.semantics?.customer_impact).toBe('CONFIRMED_CUSTOMER_IMPACT');
+    expect(result.investigations[0]?.semantics?.evidence_role).toBe('PRIMARY_INCIDENT');
+    expect(result.investigations[0]?.semantics?.upstream_incident_ids).toEqual(['finding-0']);
+  });
+
+  it('accepts unreliable observability semantics for a missing HealthyTaskCount alarm', () => {
+    const result = parseInvestigation(
+      validResult({
+        investigations: [
+          validInvestigation({
+            title: 'Active alarm for auth-service: hokusai-auth-development-task-health',
+            original_classification: 'OBSERVABILITY_FAILURE',
+            investigation_status: 'OBSERVABILITY_GAP',
+            semantics: {
+              customer_impact: 'UNKNOWN',
+              evidence_role: 'OBSERVABILITY_FAILURE',
+              currentness: 'ACTIVE',
+              duplicate_of: null,
+              root_incident_id: null,
+              upstream_incident_ids: [],
+              downstream_incident_ids: ['INC-503'],
+              observability_reliability: 'UNRELIABLE',
+              observability_notes: [
+                'HealthyTaskCount has no datapoints and the alarm treats missing data as breaching.',
+              ],
+            },
+          }),
+        ],
+      })
+    );
+
+    expect(result.investigations[0]?.semantics?.evidence_role).toBe('OBSERVABILITY_FAILURE');
+    expect(result.investigations[0]?.semantics?.observability_reliability).toBe('UNRELIABLE');
+    expect(result.investigations[0]?.semantics?.customer_impact).toBe('UNKNOWN');
   });
 
   it('rejects invalid overall_severity', () => {
@@ -105,6 +173,26 @@ describe('investigationSchema', () => {
     const result = validResult({
       investigations: [validInvestigation({ investigation_status: 'TOTALLY_BROKEN' })],
     });
+    expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
+  });
+
+  it('rejects invalid semantic enum values', () => {
+    const result = validResult({
+      investigations: [
+        validInvestigation({
+          semantics: {
+            customer_impact: 'MEDIUM',
+            evidence_role: 'PRIMARY_INCIDENT',
+            currentness: 'ACTIVE',
+            upstream_incident_ids: [],
+            downstream_incident_ids: [],
+            observability_reliability: 'TRUSTED',
+            observability_notes: [],
+          },
+        }),
+      ],
+    });
+
     expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
   });
 
