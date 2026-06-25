@@ -1,3 +1,5 @@
+import { serviceAliasesFor } from './serviceResources.js';
+
 /**
  * Shared service-name normalisation for discovery tools. A service name like
  * "data-pipeline-api" is searched both as a whole and as its distinctive
@@ -9,6 +11,7 @@ export const GENERIC_SERVICE_TOKENS = new Set([
   'backend',
   'data',
   'development',
+  'hokusai',
   'pipeline',
   'prod',
   'production',
@@ -17,9 +20,11 @@ export const GENERIC_SERVICE_TOKENS = new Set([
 
 export function serviceSearchTerms(serviceName: string): string[] {
   const normalized = serviceName.toLowerCase();
-  const tokens = normalized
+  const aliases = serviceAliasesFor(serviceName).map((alias) => alias.toLowerCase());
+  const tokens = [normalized, ...aliases]
+    .join(' ')
     .split(/[^a-z0-9]+/)
     .map((token) => token.trim())
     .filter((token) => token.length >= 3 && !GENERIC_SERVICE_TOKENS.has(token));
-  return [...new Set([normalized, ...tokens])];
+  return [...new Set([normalized, ...aliases, ...tokens])];
 }

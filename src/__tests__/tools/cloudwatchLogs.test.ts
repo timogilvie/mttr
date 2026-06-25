@@ -258,7 +258,9 @@ describe('cloudwatchLogs discover_log_groups', () => {
     const result = await discoverLogGroupsTool.handler({ service_name: 'data-pipeline-api' }, ctx);
 
     expect(result).toContain('/ecs/hokusai-api-development');
-    expect(result).toContain('using terms: data-pipeline-api, api');
+    expect(result).toContain(
+      'using terms: data-pipeline-api, hokusai-api-development, hokusai-reg-api-development, api, reg'
+    );
     expect(result).not.toContain('/ecs/hokusai-auth/development');
   });
 
@@ -313,7 +315,9 @@ describe('cloudwatchLogs discover_log_groups', () => {
     const result = await discoverLogGroupsTool.handler({ service_name: 'data-pipeline-api' }, ctx);
 
     expect(result).toContain('No CloudWatch log groups found');
-    expect(result).toContain('data-pipeline-api, api');
+    expect(result).toContain(
+      'data-pipeline-api, hokusai-api-development, hokusai-reg-api-development, api, reg'
+    );
   });
 
   it('validates discovery arguments via argsSchema', () => {
