@@ -297,6 +297,27 @@ export interface VerificationResult {
   verifications: IncidentVerification[];
 }
 
+export type MitigationStatus = 'READY_FOR_MANUAL_MITIGATION' | 'NO_MITIGATION_CANDIDATES';
+
+export interface MitigationHandoff {
+  incident_id: string;
+  title: string;
+  severity: Severity;
+  affected_services: string[];
+  rationale: string;
+  manual_confirmation_required: boolean;
+  evidence_to_review: string[];
+  proposed_actions: string[];
+  guardrails: string[];
+  verification_checks: string[];
+}
+
+export interface MitigationResult {
+  summary: string;
+  overall_status: MitigationStatus;
+  handoffs: MitigationHandoff[];
+}
+
 export type Stage = 'Classify' | 'Investigate' | 'Decide' | 'Mitigate' | 'Restore' | 'Verify';
 
 export interface StageInput {
@@ -308,6 +329,12 @@ export interface StageResult {
   stage: Stage;
   status: 'success' | 'error' | 'not_implemented';
   timestamp: string;
-  data?: ClassificationResult | InvestigationResult | DecisionResult | VerificationResult | { message: string };
+  data?:
+    | ClassificationResult
+    | InvestigationResult
+    | DecisionResult
+    | VerificationResult
+    | MitigationResult
+    | { message: string };
   error?: string;
 }
