@@ -1,6 +1,7 @@
 import type { Config } from '../config.js';
 import type {
   DecisionResult,
+  EvidenceCheckPlan,
   IncidentDecision,
   IncidentVerification,
   StageInput,
@@ -115,6 +116,49 @@ function classifyAlbEvidence(evidence: string): VerificationCheck['status'] {
   return 'warning';
 }
 
+function classifyMetricEvidence(evidence: string): VerificationCheck['status'] {
+  if (/No datapoints|no metric datapoints|returned no metric datapoints|0 datapoints/i.test(evidence)) {
+    return 'warning';
+  }
+  if (/Error:|No metrics found|not found/i.test(evidence)) {
+    return 'inconclusive';
+  }
+  if (/state=ALARM\b/i.test(evidence)) {
+    return 'failed';
+  }
+  return 'passed';
+}
+
+function classifyLogEvidence(evidence: string): VerificationCheck['status'] {
+  if (/Query returned\s+[1-9]\d*\s+row/i.test(evidence)) {
+    return 'failed';
+  }
+  if (/0 matching rows|Query completed with 0 matching rows/i.test(evidence)) {
+    return 'passed';
+  }
+  if (/Error:/i.test(evidence)) {
+    return 'inconclusive';
+  }
+  return 'warning';
+}
+
+function classifierForPlan(check: EvidenceCheckPlan): (evidence: string) => VerificationCheck['status'] {
+  switch (check.check_type) {
+    case 'ALARM_STATE':
+      return classifyAlarmEvidence;
+    case 'ECS_SERVICE_HEALTH':
+      return classifyEcsEvidence;
+    case 'ALB_ACCESS_LOGS':
+      return classifyAlbEvidence;
+    case 'METRIC_DATA':
+      return classifyMetricEvidence;
+    case 'LOG_QUERY':
+      return classifyLogEvidence;
+    case 'RESOURCE_LOOKUP':
+      return (evidence) => (/Error:|No .*found/i.test(evidence) ? 'inconclusive' : 'passed');
+  }
+}
+
 async function callTool(
   tool: string,
   target: string,
@@ -135,6 +179,16 @@ async function buildChecks(
   decision: IncidentDecision,
   ctx: ToolContext
 ): Promise<VerificationCheck[]> {
+  if (decision.evidence_check_plan && decision.evidence_check_plan.length > 0) {
+    const plannedChecks: VerificationCheck[] = [];
+    for (const check of decision.evidence_check_plan.slice(0, MAX_CHECKS_PER_DECISION)) {
+      plannedChecks.push(
+        await callTool(check.tool, check.target, check.args, ctx, classifierForPlan(check))
+      );
+    }
+    return plannedChecks;
+  }
+
   const checks: VerificationCheck[] = [];
   const alarmNames = extractAlarmNames(decision);
 
@@ -197,6 +251,21 @@ function statusFromChecks(
   decision: IncidentDecision,
   checks: VerificationCheck[]
 ): { status: VerificationStatus; nextStage: 'Mitigate' | 'None' | 'Investigate'; rationale: string } {
+  const hasMetricObservabilityGap = checks.some(
+    (check) => check.tool === 'get_metrics_and_alarms' && check.status === 'warning'
+  );
+  const hasPassingServiceHealth = checks.some(
+    (check) => check.tool === 'get_ecs_service_events' && check.status === 'passed'
+  );
+  if (hasMetricObservabilityGap && hasPassingServiceHealth) {
+    return {
+      status: 'VERIFIED_OBSERVABILITY_ISSUE',
+      nextStage: 'None',
+      rationale:
+        'Verification found missing or unreliable telemetry while current service-health checks passed.',
+    };
+  }
+
   if (checks.some((check) => check.status === 'failed')) {
     return {
       status: 'VERIFIED_ACTIVE_INCIDENT',
