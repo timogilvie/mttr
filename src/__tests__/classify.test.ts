@@ -126,6 +126,78 @@ describe('classify stage', () => {
     expect(callOpenRouter).toHaveBeenCalledTimes(2);
   });
 
+  it('includes validation path and allowed enum values in schema repair prompts', async () => {
+    const { fetchReport } = await import('../report/fetchReport.js');
+    const { callOpenRouter } = await import('../llm/openrouter.js');
+
+    vi.mocked(fetchReport).mockResolvedValue('# Test Report');
+    vi.mocked(callOpenRouter)
+      .mockResolvedValueOnce(
+        JSON.stringify({
+          summary: 'ALB 5xx detected.',
+          overall_severity: 'HIGH',
+          incidents: [
+            {
+              incident_id: 'INC-001',
+              title: 'ALB 5xx responses',
+              classification: 'APPLICATION_ERROR',
+              severity: 'HIGH',
+              confidence: 0.9,
+              affected_services: ['data-pipeline-api'],
+              evidence: ['5xx responses detected.'],
+              signals: { alarms: [], metrics: ['5xx'], logs: [] },
+              suspected_causes: ['Application returned errors.'],
+              investigation_plan: {
+                priority: 1,
+                estimated_user_impact: 'MEDIUM',
+                first_actions: ['Check logs.'],
+                questions_to_answer: ['Which endpoint failed?'],
+                suggested_cloudwatch_queries: ['fields @message'],
+              },
+              recommended_next_stage: 'INVESTIGATE',
+            },
+          ],
+          findings: [],
+        })
+      )
+      .mockResolvedValueOnce(
+        JSON.stringify({
+          summary: 'ALB 5xx detected.',
+          overall_severity: 'HIGH',
+          incidents: [
+            {
+              incident_id: 'INC-001',
+              title: 'ALB 5xx responses',
+              classification: 'APPLICATION_ERROR',
+              severity: 'HIGH',
+              confidence: 0.9,
+              affected_services: ['data-pipeline-api'],
+              evidence: ['5xx responses detected.'],
+              signals: { alarms: [], metrics: ['5xx'], logs: [] },
+              suspected_causes: ['Application returned errors.'],
+              investigation_plan: {
+                priority: 1,
+                estimated_user_impact: 'PARTIAL',
+                first_actions: ['Check logs.'],
+                questions_to_answer: ['Which endpoint failed?'],
+                suggested_cloudwatch_queries: ['fields @message'],
+              },
+              recommended_next_stage: 'INVESTIGATE',
+            },
+          ],
+          findings: [],
+        })
+      );
+
+    const result = await classifyStage.run(mockInput, mockConfig);
+
+    expect(result.status).toBe('success');
+    const repairPrompt = vi.mocked(callOpenRouter).mock.calls[1]?.[0] ?? '';
+    expect(repairPrompt).toContain('incidents.0.investigation_plan.estimated_user_impact');
+    expect(repairPrompt).toContain('Allowed values: NONE, MINIMAL, PARTIAL, SIGNIFICANT, COMPLETE');
+    expect(repairPrompt).toContain('Do not use severity labels such as LOW, MEDIUM, HIGH, or CRITICAL');
+  });
+
   it('returns fallback if retry is also invalid', async () => {
     const { fetchReport } = await import('../report/fetchReport.js');
     const { callOpenRouter } = await import('../llm/openrouter.js');

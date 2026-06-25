@@ -70,6 +70,18 @@ Significant degradation. User impact likely.
 CRITICAL:
 Service unavailable, no healthy tasks, sustained 5xx errors, or major confirmed customer impact.
 
+## **User Impact Enum**
+
+The field investigation_plan.estimated_user_impact is not severity. Use only one of:
+
+* NONE
+* MINIMAL
+* PARTIAL
+* SIGNIFICANT
+* COMPLETE
+
+Do not use LOW, MEDIUM, HIGH, or CRITICAL for estimated_user_impact.
+
 ## **Classification Rules**
 
 * Prefer evidence over speculation.

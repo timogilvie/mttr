@@ -7,6 +7,27 @@ import { parseClassification } from '../validation/classificationSchema.js';
 import { stripMarkdownFences } from '../llm/json.js';
 import { enforceMandatoryIncidents } from '../report/mandatoryIncidents.js';
 import { parseReportContext } from '../report/reportContext.js';
+import { z } from 'zod';
+
+function formatValidationDetails(error: unknown): string {
+  if (
+    error instanceof Error &&
+    'zodError' in error &&
+    error.zodError instanceof z.ZodError
+  ) {
+    return error.zodError.issues
+      .slice(0, 5)
+      .map((issue) => {
+        const path = issue.path.length > 0 ? issue.path.join('.') : '<root>';
+        const options =
+          issue.code === 'invalid_enum_value' ? ` Allowed values: ${issue.options.join(', ')}.` : '';
+        return `- ${path}: ${issue.message}.${options}`;
+      })
+      .join('\n');
+  }
+
+  return error instanceof Error ? error.message : String(error);
+}
 
 async function attemptParse(
   responseText: string,
@@ -26,7 +47,8 @@ async function attemptParse(
 
     console.warn('[Classify] Initial response invalid, attempting repair retry', error);
 
-    const repairInstruction = `\n\nThe previous response was invalid JSON or did not match the required schema. Please return a valid JSON object matching the exact schema specified in the instructions.`;
+    const validationDetails = formatValidationDetails(error);
+    const repairInstruction = `\n\nThe previous response was invalid JSON or did not match the required schema.\n\nValidation details:\n${validationDetails}\n\nReturn a valid JSON object matching the exact schema specified in the instructions. For investigation_plan.estimated_user_impact, use only one of: NONE, MINIMAL, PARTIAL, SIGNIFICANT, COMPLETE. Do not use severity labels such as LOW, MEDIUM, HIGH, or CRITICAL for estimated_user_impact.`;
     const repairPrompt = (originalPrompt ?? '') + repairInstruction;
 
     try {

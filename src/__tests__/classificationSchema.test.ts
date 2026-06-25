@@ -177,6 +177,37 @@ describe('classificationSchema', () => {
     expect(() => parseClassification(invalid)).toThrow(ClassificationValidationError);
   });
 
+  it('rejects severity labels for estimated user impact', () => {
+    const invalid = {
+      summary: 'Test',
+      overall_severity: 'HIGH',
+      incidents: [
+        {
+          incident_id: 'INC-001',
+          title: 'Test',
+          classification: 'APPLICATION_ERROR',
+          severity: 'HIGH',
+          confidence: 0.8,
+          affected_services: ['api'],
+          evidence: ['5xx responses detected.'],
+          signals: { alarms: [], metrics: ['5xx'], logs: [] },
+          suspected_causes: ['Application error.'],
+          investigation_plan: {
+            priority: 1,
+            estimated_user_impact: 'MEDIUM',
+            first_actions: [],
+            questions_to_answer: [],
+            suggested_cloudwatch_queries: [],
+          },
+          recommended_next_stage: 'INVESTIGATE',
+        },
+      ],
+      findings: [],
+    };
+
+    expect(() => parseClassification(invalid)).toThrow(ClassificationValidationError);
+  });
+
   it('rejects missing required fields', () => {
     const invalid = {
       summary: 'Test',

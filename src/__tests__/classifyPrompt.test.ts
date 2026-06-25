@@ -43,6 +43,16 @@ describe('classifyPrompt', () => {
     expect(prompt).toContain('CRITICAL:');
   });
 
+  it('distinguishes severity from estimated user impact enum values', () => {
+    const prompt = buildClassifyPrompt(sampleReport);
+
+    expect(prompt).toContain('investigation_plan.estimated_user_impact is not severity');
+    expect(prompt).toContain('MINIMAL');
+    expect(prompt).toContain('PARTIAL');
+    expect(prompt).toContain('SIGNIFICANT');
+    expect(prompt).toContain('Do not use LOW, MEDIUM, HIGH, or CRITICAL');
+  });
+
   it('requires hard health signals to be classified as incidents', () => {
     const prompt = buildClassifyPrompt(sampleReport);
 
