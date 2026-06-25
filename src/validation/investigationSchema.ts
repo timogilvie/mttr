@@ -1,6 +1,11 @@
 import { z } from 'zod';
 import type { InvestigationResult } from '../types.js';
-import { SeveritySchema, IncidentClassificationSchema } from './classificationSchema.js';
+import {
+  SeveritySchema,
+  IncidentClassificationSchema,
+  IncidentSemanticsSchema,
+} from './classificationSchema.js';
+import type { IncidentSemantics } from '../types.js';
 
 const OverallAssessmentSchema = z.enum([
   'ACTIVE_INCIDENT',
@@ -53,6 +58,16 @@ const UnresolvedEvidenceRequirementSchema = z.object({
   tool_hint: z.string(),
 });
 
+const DefaultIncidentSemantics: IncidentSemantics = {
+  customer_impact: 'UNKNOWN',
+  evidence_role: 'UNKNOWN',
+  currentness: 'UNKNOWN',
+  upstream_incident_ids: [],
+  downstream_incident_ids: [],
+  observability_reliability: 'UNKNOWN',
+  observability_notes: [],
+};
+
 const PriorityItemSchema = z.object({
   rank: z.number(),
   incident_id: z.string(),
@@ -71,6 +86,7 @@ const InvestigationSchema = z.object({
   confirmed_facts: z.array(z.string()),
   supporting_evidence: z.array(z.string()),
   contradicting_evidence: z.array(z.string()),
+  semantics: IncidentSemanticsSchema.default(DefaultIncidentSemantics),
   likely_causes: z.array(LikelyCauseSchema),
   unknowns: z.array(z.string()),
   additional_data_needed: z.array(AdditionalDataNeededSchema),

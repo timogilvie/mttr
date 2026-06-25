@@ -32,6 +32,13 @@ Use suggested_cloudwatch_queries and signals to target your queries. For finding
 - Start from the highest severity / highest confidence items.
 - Correlate across metrics, logs, and alarm history; look for timing relationships (errors after a deploy, latency before errors, downstream before upstream).
 - Determine whether the affected service is the true source or merely surfacing a downstream failure. Avoid overfitting to a single metric.
+- Assign explicit semantics for every investigation. Do not encode these distinctions only in prose:
+  - customer_impact distinguishes CONFIRMED_CUSTOMER_IMPACT from POSSIBLE_CUSTOMER_IMPACT, NONE, NOT_CUSTOMER_IMPACT, or UNKNOWN.
+  - evidence_role distinguishes PRIMARY_INCIDENT, DUPLICATE_EVIDENCE, UPSTREAM_SUSPECT, DOWNSTREAM_SYMPTOM, OBSERVABILITY_FAILURE, NOISE_OR_NON_INCIDENT, or UNKNOWN.
+  - currentness distinguishes ACTIVE, RECOVERED_TRANSIENT, HISTORICAL, STALE, or UNKNOWN.
+  - duplicate_of and root_incident_id link duplicate symptoms to the canonical/root investigation id when evidence supports that relationship.
+  - upstream_incident_ids and downstream_incident_ids record suspected service dependency direction.
+  - observability_reliability distinguishes TRUSTED, PARTIAL, UNRELIABLE, or UNKNOWN telemetry.
 - If Step 1 reports a high 4xx rate or AUTH_FAILURE without direct auth evidence, do not stop at the aggregate count. Use discover_log_groups if needed, then query recent logs to break down 4xx responses by status code, endpoint/path, and caller/client/tenant fields when present. Search for explicit auth terms such as unauthorized, forbidden, token, signature, credential, authentication, and authorization.
 - If Step 1 reports 5xx responses or APPLICATION_ERROR, do not stop at the aggregate count. Break the errors down by status code and endpoint using query_alb_access_logs and application logs, and use get_ecs_service_events to check for deployments or stopped tasks overlapping the error window. Target 5xx responses (especially 502/504) may never appear in application logs because the task crashed or timed out; in that case ALB access logs and ECS stopped-task reasons are the evidence to use.
 - Prefer aggregation queries (e.g. stats count(*) by status, path) over raw newest-N row dumps, and exclude health-check endpoints (e.g. /health) when sampling raw logs — otherwise routine health checks drown out the signal.
@@ -43,6 +50,8 @@ Use suggested_cloudwatch_queries and signals to target your queries. For finding
 ## Evidence discipline
 
 - Treat the Pre-gathered Tool Evidence section as actual tool output. Use it before deciding whether more tool calls are needed.
+- If an alarm is in ALARM because its metric has no datapoints and the alarm treats missing data as breaching, mark observability_reliability UNRELIABLE or PARTIAL unless corroborating service-health evidence proves real impact. Such an alarm may still be relevant, but it is not by itself confirmed customer impact.
+- If multiple findings describe the same failure path, mark the non-canonical items as DUPLICATE_EVIDENCE and set duplicate_of/root_incident_id to the canonical investigation id.
 - Pre-gathered evidence is a starting point, not a substitute for investigation. Do NOT return investigation_status INSUFFICIENT_EVIDENCE for an item, and do NOT leave a question in additional_data_needed or unknowns, while an available tool could plausibly answer it and you have tool budget remaining. Attempt the relevant tool calls first; INSUFFICIENT_EVIDENCE is only valid after the attempted calls failed, returned nothing, or the data is genuinely outside your tools' reach — and in that case name the calls you attempted in confirmed_facts or unknowns.
 - Before finalising each item, do not defer tool-answerable evidence in prose. If a root-cause gap is still answerable by an available tool after your current budget, add it to unresolved_evidence_requirements using one of these types: CUSTOM_METRIC_HISTORY, FIRST_BAD_LOG_TIMESTAMP, LAMBDA_FAILURE_SUMMARY, CHANGE_EVENT_DETAILS, DEPLOYMENT_PROVENANCE, ALARM_COVERAGE. Keep human-only work in recommended_next_investigation_steps; human-only steps do not trigger tool closure.
 - Every entry in confirmed_facts and supporting_evidence MUST be traceable to a specific Step 1 field or a tool result you actually received. Quote or reference it. If you have no evidence beyond Step 1, leave the array empty and record the gap in unknowns.
@@ -80,6 +89,17 @@ Return valid JSON only. Do not include markdown. Use this schema:
 "confirmed_facts": [],
 "supporting_evidence": [],
 "contradicting_evidence": [],
+"semantics": {
+  "customer_impact": "NONE | POSSIBLE_CUSTOMER_IMPACT | CONFIRMED_CUSTOMER_IMPACT | NOT_CUSTOMER_IMPACT | UNKNOWN",
+  "evidence_role": "PRIMARY_INCIDENT | DUPLICATE_EVIDENCE | UPSTREAM_SUSPECT | DOWNSTREAM_SYMPTOM | OBSERVABILITY_FAILURE | NOISE_OR_NON_INCIDENT | UNKNOWN",
+  "currentness": "ACTIVE | RECOVERED_TRANSIENT | HISTORICAL | STALE | UNKNOWN",
+  "duplicate_of": null,
+  "root_incident_id": null,
+  "upstream_incident_ids": [],
+  "downstream_incident_ids": [],
+  "observability_reliability": "TRUSTED | PARTIAL | UNRELIABLE | UNKNOWN",
+  "observability_notes": []
+},
 "likely_causes": [ { "cause": "", "confidence": 0.0, "evidence": [] } ],
 "unknowns": [],
 "additional_data_needed": [ { "data": "", "reason": "", "suggested_query_or_source": "" } ],

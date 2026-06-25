@@ -56,6 +56,85 @@ describe('classificationSchema', () => {
     expect(result.incidents[0]?.classification).toBe('TRAFFIC_ANOMALY');
   });
 
+  it('accepts optional incident semantics on classification output', () => {
+    const valid = {
+      summary: 'ALB 5xx detected',
+      overall_severity: 'HIGH',
+      incidents: [
+        {
+          incident_id: 'INC-503',
+          title: 'ALB 5xx responses for data-pipeline-api',
+          classification: 'APPLICATION_ERROR',
+          severity: 'HIGH',
+          confidence: 0.9,
+          affected_services: ['data-pipeline-api'],
+          evidence: ['11 target 503 responses.'],
+          signals: {
+            alarms: [],
+            metrics: ['ALB 5xx responses: 11'],
+            logs: [],
+          },
+          semantics: {
+            customer_impact: 'CONFIRMED_CUSTOMER_IMPACT',
+            evidence_role: 'PRIMARY_INCIDENT',
+            currentness: 'HISTORICAL',
+            duplicate_of: null,
+            root_incident_id: 'INC-503',
+            upstream_incident_ids: ['AUTH-001'],
+            downstream_incident_ids: [],
+            observability_reliability: 'TRUSTED',
+            observability_notes: ['ALB target 5xx metric came from the health report.'],
+          },
+          suspected_causes: ['Application returned server errors.'],
+          investigation_plan: {
+            priority: 1,
+            estimated_user_impact: 'PARTIAL',
+            first_actions: ['Check ALB access logs.'],
+            questions_to_answer: ['Which endpoint returned 503?'],
+            suggested_cloudwatch_queries: ['Query ALB logs.'],
+          },
+          recommended_next_stage: 'INVESTIGATE',
+        },
+      ],
+      findings: [],
+    };
+
+    const result = parseClassification(valid);
+
+    expect(result.incidents[0]?.semantics?.customer_impact).toBe('CONFIRMED_CUSTOMER_IMPACT');
+    expect(result.incidents[0]?.semantics?.upstream_incident_ids).toEqual(['AUTH-001']);
+  });
+
+  it('rejects invalid optional classification semantics', () => {
+    const invalid = {
+      summary: 'Test',
+      overall_severity: 'LOW',
+      incidents: [],
+      findings: [
+        {
+          title: 'Noisy warning count',
+          classification: 'OBSERVABILITY_FAILURE',
+          severity: 'LOW',
+          confidence: 0.7,
+          affected_services: ['auth-service'],
+          evidence: ['Warnings count: 618'],
+          semantics: {
+            customer_impact: 'NONE',
+            evidence_role: 'BENIGN',
+            currentness: 'ACTIVE',
+            upstream_incident_ids: [],
+            downstream_incident_ids: [],
+            observability_reliability: 'PARTIAL',
+            observability_notes: [],
+          },
+          reason_not_incident: 'No confirmed impact.',
+        },
+      ],
+    };
+
+    expect(() => parseClassification(invalid)).toThrow(ClassificationValidationError);
+  });
+
   it('rejects invalid severity', () => {
     const invalid = {
       summary: 'Test',
