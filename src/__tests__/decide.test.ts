@@ -68,6 +68,51 @@ describe('Decide stage', () => {
     expect(decision.decisions[0]?.disposition).toBe('VERIFY');
     expect(decision.decisions[0]?.follow_up_actions.join(' ')).toContain('ALB access logs');
     expect(decision.decisions[0]?.evidence_to_pass.join(' ')).toContain('steady state');
+    expect(decision.decisions[0]?.evidence_check_plan).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          check_type: 'ALARM_STATE',
+          tool: 'find_alarms',
+          target: 'hokusai-auth-development-task-health',
+        }),
+        expect.objectContaining({
+          check_type: 'ECS_SERVICE_HEALTH',
+          tool: 'get_ecs_service_events',
+          target: 'hokusai-auth-development',
+        }),
+      ])
+    );
+    expect(decision.decisions[0]?.evidence_check_plan?.map((check) => check.target)).not.toContain('at');
+  });
+
+  it('builds exact ALB and log checks for data-pipeline-api 503 investigations', () => {
+    const decision = decide(
+      result([
+        investigation({
+          incident_id: 'INC-503',
+          title: 'ALB 5xx responses for data-pipeline-api',
+          investigation_status: 'CONFIRMED_INCIDENT',
+          affected_services: ['data-pipeline-api'],
+          confirmed_facts: ['Application logs show auth service request timed out before 503 responses.'],
+          supporting_evidence: ['ALB access logs show 11 target-generated 503 responses.'],
+        }),
+      ])
+    );
+
+    expect(decision.decisions[0]?.evidence_check_plan).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          check_type: 'ALB_ACCESS_LOGS',
+          tool: 'query_alb_access_logs',
+          target: 'app/hokusai-registry-development/78840d73e3e9652e',
+        }),
+        expect.objectContaining({
+          check_type: 'LOG_QUERY',
+          tool: 'query_logs',
+          target: '/ecs/hokusai-api-development',
+        }),
+      ])
+    );
   });
 
   it('routes confirmed incidents with root cause evidence to Mitigate', () => {

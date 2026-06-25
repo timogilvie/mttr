@@ -54,6 +54,7 @@ Use suggested_cloudwatch_queries and signals to target your queries. For finding
 - If multiple findings describe the same failure path, mark the non-canonical items as DUPLICATE_EVIDENCE and set duplicate_of/root_incident_id to the canonical investigation id.
 - Pre-gathered evidence is a starting point, not a substitute for investigation. Do NOT return investigation_status INSUFFICIENT_EVIDENCE for an item, and do NOT leave a question in additional_data_needed or unknowns, while an available tool could plausibly answer it and you have tool budget remaining. Attempt the relevant tool calls first; INSUFFICIENT_EVIDENCE is only valid after the attempted calls failed, returned nothing, or the data is genuinely outside your tools' reach — and in that case name the calls you attempted in confirmed_facts or unknowns.
 - Before finalising each item, do not defer tool-answerable evidence in prose. If a root-cause gap is still answerable by an available tool after your current budget, add it to unresolved_evidence_requirements using one of these types: CUSTOM_METRIC_HISTORY, FIRST_BAD_LOG_TIMESTAMP, LAMBDA_FAILURE_SUMMARY, CHANGE_EVENT_DETAILS, DEPLOYMENT_PROVENANCE, ALARM_COVERAGE. Keep human-only work in recommended_next_investigation_steps; human-only steps do not trigger tool closure.
+- For each item that should be checked again by Decide/Verify, add structured entries to evidence_check_plan. Use exact tool targets and JSON args, not prose. For example: exact alarm names for find_alarms, exact ECS service/cluster for get_ecs_service_events, exact LoadBalancer dimension for query_alb_access_logs, exact log group for query_logs, and exact metric namespace/name/dimensions for get_metrics_and_alarms. If an exact identifier is unknown, create a RESOURCE_LOOKUP check instead of guessing.
 - Every entry in confirmed_facts and supporting_evidence MUST be traceable to a specific Step 1 field or a tool result you actually received. Quote or reference it. If you have no evidence beyond Step 1, leave the array empty and record the gap in unknowns.
 - Do NOT assign a per-item confidence higher than that item's Step 1 confidence unless you obtained corroborating evidence from a tool.
 - Do not fabricate logs, metrics, timestamps, or service names. Preserve service names exactly as given in Step 1.
@@ -104,6 +105,20 @@ Return valid JSON only. Do not include markdown. Use this schema:
 "unknowns": [],
 "additional_data_needed": [ { "data": "", "reason": "", "suggested_query_or_source": "" } ],
 "unresolved_evidence_requirements": [ { "type": "CUSTOM_METRIC_HISTORY | FIRST_BAD_LOG_TIMESTAMP | LAMBDA_FAILURE_SUMMARY | CHANGE_EVENT_DETAILS | DEPLOYMENT_PROVENANCE | ALARM_COVERAGE", "description": "", "tool_hint": "" } ],
+"evidence_check_plan": [
+  {
+    "check_id": "",
+    "incident_id": "",
+    "check_type": "ALARM_STATE | METRIC_DATA | ECS_SERVICE_HEALTH | LOG_QUERY | ALB_ACCESS_LOGS | RESOURCE_LOOKUP",
+    "tool": "",
+    "target": "",
+    "args": {},
+    "expected_signal": "",
+    "freshness_window_minutes": 60,
+    "pass_criteria": "",
+    "fail_criteria": ""
+  }
+],
 "recommended_next_investigation_steps": [ { "priority": 1, "action": "", "expected_signal": "" } ],
 "requires_more_evidence_before_mitigation": true,
 "possible_future_remediation": []

@@ -1,12 +1,14 @@
 import type {
   DecisionNextStage,
   DecisionResult,
+  EvidenceCheckPlan,
   IncidentDecision,
   Investigation,
   InvestigationResult,
   StageInput,
   StageResult,
 } from '../types.js';
+import { resolveServiceResource } from '../tools/serviceResources.js';
 
 const STAGE_PRIORITY: Record<DecisionNextStage, number> = {
   Mitigate: 4,
@@ -29,6 +31,198 @@ function evidenceToPass(investigation: Investigation): string[] {
     ...investigation.supporting_evidence,
     ...investigation.contradicting_evidence.map((evidence) => `Contradicting: ${evidence}`),
   ].slice(0, 12);
+}
+
+function uniqueByCheckId(checks: EvidenceCheckPlan[]): EvidenceCheckPlan[] {
+  const seen = new Set<string>();
+  const unique: EvidenceCheckPlan[] = [];
+  for (const check of checks) {
+    if (!seen.has(check.check_id)) {
+      seen.add(check.check_id);
+      unique.push(check);
+    }
+  }
+  return unique;
+}
+
+function investigationText(investigation: Investigation): string {
+  return [
+    investigation.title,
+    investigation.original_classification,
+    investigation.investigation_status,
+    ...investigation.affected_services,
+    ...investigation.confirmed_facts,
+    ...investigation.supporting_evidence,
+    ...investigation.contradicting_evidence,
+    ...investigation.unknowns,
+    ...investigation.recommended_next_investigation_steps.map((step) => step.action),
+  ].join('\n');
+}
+
+function extractAlarmNames(text: string): string[] {
+  const names: string[] = [];
+  const patterns = [
+    /\balarm=([A-Za-z0-9_.:/-]+)/gi,
+    /\balarm\s+(?!for\b|state\b)([A-Za-z0-9_.:/-]*alarm[A-Za-z0-9_.:/-]*)/gi,
+    /\b([A-Za-z0-9][A-Za-z0-9_.:/-]*-[A-Za-z0-9_.:/-]*alarm[A-Za-z0-9_.:/-]*)\b/gi,
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const candidate = match[1]?.replace(/[.,;:)]+$/g, '');
+      if (candidate && !['alarm', 'state', 'history'].includes(candidate.toLowerCase())) {
+        names.push(candidate);
+      }
+    }
+  }
+
+  return [...new Set(names)];
+}
+
+function fallbackEvidenceCheckPlan(investigation: Investigation): EvidenceCheckPlan[] {
+  const text = investigationText(investigation);
+  const lowerText = text.toLowerCase();
+  const checks: EvidenceCheckPlan[] = [...(investigation.evidence_check_plan ?? [])];
+
+  for (const alarmName of extractAlarmNames(text)) {
+    checks.push({
+      check_id: `${investigation.incident_id}:alarm:${alarmName}`,
+      incident_id: investigation.incident_id,
+      check_type: 'ALARM_STATE',
+      tool: 'find_alarms',
+      target: alarmName,
+      args: { search: alarmName },
+      expected_signal: `Current state and missing-data handling for alarm ${alarmName}.`,
+      freshness_window_minutes: 60,
+      pass_criteria: 'Alarm is OK or corroborating evidence shows no active service impact.',
+      fail_criteria: 'Alarm is ALARM with trusted corroborating service-health evidence.',
+    });
+  }
+
+  for (const service of investigation.affected_services) {
+    const resource = resolveServiceResource(service, text);
+    if (lowerText.includes('alarm')) {
+      for (const alarmName of resource.alarms) {
+        checks.push({
+          check_id: `${investigation.incident_id}:alarm:${alarmName}`,
+          incident_id: investigation.incident_id,
+          check_type: 'ALARM_STATE',
+          tool: 'find_alarms',
+          target: alarmName,
+          args: { search: alarmName },
+          expected_signal: `Current state and missing-data handling for alarm ${alarmName}.`,
+          freshness_window_minutes: 60,
+          pass_criteria: 'Alarm is OK or corroborating evidence shows no active service impact.',
+          fail_criteria: 'Alarm is ALARM with trusted corroborating service-health evidence.',
+        });
+      }
+    }
+
+    const ecs = resource.ecsServices[0];
+    if (ecs) {
+      checks.push({
+        check_id: `${investigation.incident_id}:ecs:${ecs.cluster ?? 'any'}:${ecs.serviceName}`,
+        incident_id: investigation.incident_id,
+        check_type: 'ECS_SERVICE_HEALTH',
+        tool: 'get_ecs_service_events',
+        target: ecs.serviceName,
+        args: { service_name: ecs.serviceName, cluster: ecs.cluster, lookback_minutes: 60 },
+        expected_signal: `Current ECS health for ${ecs.serviceName}.`,
+        freshness_window_minutes: 60,
+        pass_criteria: 'Service is ACTIVE with desired tasks running and no fresh failure evidence.',
+        fail_criteria: 'Service has zero running tasks, failed rollout, or recent stopped tasks.',
+      });
+    } else {
+      checks.push({
+        check_id: `${investigation.incident_id}:resource-lookup:${service}`,
+        incident_id: investigation.incident_id,
+        check_type: 'RESOURCE_LOOKUP',
+        tool: 'discover_log_groups',
+        target: service,
+        args: { service_name: service, limit: 5 },
+        expected_signal: `Resolve exact resources for ${service}.`,
+        freshness_window_minutes: 60,
+        pass_criteria: 'Exact service resources are found before service-health checks run.',
+        fail_criteria: 'Only generic service labels are available.',
+      });
+    }
+
+    if (lowerText.includes('5xx') || lowerText.includes('503')) {
+      const alb = resource.albs[0];
+      if (alb) {
+        checks.push({
+          check_id: `${investigation.incident_id}:alb:${alb.loadBalancer}`,
+          incident_id: investigation.incident_id,
+          check_type: 'ALB_ACCESS_LOGS',
+          tool: 'query_alb_access_logs',
+          target: alb.loadBalancer,
+          args: {
+            load_balancer: alb.loadBalancer,
+            status_class: '5xx',
+            lookback_minutes: 60,
+            sample_limit: 5,
+          },
+          expected_signal: `Recent ALB 5xx access-log evidence for ${alb.loadBalancer}.`,
+          freshness_window_minutes: 60,
+          pass_criteria: 'No recent matching 5xx requests in the verification window.',
+          fail_criteria: 'Recent matching target or ELB 5xx requests are present.',
+        });
+      }
+    }
+
+    if (lowerText.includes('log') || lowerText.includes('warning') || lowerText.includes('timeout')) {
+      const logGroup = resource.logGroups[0];
+      if (logGroup) {
+        checks.push({
+          check_id: `${investigation.incident_id}:logs:${logGroup}`,
+          incident_id: investigation.incident_id,
+          check_type: 'LOG_QUERY',
+          tool: 'query_logs',
+          target: logGroup,
+          args: {
+            log_group: logGroup,
+            filter_or_query:
+              'fields @timestamp, @message, @logStream | filter @message like /(?i)(error|exception|timeout|warning|failed)/ | sort @timestamp desc | limit 25',
+            lookback_minutes: 60,
+            limit: 25,
+          },
+          expected_signal: `Recent failure, timeout, or warning logs from ${logGroup}.`,
+          freshness_window_minutes: 60,
+          pass_criteria: 'No recent matching bad-event logs.',
+          fail_criteria: 'Recent timeout/error/warning burst is still present.',
+        });
+      }
+    }
+
+    for (const metric of resource.healthMetrics) {
+      if (
+        lowerText.includes(metric.metric_name.toLowerCase()) ||
+        lowerText.includes('missing datapoint') ||
+        lowerText.includes('no datapoint')
+      ) {
+        checks.push({
+          check_id: `${investigation.incident_id}:metric:${metric.namespace}:${metric.metric_name}`,
+          incident_id: investigation.incident_id,
+          check_type: 'METRIC_DATA',
+          tool: 'get_metrics_and_alarms',
+          target: `${metric.namespace}/${metric.metric_name}`,
+          args: {
+            namespace: metric.namespace,
+            metric_name: metric.metric_name,
+            dimensions: metric.dimensions,
+            stat: metric.stat,
+            lookback_minutes: 60,
+          },
+          expected_signal: `Recent datapoints for ${metric.namespace}/${metric.metric_name}.`,
+          freshness_window_minutes: 60,
+          pass_criteria: 'Recent datapoints exist and corroborate healthy service state.',
+          fail_criteria: 'Metric is absent or breaching and corroborated by service-health evidence.',
+        });
+      }
+    }
+  }
+
+  return uniqueByCheckId(checks);
 }
 
 function unresolvedActions(investigation: Investigation): string[] {
@@ -69,6 +263,7 @@ function decideInvestigation(investigation: Investigation): IncidentDecision {
     severity: investigation.severity,
     affected_services: investigation.affected_services,
     evidence_to_pass: evidenceToPass(investigation),
+    evidence_check_plan: fallbackEvidenceCheckPlan(investigation),
   };
 
   if (
