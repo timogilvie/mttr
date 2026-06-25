@@ -95,7 +95,37 @@ describe('investigationSchema', () => {
       observability_reliability: 'UNKNOWN',
       observability_notes: [],
     });
+    expect(result.investigations[0]?.evidence_check_plan).toEqual([]);
     expect(result.priority_order[0]?.incident_id).toBe('INC-001');
+  });
+
+  it('accepts structured evidence check plans', () => {
+    const result = parseInvestigation(
+      validResult({
+        investigations: [
+          validInvestigation({
+            evidence_check_plan: [
+              {
+                check_id: 'INC-001:alarm:hokusai-auth-development-task-health',
+                incident_id: 'INC-001',
+                check_type: 'ALARM_STATE',
+                tool: 'find_alarms',
+                target: 'hokusai-auth-development-task-health',
+                args: { search: 'hokusai-auth-development-task-health' },
+                expected_signal: 'Current alarm state.',
+                freshness_window_minutes: 60,
+                pass_criteria: 'Alarm is OK.',
+                fail_criteria: 'Alarm is ALARM with corroborating evidence.',
+              },
+            ],
+          }),
+        ],
+      })
+    );
+
+    expect(result.investigations[0]?.evidence_check_plan?.[0]?.target).toBe(
+      'hokusai-auth-development-task-health'
+    );
   });
 
   it('accepts explicit customer-impact semantics for a confirmed 503 incident', () => {

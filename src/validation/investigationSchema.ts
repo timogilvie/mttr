@@ -43,6 +43,28 @@ const NextInvestigationStepSchema = z.object({
   expected_signal: z.string(),
 });
 
+const EvidenceCheckTypeSchema = z.enum([
+  'ALARM_STATE',
+  'METRIC_DATA',
+  'ECS_SERVICE_HEALTH',
+  'LOG_QUERY',
+  'ALB_ACCESS_LOGS',
+  'RESOURCE_LOOKUP',
+]);
+
+const EvidenceCheckPlanSchema = z.object({
+  check_id: z.string(),
+  incident_id: z.string(),
+  check_type: EvidenceCheckTypeSchema,
+  tool: z.string(),
+  target: z.string(),
+  args: z.record(z.unknown()),
+  expected_signal: z.string(),
+  freshness_window_minutes: z.number().optional(),
+  pass_criteria: z.string(),
+  fail_criteria: z.string(),
+});
+
 const EvidenceRequirementTypeSchema = z.enum([
   'CUSTOM_METRIC_HISTORY',
   'FIRST_BAD_LOG_TIMESTAMP',
@@ -91,6 +113,7 @@ const InvestigationSchema = z.object({
   unknowns: z.array(z.string()),
   additional_data_needed: z.array(AdditionalDataNeededSchema),
   unresolved_evidence_requirements: z.array(UnresolvedEvidenceRequirementSchema).default([]),
+  evidence_check_plan: z.array(EvidenceCheckPlanSchema).default([]),
   recommended_next_investigation_steps: z.array(NextInvestigationStepSchema),
   requires_more_evidence_before_mitigation: z.boolean(),
   possible_future_remediation: z.array(z.string()),

@@ -95,8 +95,17 @@ describe('investigatePrompt', () => {
     expect(prompt).toContain('CONFIRMED_CUSTOMER_IMPACT');
     expect(prompt).toContain('DUPLICATE_EVIDENCE');
     expect(prompt).toContain('observability_reliability');
+    expect(prompt).toContain('evidence_check_plan');
+    expect(prompt).toContain('ALB_ACCESS_LOGS');
     expect(prompt).toContain('requires_more_evidence_before_mitigation');
     expect(prompt).toContain('NO_ACTIONABLE_INCIDENT');
+  });
+
+  it('requires exact structured check targets instead of prose-only follow-up actions', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('Use exact tool targets and JSON args');
+    expect(prompt).toContain('RESOURCE_LOOKUP check instead of guessing');
   });
 
   it('instructs the model to distrust missing-data alarms without corroboration', () => {

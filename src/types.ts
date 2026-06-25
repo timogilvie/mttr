@@ -163,6 +163,27 @@ export interface NextInvestigationStep {
   expected_signal: string;
 }
 
+export type EvidenceCheckType =
+  | 'ALARM_STATE'
+  | 'METRIC_DATA'
+  | 'ECS_SERVICE_HEALTH'
+  | 'LOG_QUERY'
+  | 'ALB_ACCESS_LOGS'
+  | 'RESOURCE_LOOKUP';
+
+export interface EvidenceCheckPlan {
+  check_id: string;
+  incident_id: string;
+  check_type: EvidenceCheckType;
+  tool: string;
+  target: string;
+  args: Record<string, unknown>;
+  expected_signal: string;
+  freshness_window_minutes?: number | undefined;
+  pass_criteria: string;
+  fail_criteria: string;
+}
+
 export type EvidenceRequirementType =
   | 'CUSTOM_METRIC_HISTORY'
   | 'FIRST_BAD_LOG_TIMESTAMP'
@@ -200,6 +221,7 @@ export interface Investigation {
   unknowns: string[];
   additional_data_needed: AdditionalDataNeeded[];
   unresolved_evidence_requirements: UnresolvedEvidenceRequirement[];
+  evidence_check_plan?: EvidenceCheckPlan[] | undefined;
   recommended_next_investigation_steps: NextInvestigationStep[];
   requires_more_evidence_before_mitigation: boolean;
   possible_future_remediation: string[];
@@ -233,6 +255,7 @@ export interface IncidentDecision {
   affected_services: string[];
   rationale: string;
   evidence_to_pass: string[];
+  evidence_check_plan?: EvidenceCheckPlan[] | undefined;
   follow_up_actions: string[];
 }
 
