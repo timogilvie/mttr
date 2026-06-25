@@ -6,6 +6,7 @@ import * as decideStage from './stages/decide.js';
 import * as verifyStage from './stages/verify.js';
 import { mitigateStage } from './stages/stubs.js';
 import { fetchReport } from './report/fetchReport.js';
+import { renderOperatorSummary } from './report/operatorSummary.js';
 import {
   hashReportContent,
   hasProcessedReport,
@@ -192,6 +193,7 @@ export class Orchestrator {
         `[Orchestrator] Decide stage completed: next=${data.overall_next_stage} ` +
           `(${data.decisions.length} decision(s))`
       );
+      console.log(renderOperatorSummary({ investigation, decision: data }));
       console.log(JSON.stringify(result.data, null, 2));
       await this.runSelectedResponseStage(data);
     } else if (result.status === 'error') {
