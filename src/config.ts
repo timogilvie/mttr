@@ -36,7 +36,22 @@ export interface Config {
     intervalMs: number;
   };
   state: {
+    backend: 'file' | 'postgres';
     path: string;
+  };
+  database: {
+    url?: string;
+    runtimeUrl?: string;
+    ssl: boolean;
+    maxConnections: number;
+    idleTimeoutMs: number;
+  };
+  alerts: {
+    slack: {
+      webhookUrl?: string;
+      channel: string;
+      timeoutMs: number;
+    };
   };
   timeouts: {
     llmMs: number;
@@ -53,6 +68,11 @@ function getEnv(key: string, defaultValue?: string): string {
     return defaultValue;
   }
   throw new Error(`Missing required environment variable: ${key}`);
+}
+
+function getEnvOptional(key: string): string | undefined {
+  const value = process.env[key];
+  return value === undefined || value === '' ? undefined : value;
 }
 
 function getEnvNumber(key: string, defaultValue: number): number {
@@ -81,7 +101,24 @@ function getEnvBoolean(key: string, defaultValue: boolean): boolean {
   throw new Error(`Environment variable ${key} must be a valid boolean, got: ${value}`);
 }
 
+function getStateBackend(): 'file' | 'postgres' {
+  const value = getEnv('STATE_BACKEND', 'file');
+  if (value === 'file' || value === 'postgres') {
+    return value;
+  }
+  throw new Error(`Environment variable STATE_BACKEND must be "file" or "postgres", got: ${value}`);
+}
+
 export function loadConfig(): Config {
+  const stateBackend = getStateBackend();
+  const databaseUrl = getEnvOptional('DATABASE_URL');
+  const pooledDatabaseUrl = getEnvOptional('POOLED_DATABASE_URL');
+  const databaseRuntimeUrl = pooledDatabaseUrl ?? databaseUrl;
+  const slackWebhookUrl = getEnvOptional('SLACK_WEBHOOK_URL');
+  if (stateBackend === 'postgres' && !databaseUrl) {
+    throw new Error('DATABASE_URL is required when STATE_BACKEND=postgres');
+  }
+
   return {
     openrouter: {
       apiKey: getEnv('OPENROUTER_API_KEY'),
@@ -120,10 +157,25 @@ export function loadConfig(): Config {
       maxAttempts: getEnvNumber('AWS_MAX_ATTEMPTS', 5),
     },
     monitoring: {
-      intervalMs: getEnvNumber('MONITOR_INTERVAL_MS', 300000),
+      intervalMs: getEnvNumber('MONITOR_INTERVAL_MS', 900000),
     },
     state: {
+      backend: stateBackend,
       path: getEnv('AGENT_STATE_PATH', '.mttr-state.json'),
+    },
+    database: {
+      ...(databaseUrl ? { url: databaseUrl } : {}),
+      ...(databaseRuntimeUrl ? { runtimeUrl: databaseRuntimeUrl } : {}),
+      ssl: getEnvBoolean('DATABASE_SSL', false),
+      maxConnections: getEnvNumber('DATABASE_MAX_CONNECTIONS', 4),
+      idleTimeoutMs: getEnvNumber('DATABASE_IDLE_TIMEOUT_MS', 30000),
+    },
+    alerts: {
+      slack: {
+        ...(slackWebhookUrl ? { webhookUrl: slackWebhookUrl } : {}),
+        channel: getEnv('SLACK_ALERT_CHANNEL', 'slack'),
+        timeoutMs: getEnvNumber('SLACK_ALERT_TIMEOUT_MS', 10000),
+      },
     },
     timeouts: {
       llmMs: getEnvNumber('LLM_TIMEOUT_MS', 60000),

@@ -14,6 +14,11 @@ function main() {
     process.exit(1);
   }
 
+  if (process.env['MTTR_WORKER_SMOKE'] === '1') {
+    console.log('[Main] Worker smoke check passed');
+    return;
+  }
+
   const orchestrator = new Orchestrator(config);
 
   process.on('SIGINT', () => {

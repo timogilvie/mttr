@@ -44,7 +44,19 @@ const mockConfig: Config = {
     intervalMs: 5000,
   },
   state: {
+    backend: 'file',
     path: '.test-mttr-state.json',
+  },
+  database: {
+    ssl: false,
+    maxConnections: 4,
+    idleTimeoutMs: 30000,
+  },
+  alerts: {
+    slack: {
+      channel: 'slack',
+      timeoutMs: 10000,
+    },
   },
   timeouts: {
     llmMs: 5000,

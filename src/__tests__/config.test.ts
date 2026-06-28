@@ -24,7 +24,7 @@ describe('config', () => {
       's3://hokusai-health-reports-development/latest/development/report.md'
     );
     expect(config.aws.region).toBe('us-east-1');
-    expect(config.monitoring.intervalMs).toBe(300000);
+    expect(config.monitoring.intervalMs).toBe(900000);
     expect(config.state.path).toBe('.mttr-state.json');
     expect(config.timeouts.llmMs).toBe(60000);
     expect(config.timeouts.s3Ms).toBe(15000);
@@ -51,7 +51,16 @@ describe('config', () => {
       'OPENROUTER_BACKOFF_BASE_MS',
       'OPENROUTER_BACKOFF_MAX_MS',
       'AWS_MAX_ATTEMPTS',
+      'STATE_BACKEND',
       'AGENT_STATE_PATH',
+      'DATABASE_URL',
+      'POOLED_DATABASE_URL',
+      'DATABASE_SSL',
+      'DATABASE_MAX_CONNECTIONS',
+      'DATABASE_IDLE_TIMEOUT_MS',
+      'SLACK_WEBHOOK_URL',
+      'SLACK_ALERT_CHANNEL',
+      'SLACK_ALERT_TIMEOUT_MS',
     ]) {
       delete process.env[key];
     }
@@ -76,7 +85,74 @@ describe('config', () => {
     expect(config.openrouter.backoffBaseMs).toBe(1000);
     expect(config.openrouter.backoffMaxMs).toBe(30000);
     expect(config.aws.maxAttempts).toBe(5);
+    expect(config.state.backend).toBe('file');
     expect(config.state.path).toBe('.mttr-state.json');
+    expect(config.database.url).toBeUndefined();
+    expect(config.database.runtimeUrl).toBeUndefined();
+    expect(config.database.ssl).toBe(false);
+    expect(config.database.maxConnections).toBe(4);
+    expect(config.database.idleTimeoutMs).toBe(30000);
+    expect(config.alerts.slack.webhookUrl).toBeUndefined();
+    expect(config.alerts.slack.channel).toBe('slack');
+    expect(config.alerts.slack.timeoutMs).toBe(10000);
+  });
+
+  it('reads Slack alert settings from env', () => {
+    process.env['OPENROUTER_API_KEY'] = 'test-key';
+    process.env['SLACK_WEBHOOK_URL'] = 'https://hooks.slack.test/services/secret';
+    process.env['SLACK_ALERT_CHANNEL'] = 'mttr-alerts';
+    process.env['SLACK_ALERT_TIMEOUT_MS'] = '5000';
+
+    const config = loadConfig();
+
+    expect(config.alerts.slack.webhookUrl).toBe('https://hooks.slack.test/services/secret');
+    expect(config.alerts.slack.channel).toBe('mttr-alerts');
+    expect(config.alerts.slack.timeoutMs).toBe(5000);
+  });
+
+  it('reads postgres state backend and database settings from env', () => {
+    process.env['OPENROUTER_API_KEY'] = 'test-key';
+    process.env['STATE_BACKEND'] = 'postgres';
+    process.env['DATABASE_URL'] = 'postgres://user:pass@localhost:5432/mttr';
+    process.env['DATABASE_SSL'] = 'true';
+    process.env['DATABASE_MAX_CONNECTIONS'] = '8';
+    process.env['DATABASE_IDLE_TIMEOUT_MS'] = '45000';
+
+    const config = loadConfig();
+
+    expect(config.state.backend).toBe('postgres');
+    expect(config.database.url).toBe('postgres://user:pass@localhost:5432/mttr');
+    expect(config.database.runtimeUrl).toBe('postgres://user:pass@localhost:5432/mttr');
+    expect(config.database.ssl).toBe(true);
+    expect(config.database.maxConnections).toBe(8);
+    expect(config.database.idleTimeoutMs).toBe(45000);
+  });
+
+  it('uses pooled database URL for runtime connections when provided', () => {
+    process.env['OPENROUTER_API_KEY'] = 'test-key';
+    process.env['STATE_BACKEND'] = 'postgres';
+    process.env['DATABASE_URL'] = 'postgres://user:pass@direct.example.com:5432/mttr';
+    process.env['POOLED_DATABASE_URL'] = 'postgres://user:pass@pooler.example.com:5432/mttr';
+
+    const config = loadConfig();
+
+    expect(config.database.url).toBe('postgres://user:pass@direct.example.com:5432/mttr');
+    expect(config.database.runtimeUrl).toBe('postgres://user:pass@pooler.example.com:5432/mttr');
+  });
+
+  it('requires DATABASE_URL when postgres state backend is enabled', () => {
+    process.env['OPENROUTER_API_KEY'] = 'test-key';
+    process.env['STATE_BACKEND'] = 'postgres';
+    delete process.env['DATABASE_URL'];
+
+    expect(() => loadConfig()).toThrow('DATABASE_URL');
+  });
+
+  it('rejects unknown state backends', () => {
+    process.env['OPENROUTER_API_KEY'] = 'test-key';
+    process.env['STATE_BACKEND'] = 'redis';
+
+    expect(() => loadConfig()).toThrow('STATE_BACKEND');
   });
 
   it('reads investigate model overrides from env', () => {
@@ -138,7 +214,7 @@ describe('config', () => {
     const config = loadConfig();
 
     expect(config.openrouter.model).toBe('openai/gpt-4o-mini');
-    expect(config.monitoring.intervalMs).toBe(300000);
+    expect(config.monitoring.intervalMs).toBe(900000);
   });
 
   it('non-numeric interval throws with variable name', () => {

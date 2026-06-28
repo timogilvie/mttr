@@ -2,13 +2,20 @@
   "name": "hokusai-monitoring-agent",
   "version": "1.0.0",
   "type": "module",
+  "packageManager": "pnpm@10.11.0",
   "description": "Hokusai monitoring agent with staged incident classification and response",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && vite build",
+    "build:web": "vite build",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
-    "start": "tsx src/index.ts"
+    "smoke:compose": "bash tests/compose-smoke.sh",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "start": "tsx src/index.ts",
+    "start:worker": "tsx src/index.ts",
+    "start:web": "tsx src/web/server.ts",
+    "dev:web": "vite --host 0.0.0.0"
   },
   "dependencies": {
     "@aws-sdk/client-cloudformation": "^3.1068.0",
@@ -21,17 +28,27 @@
     "@aws-sdk/client-eventbridge": "^3.1068.0",
     "@aws-sdk/client-lambda": "^3.1068.0",
     "@aws-sdk/client-s3": "^3.699.0",
+    "@fastify/static": "^9.1.3",
     "ethers": "^6.17.0",
+    "fastify": "^5.8.5",
+    "pg": "^8.22.0",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
     "zod": "^3.24.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
+    "@types/pg": "^8.20.0",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
     "@typescript-eslint/eslint-plugin": "^8.18.2",
     "@typescript-eslint/parser": "^8.18.2",
+    "@vitejs/plugin-react": "^6.0.3",
     "eslint": "^9.17.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.60.1",
+    "vite": "^8.1.0",
     "vitest": "^2.1.8"
   },
   "engines": {

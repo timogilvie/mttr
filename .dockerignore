@@ -1,0 +1,9 @@
+node_modules
+dist
+.git
+.env
+.mttr-state.json
+.pnpm-store
+coverage
+features
+test-results

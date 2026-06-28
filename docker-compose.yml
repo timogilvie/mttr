@@ -1,0 +1,82 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mttr}
+      POSTGRES_USER: ${POSTGRES_USER:-mttr}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mttr}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    build: .
+    command: ["pnpm", "db:migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      STATE_BACKEND: postgres
+      DATABASE_URL: postgres://${POSTGRES_USER:-mttr}:${POSTGRES_PASSWORD:-mttr}@postgres:5432/${POSTGRES_DB:-mttr}
+      DATABASE_SSL: "false"
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?OPENROUTER_API_KEY is required}
+
+  worker:
+    build: .
+    command: ["pnpm", "start:worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    environment:
+      STATE_BACKEND: postgres
+      DATABASE_URL: postgres://${POSTGRES_USER:-mttr}:${POSTGRES_PASSWORD:-mttr}@postgres:5432/${POSTGRES_DB:-mttr}
+      POOLED_DATABASE_URL: postgres://${POSTGRES_USER:-mttr}:${POSTGRES_PASSWORD:-mttr}@postgres:5432/${POSTGRES_DB:-mttr}
+      DATABASE_SSL: "false"
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?OPENROUTER_API_KEY is required}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-openai/gpt-4o-mini}
+      INVESTIGATE_MODEL: ${INVESTIGATE_MODEL:-openai/gpt-5.4}
+      INVESTIGATE_MODEL_FALLBACK: ${INVESTIGATE_MODEL_FALLBACK:-anthropic/claude-3.5-sonnet}
+      HEALTH_REPORT_S3_URI: ${HEALTH_REPORT_S3_URI:-s3://hokusai-health-reports-development/latest/development/report.md}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      MONITOR_INTERVAL_MS: ${MONITOR_INTERVAL_MS:-900000}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      SLACK_ALERT_CHANNEL: ${SLACK_ALERT_CHANNEL:-slack}
+    volumes:
+      - ${AWS_CONFIG_DIR:-$HOME/.aws}:/home/node/.aws:ro
+
+  web:
+    build: .
+    command: ["pnpm", "start:web"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    environment:
+      STATE_BACKEND: postgres
+      DATABASE_URL: postgres://${POSTGRES_USER:-mttr}:${POSTGRES_PASSWORD:-mttr}@postgres:5432/${POSTGRES_DB:-mttr}
+      POOLED_DATABASE_URL: postgres://${POSTGRES_USER:-mttr}:${POSTGRES_PASSWORD:-mttr}@postgres:5432/${POSTGRES_DB:-mttr}
+      DATABASE_SSL: "false"
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?OPENROUTER_API_KEY is required}
+      HEALTH_REPORT_S3_URI: ${HEALTH_REPORT_S3_URI:-s3://hokusai-health-reports-development/latest/development/report.md}
+      MONITOR_INTERVAL_MS: ${MONITOR_INTERVAL_MS:-900000}
+      WEB_HOST: 0.0.0.0
+      WEB_PORT: 3000
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      SLACK_ALERT_CHANNEL: ${SLACK_ALERT_CHANNEL:-slack}
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  postgres-data:

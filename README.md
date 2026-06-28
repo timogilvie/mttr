@@ -38,7 +38,11 @@ Commonly tuned (with defaults):
 - `INVESTIGATE_MODEL_FALLBACK` (`anthropic/claude-3.5-sonnet`): used once per run if the primary model is unavailable or doesn't support tools
 - `HEALTH_REPORT_S3_URI` (`s3://hokusai-health-reports-development/latest/development/report.md`)
 - `AWS_REGION` (`us-east-1`)
-- `MONITOR_INTERVAL_MS` (`300000`)
+- `MONITOR_INTERVAL_MS` (`900000`)
+- `STATE_BACKEND` (`file`): use `postgres` on the continuous-monitoring server
+- `DATABASE_URL`: required when `STATE_BACKEND=postgres`
+- `POOLED_DATABASE_URL`: optional runtime pooler URL; when set, worker/web connections use this
+  instead of `DATABASE_URL`
 
 The Investigate stage's tool loop and rate-limit behaviour are bounded by several budgets
 (`INVESTIGATE_MAX_TOOL_ITERATIONS`, `INVESTIGATE_MAX_TOOL_CALLS`, `INVESTIGATE_LLM_TIMEOUT_MS`,
@@ -48,6 +52,68 @@ draft investigation defers tool-executable root-cause checks while
 controlled by `INVESTIGATE_CLOSURE_ENABLED`, `INVESTIGATE_CLOSURE_MAX_TOOL_ITERATIONS`, and
 `INVESTIGATE_CLOSURE_MAX_TOOL_CALLS`. See
 `.env.example` for all of them.
+
+## Database migrations
+
+File state remains the default for local development. For the server deployment, set
+`STATE_BACKEND=postgres` and `DATABASE_URL` to the direct database URL, then run:
+
+```bash
+pnpm db:migrate
+```
+
+For the long-running worker/web runtime, also set `POOLED_DATABASE_URL` when your provider offers a
+pooler connection string. The migration command uses `DATABASE_URL`; runtime pools prefer
+`POOLED_DATABASE_URL` and fall back to `DATABASE_URL`.
+
+The first migration creates the continuous-monitoring foundation tables:
+`report_states`, `observation_states`, `runs`, `incidents`, `incident_events`, `alerts`, and
+`worker_heartbeats`.
+
+Slack alert delivery is disabled unless `SLACK_WEBHOOK_URL` is set. When enabled, transition
+alerts are sent to that webhook and successful sends are stored in `alerts` using the configured
+`SLACK_ALERT_CHANNEL` for dedupe keys.
+
+Start the API server with:
+
+```bash
+pnpm start:web
+```
+
+It listens on `WEB_HOST` / `WEB_PORT` and exposes read-only JSON endpoints for `/api/status`,
+`/api/runs`, `/api/runs/:id`, `/api/incidents`, `/api/incidents/:id`, `/api/alerts`, and
+`/api/settings`.
+
+## Docker Compose deployment
+
+The first server deployment uses one shared image for `mttr-worker`, `mttr-web`, and migrations.
+Copy `.env.compose.example` to `.env.compose`, fill in secrets, then run:
+
+```bash
+docker compose --env-file .env.compose up -d postgres
+docker compose --env-file .env.compose run --rm migrate
+docker compose --env-file .env.compose up -d web worker
+```
+
+The Compose stack contains:
+
+- `postgres`: local persistent Postgres volume for single-server deployments.
+- `migrate`: one-shot `pnpm db:migrate`.
+- `worker`: long-running 15-minute monitor loop.
+- `web`: Fastify API plus the built Vite dashboard on `WEB_PORT`.
+
+Run the local Compose smoke check with:
+
+```bash
+COMPOSE_ENV_FILE=.env.compose pnpm smoke:compose
+```
+
+The smoke check validates Compose config, builds the shared image, runs migrations, verifies
+`/healthz`, and starts the worker in `MTTR_WORKER_SMOKE=1` mode so it validates config without
+fetching a report or sending alerts.
+
+For the `status.hokus.ai` EC2 deployment with Neon and Caddy-managed HTTPS, use
+[docs/ec2-deploy.md](docs/ec2-deploy.md) and `docker-compose.ec2.yml`.
 
 ## AWS access (read-only)
 
@@ -116,6 +182,8 @@ Minimum read-only IAM policy:
         "events:DescribeRule",
         "events:ListTargetsByRule",
         "cloudtrail:LookupEvents",
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "elasticloadbalancing:DescribeLoadBalancerAttributes",
         "ecs:ListClusters",
         "ecs:ListServices",
         "ecs:DescribeServices",
@@ -129,9 +197,14 @@ Minimum read-only IAM policy:
 }
 ```
 
-No write/mutate actions are required or used. Scope the `Resource` for the CloudWatch
-statements down to specific log groups / namespaces if your environment supports it. If these
-permissions are missing, the Investigate tools return the error as evidence ("missing
+If ALB access-log investigation is enabled for your report bucket, also allow `s3:ListBucket` on
+that bucket and `s3:GetObject` on the relevant access-log prefixes.
+
+No infrastructure write/mutate actions are required or used. The only non-read-style AWS actions
+are CloudWatch Logs Insights query-control actions (`logs:StartQuery` and `logs:StopQuery`), which
+create/stop a diagnostic query but do not mutate monitored services. Scope the `Resource` for the
+CloudWatch statements down to specific log groups / namespaces if your environment supports it. If
+these permissions are missing, the Investigate tools return the error as evidence ("missing
 telemetry") and the stage degrades to a triage / data-request result rather than failing.
 
 ## Architecture
@@ -174,3 +247,203 @@ The orchestrator runs on a loop without blocking on long-running stage execution
 successful Classify with actionable incidents or findings, it chains into Investigate. In-flight
 guards prevent overlapping Classify and Investigate runs; a slow stage delays the next tick
 rather than stacking.
+
+## Continuous Monitoring Architecture
+
+The current codebase is already shaped like the worker process: `src/index.ts` starts one
+long-running `Orchestrator`, and `src/orchestrator.ts` runs the read-only Classify →
+Investigate → Decide → Verify/Mitigate flow on `MONITOR_INTERVAL_MS`. The production default is
+15 minutes (`900000` ms). The existing in-flight guards should remain the first concurrency
+boundary; a slow run should skip the next tick rather than enqueue duplicate work.
+
+### Current state to preserve
+
+- The agent is read-only against AWS. Tools read S3 health reports, CloudWatch logs/metrics/
+  alarms, ECS, Lambda, EventBridge, CloudTrail, ALB access logs, CloudFormation/ECR metadata,
+  and contract state. Keep this boundary until the UI and alert lifecycle are reliable.
+- `.mttr-state.json` currently stores the last processed report hash plus active/resolved
+  observation state. A database-backed version should replace this state store instead of
+  introducing a second incident tracker.
+- `IncidentDecision` and `VerificationResult` are the right downstream contracts for alerting:
+  alert after Decide and update/close after Verify when that stage runs.
+- Mitigate is still a stub. Treat `overall_next_stage=Mitigate` as "ready for mitigation" for
+  alerting and UI purposes, not as permission to mutate infrastructure.
+
+### Target deployment
+
+Run three services on one server first:
+
+- `mttr-worker`: the existing Node/TypeScript process, packaged as a long-running worker.
+- `mttr-web`: a separate API/UI process in the same repo.
+- `postgres`: persistent state for runs, incidents, evidence, decisions, verification, and alerts.
+
+Docker Compose is the right first deployment target. Move to ECS later only when the single-server
+operational model is proven.
+
+### Persistence model
+
+Prefer Postgres for the first server deployment. SQLite is acceptable only for a truly
+single-host prototype, but Postgres maps better to row locks, alert dedupe, future multi-worker
+leases, and a web UI reading while the worker writes.
+
+Initial tables:
+
+- `runs`: `id`, `started_at`, `finished_at`, `status`, `health_report_s3_uri`, `report_hash`,
+  `summary`, `overall_severity`, `raw_classification_json`, `raw_investigation_json`,
+  `raw_decision_json`, `raw_verification_json`, `error_message`.
+- `incidents`: `incident_id`, `title`, `service`, `severity`, `state`, `opened_at`, `closed_at`,
+  `current_disposition`, `current_next_stage`, `current_decision_json`, `last_run_id`.
+- `incident_events`: `id`, `incident_id`, `run_id`, `stage`, `message`, `severity`,
+  `evidence_json`, `created_at`.
+- `alerts`: `id`, `incident_id`, `run_id`, `channel`, `sent_at`, `dedupe_key`, `payload_json`.
+
+Use stable incident keys from the existing reconciliation logic for findings, because findings
+do not have model-provided `incident_id`s. Keep the report hash skip behavior by storing the last
+processed hash per `health_report_s3_uri`.
+
+### Alerting boundary
+
+Keep detection and alert delivery separate. After Decide, compare the persisted previous incident
+state to the new decision and emit an `IncidentStateChanged` domain event. Slack is the first
+channel; email can be added behind the same event later.
+
+Alert on:
+
+- new active incident or actionable finding;
+- severity increase;
+- disposition changes to `MITIGATE` / `overall_next_stage=Mitigate` ("ready for mitigation");
+- verification confirms active impact;
+- recovered, transient, non-incident, or closed state.
+
+Do not alert on:
+
+- same report hash;
+- recurring observation with unchanged signature/severity;
+- same incident state and same decision on a later 15-minute run.
+
+Use `alerts.dedupe_key` in the form
+`channel:incident_id:transition_type:severity:disposition` so repeated runs do not spam Slack.
+The Slack sender records the alert only after Slack returns success; retryable failures such as
+HTTP 429/5xx leave no alert row, so a later run can retry.
+
+### Web UI
+
+Use Fastify API + Vite/React UI for the first version. This repo is currently a TypeScript
+service, not a Next.js app, so Fastify/Vite keeps the worker and web server explicit while still
+sharing types.
+
+The current `/` dashboard is bundled by `pnpm build` into `dist/web` and served by `pnpm start:web`.
+It shows green/yellow/red status, stale worker/report warnings, the last run, open incidents, and
+recent transition events from the persisted state API.
+
+Pages:
+
+- `/`: current status, last run, worker heartbeat, open incidents, and recent transitions.
+- `/incidents/:id`: timeline from `incident_events`, classification, investigation evidence,
+  current decision, verification checks, and alert history.
+- `/runs/:id`: raw stage outputs, report hash, timestamps, errors, and compact tool trace/evidence.
+- `/settings`: alert channel config, monitored health report URI, thresholds, and read-only AWS
+  account/region display.
+
+### Queue decision
+
+Do not add BullMQ or SQS yet. For one environment and one 15-minute worker, Postgres row locks plus
+the existing in-flight guards are enough. Add a queue only when monitoring multiple environments,
+running per-incident work in parallel, or needing retryable alert delivery independent of worker
+runs.
+
+## Operations runbook
+
+### Required server environment
+
+Set these values in `.env.compose` for the Docker Compose deployment:
+
+- `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`: local Postgres credentials.
+- `OPENROUTER_API_KEY`: required by worker, web config loading, and migrations.
+- `HEALTH_REPORT_S3_URI`: report object watched by the worker.
+- `AWS_REGION`: region for AWS reads.
+- `MONITOR_INTERVAL_MS`: defaults to `900000`; keep this at 15 minutes for v1.
+- `WEB_PORT`: host port for the dashboard/API.
+- `SLACK_WEBHOOK_URL`: optional; when empty, alerts are skipped but transition events still persist.
+- `SLACK_ALERT_CHANNEL`: logical channel name used in alert dedupe keys.
+- `AWS_CONFIG_DIR`: host AWS config path mounted read-only into the worker container.
+
+For Neon or another managed Postgres instead of the Compose `postgres` service, run migrations with
+the direct `DATABASE_URL`, set `STATE_BACKEND=postgres`, and use the provider pooler as
+`POOLED_DATABASE_URL` for worker/web runtime connections. Keep `DATABASE_SSL=true` when the
+provider requires TLS.
+
+### Slack setup
+
+Create a Slack incoming webhook for the target channel and set `SLACK_WEBHOOK_URL`. Alerts are sent
+only for alertable transition events: new incident, severity increase, ready for mitigation,
+verified active, recovered, and closed. Sent alerts are persisted in `alerts` with dedupe keys in
+the form `channel:incident_id:transition_type:severity:disposition`, so a 15-minute recurring run
+does not spam the same alert.
+
+If Slack returns HTTP 429 or 5xx, the send is treated as retryable and no alert row is written. A
+later run can retry because the dedupe key remains unsent.
+
+### Backup and restore
+
+For local Compose Postgres, back up before upgrades:
+
+```bash
+docker compose --env-file .env.compose exec -T postgres \
+  sh -c 'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB"' > mttr-backup.sql
+```
+
+Restore into an empty database:
+
+```bash
+docker compose --env-file .env.compose exec -T postgres \
+  sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < mttr-backup.sql
+```
+
+For Neon, use Neon point-in-time restore or branch-based recovery for production data. Use
+`pnpm db:migrate` against the restored direct database URL before starting worker/web.
+
+### Troubleshooting
+
+- **Dashboard shows stale worker**: check `docker compose ps worker`, worker logs, and the
+  `worker_heartbeats` table. The worker updates heartbeat when a run starts.
+- **Dashboard shows stale report**: confirm the worker can read `HEALTH_REPORT_S3_URI` and that
+  `runs.started_at` is updating. Same report hashes still produce skipped runs.
+- **Failed run**: open `/runs/:id` and inspect `errorMessage` plus raw stage output. Common causes
+  are missing S3/IAM access, OpenRouter/API errors, or invalid DB connectivity.
+- **No Slack alert**: verify `SLACK_WEBHOOK_URL`, inspect `incident_events` for alertable
+  `transition_type`, and check `alerts` for an existing dedupe key.
+- **Repeated alert concern**: alerts dedupe on `alerts.dedupe_key`. Identical recurring decisions
+  produce non-alertable `unchanged` transition events.
+- **Migration failure**: use the direct database URL, not the pooler URL, and confirm
+  `OPENROUTER_API_KEY` is present because config loading validates required env vars.
+
+### First deployment checklist
+
+1. Create `.env.compose` from `.env.compose.example`.
+2. Confirm read-only AWS credentials are available on the server and mounted via `AWS_CONFIG_DIR`.
+3. Set `OPENROUTER_API_KEY`, `HEALTH_REPORT_S3_URI`, and optional Slack settings.
+4. Run `COMPOSE_ENV_FILE=.env.compose pnpm smoke:compose`.
+5. Start the stack with `docker compose --env-file .env.compose up -d web worker`.
+6. Open `/` and confirm worker/report stale state clears after the first run starts.
+7. Confirm `/api/status`, `/api/runs`, and `/api/incidents` return JSON.
+8. Watch the first worker run logs and verify a row appears in `runs`.
+
+Use [docs/release-checklist.md](docs/release-checklist.md) for the full MVP release checklist,
+including scenario checks for healthy, new incident, unchanged recurrence, escalation, mitigation,
+recovery, failed run, alert dedupe, and the read-only AWS boundary.
+
+### Rollback checklist
+
+1. Stop worker first: `docker compose --env-file .env.compose stop worker`.
+2. Keep web running if you need to inspect the last known state.
+3. Restore the previous image or git revision and rebuild with `docker compose build`.
+4. If a migration changed schema, restore from the latest Postgres/Neon backup before restarting.
+5. Start `web`, verify `/healthz`, then start `worker`.
+
+### Queue policy
+
+Do not add BullMQ, Redis, or SQS for v1. The single worker, 15-minute cadence, persisted run state,
+alert dedupe keys, and in-flight guards are enough for one environment. Add a queue only when you
+need multiple monitored environments, parallel per-incident workers, or independently retryable
+alert delivery outside the monitor run lifecycle.

@@ -122,7 +122,18 @@ const mockConfig: Config = {
   healthReport: { s3Uri: 's3://test/report.md' },
   aws: { region: 'us-east-1', maxAttempts: 5 },
   monitoring: { intervalMs: 5000 },
-  state: { path: '.test-mttr-state.json' },
+  state: { backend: 'file', path: '.test-mttr-state.json' },
+  database: {
+    ssl: false,
+    maxConnections: 4,
+    idleTimeoutMs: 30000,
+  },
+  alerts: {
+    slack: {
+      channel: 'slack',
+      timeoutMs: 10000,
+    },
+  },
   timeouts: { llmMs: 5000, s3Ms: 5000 },
 };
 

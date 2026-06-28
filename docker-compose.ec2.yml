@@ -1,0 +1,83 @@
+services:
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      STATUS_DOMAIN: ${STATUS_DOMAIN:-status.hokus.ai}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL is required}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+  migrate:
+    build: .
+    command: ["pnpm", "db:migrate"]
+    environment:
+      STATE_BACKEND: postgres
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      DATABASE_SSL: ${DATABASE_SSL:-true}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?OPENROUTER_API_KEY is required}
+
+  worker:
+    build: .
+    command: ["pnpm", "start:worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    environment:
+      STATE_BACKEND: postgres
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      POOLED_DATABASE_URL: ${POOLED_DATABASE_URL:-${DATABASE_URL}}
+      DATABASE_SSL: ${DATABASE_SSL:-true}
+      DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-2}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?OPENROUTER_API_KEY is required}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-openai/gpt-4o-mini}
+      INVESTIGATE_MODEL: ${INVESTIGATE_MODEL:-openai/gpt-5.4}
+      INVESTIGATE_MODEL_FALLBACK: ${INVESTIGATE_MODEL_FALLBACK:-anthropic/claude-3.5-sonnet}
+      HEALTH_REPORT_S3_URI: ${HEALTH_REPORT_S3_URI:?HEALTH_REPORT_S3_URI is required}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      MONITOR_INTERVAL_MS: ${MONITOR_INTERVAL_MS:-900000}
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      SLACK_ALERT_CHANNEL: ${SLACK_ALERT_CHANNEL:-slack}
+    volumes:
+      - ${AWS_CONFIG_DIR:-$HOME/.aws}:/home/node/.aws:ro
+
+  web:
+    build: .
+    command: ["pnpm", "start:web"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    expose:
+      - "3000"
+    environment:
+      STATE_BACKEND: postgres
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      POOLED_DATABASE_URL: ${POOLED_DATABASE_URL:-${DATABASE_URL}}
+      DATABASE_SSL: ${DATABASE_SSL:-true}
+      DATABASE_MAX_CONNECTIONS: ${DATABASE_MAX_CONNECTIONS:-2}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?OPENROUTER_API_KEY is required}
+      HEALTH_REPORT_S3_URI: ${HEALTH_REPORT_S3_URI:?HEALTH_REPORT_S3_URI is required}
+      MONITOR_INTERVAL_MS: ${MONITOR_INTERVAL_MS:-900000}
+      WEB_HOST: 0.0.0.0
+      WEB_PORT: 3000
+      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+      SLACK_ALERT_CHANNEL: ${SLACK_ALERT_CHANNEL:-slack}
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  caddy-data:
+  caddy-config:

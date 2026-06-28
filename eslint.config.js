@@ -2,7 +2,7 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: ['dist', 'node_modules', 'eslint.config.js', 'vitest.config.ts'],
+    ignores: ['dist', 'node_modules', 'eslint.config.js', 'vitest.config.ts', 'vite.config.ts'],
   },
   ...tseslint.configs.recommended,
   {
