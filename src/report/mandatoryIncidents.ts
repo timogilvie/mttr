@@ -132,7 +132,45 @@ function isTaskHealthAlarm(alarmName: string): boolean {
   );
 }
 
+function normalizeSignal(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function hasExactSignalMatch(values: string[], signals: string[] | undefined): boolean {
+  if (!signals || signals.length === 0) {
+    return false;
+  }
+
+  const normalizedValues = values.map(normalizeSignal);
+  return signals
+    .map(normalizeSignal)
+    .some((signal) =>
+      normalizedValues.some((value) => value === signal || value.includes(signal))
+    );
+}
+
+function incidentServiceMatchesSpec(incident: Incident, spec: MandatoryIncidentSpec): boolean {
+  const services = [spec.affectedService, ...(spec.serviceAliases ?? [])].map((service) =>
+    service.toLowerCase()
+  );
+  return incident.affected_services.some((service) => services.includes(service.toLowerCase()));
+}
+
 function incidentCoversSpec(incident: Incident, spec: MandatoryIncidentSpec): boolean {
+  if (!incidentServiceMatchesSpec(incident, spec)) {
+    return false;
+  }
+
+  if (
+    hasExactSignalMatch(incident.signals.alarms, spec.alarms) ||
+    hasExactSignalMatch(incident.signals.metrics, spec.metrics) ||
+    hasExactSignalMatch(incident.evidence, spec.alarms) ||
+    hasExactSignalMatch(incident.evidence, spec.metrics) ||
+    hasExactSignalMatch(incident.evidence, spec.evidence)
+  ) {
+    return true;
+  }
+
   const haystack = [
     incident.title,
     incident.classification,
@@ -145,15 +183,11 @@ function incidentCoversSpec(incident: Incident, spec: MandatoryIncidentSpec): bo
     .join(' ')
     .toLowerCase();
 
-  const services = [spec.affectedService, ...(spec.serviceAliases ?? [])].map((service) => service.toLowerCase());
   const signal = [...(spec.alarms ?? []), ...(spec.metrics ?? []), ...spec.evidence]
     .join(' ')
     .toLowerCase();
 
-  return (
-    services.some((service) => haystack.includes(service)) &&
-    signal.split(/\s+/).some((token) => token.length > 8 && haystack.includes(token))
-  );
+  return signal.split(/\s+/).some((token) => token.length > 8 && haystack.includes(token));
 }
 
 function findingCoversSpec(findingText: string, spec: MandatoryIncidentSpec): boolean {
@@ -417,11 +451,32 @@ function maxSeverity(a: Severity, b: Severity): Severity {
   return order.indexOf(a) >= order.indexOf(b) ? a : b;
 }
 
+function specDedupeKey(spec: MandatoryIncidentSpec): string {
+  return [
+    normalizeSignal(spec.affectedService),
+    spec.classification,
+    ...(spec.alarms ?? []).map(normalizeSignal).sort(),
+    ...(spec.metrics ?? []).map(normalizeSignal).sort(),
+  ].join('|');
+}
+
+function dedupeMandatorySpecs(specs: MandatoryIncidentSpec[]): MandatoryIncidentSpec[] {
+  const byKey = new Map<string, MandatoryIncidentSpec>();
+  for (const spec of specs) {
+    const key = specDedupeKey(spec);
+    const existing = byKey.get(key);
+    if (!existing || maxSeverity(spec.severity, existing.severity) === spec.severity) {
+      byKey.set(key, spec);
+    }
+  }
+  return [...byKey.values()];
+}
+
 export function enforceMandatoryIncidents(
   classification: ClassificationResult,
   report: string
 ): ClassificationResult {
-  const specs = mandatoryIncidentSpecs(report);
+  const specs = dedupeMandatorySpecs(mandatoryIncidentSpecs(report));
   let didEnrichIncident = false;
   const enrichedIncidents = classification.incidents.map((incident) => {
     const coveringSpec = specs.find((spec) => incidentCoversSpec(incident, spec));

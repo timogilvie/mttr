@@ -50,7 +50,13 @@ export function Dashboard({ status }: { status: StatusResponse }): ReactElement 
       <section className="metrics-grid" aria-label="monitor summary">
         <div className="metric">
           <span>Last run</span>
-          <strong>{status.lastRun ? lastRunAge : 'none'}</strong>
+          <strong>
+            {status.lastRun ? (
+              <a href={`/runs/${encodeURIComponent(status.lastRun.id)}`}>{lastRunAge}</a>
+            ) : (
+              'none'
+            )}
+          </strong>
           <small>{status.lastRun?.status ?? 'no run recorded'}</small>
         </div>
         <div className={`metric ${status.stale.worker ? 'metric-stale' : ''}`}>
@@ -86,7 +92,11 @@ export function Dashboard({ status }: { status: StatusResponse }): ReactElement 
               {status.openIncidents.map((incident) => (
                 <li key={incident.incidentId}>
                   <div>
-                    <strong>{incident.title}</strong>
+                    <strong>
+                      <a href={`/incidents/${encodeURIComponent(incident.incidentId)}`}>
+                        {incident.title}
+                      </a>
+                    </strong>
                     <small>
                       {display(incident.service)} · {incident.state} ·{' '}
                       {display(incident.currentNextStage)}
@@ -113,7 +123,11 @@ export function Dashboard({ status }: { status: StatusResponse }): ReactElement 
                   <div>
                     <strong>{event.message}</strong>
                     <small>
-                      {event.stage} · {event.incidentId} · {formatAge(event.createdAt)}
+                      {event.stage} ·{' '}
+                      <a href={`/incidents/${encodeURIComponent(event.incidentId)}`}>
+                        {event.incidentId}
+                      </a>{' '}
+                      · {formatAge(event.createdAt)}
                     </small>
                   </div>
                   <span className={severityClass(event.severity)}>{event.severity ?? 'NONE'}</span>
@@ -131,7 +145,15 @@ export function Dashboard({ status }: { status: StatusResponse }): ReactElement 
         </div>
         <div>
           <span>Hash</span>
-          <strong>{status.lastRun?.reportHash ?? 'none'}</strong>
+          <strong>
+            {status.lastRun ? (
+              <a href={`/runs/${encodeURIComponent(status.lastRun.id)}`}>
+                {status.lastRun.reportHash ?? status.lastRun.id}
+              </a>
+            ) : (
+              'none'
+            )}
+          </strong>
         </div>
         <div>
           <span>Summary</span>

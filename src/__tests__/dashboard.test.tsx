@@ -95,6 +95,8 @@ describe('dashboard', () => {
     expect(html).toContain('High 4xx');
     expect(html).toContain('Ready for mitigation');
     expect(html).toContain('data-pipeline-api');
+    expect(html).toContain('href="/incidents/INC-001"');
+    expect(html).toContain('href="/runs/run-1"');
   });
 
   it('prioritizes stale state over green/yellow/red status', () => {

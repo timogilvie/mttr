@@ -78,7 +78,7 @@ function normalizeServices(services: string[]): string[] {
   return [...services].map(normalizeText).sort();
 }
 
-function observationKey(type: ObservationType, item: Incident | Finding): string {
+export function canonicalObservationKey(type: ObservationType, item: Incident | Finding): string {
   return stableHash({
     type,
     title: normalizeText(item.title),
@@ -111,7 +111,7 @@ function observationSignature(type: ObservationType, item: Incident | Finding): 
 
 function toCurrentObservation(type: ObservationType, item: Incident | Finding): CurrentObservation {
   return {
-    key: observationKey(type, item),
+    key: canonicalObservationKey(type, item),
     type,
     title: item.title,
     classification: item.classification,

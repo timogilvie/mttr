@@ -161,7 +161,15 @@ export function IncidentDetail({ data }: { data: IncidentDetailResponse }): Reac
         </div>
         <div className="metric">
           <span>Source run</span>
-          <strong>{display(incident.lastRunId)}</strong>
+          <strong>
+            {incident.lastRunId ? (
+              <a href={`/runs/${encodeURIComponent(incident.lastRunId)}`}>
+                {incident.lastRunId}
+              </a>
+            ) : (
+              display(incident.lastRunId)
+            )}
+          </strong>
           <small>closed {formatAge(incident.closedAt)}</small>
         </div>
       </section>

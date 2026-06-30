@@ -95,6 +95,7 @@ describe('incident detail', () => {
     expect(html).toContain('duplicate_of: INC-000');
     expect(html).toContain('find_alarms api');
     expect(html).toContain('slack:finding-abc123');
+    expect(html).toContain('href="/runs/run-1"');
   });
 
   it('renders a recovered timeline', () => {

@@ -55,6 +55,20 @@ const config: Config = {
   timeouts: { llmMs: 5000, s3Ms: 5000 },
 };
 
+interface FakeIncidentRow {
+  incident_id: string;
+  title: string;
+  service: string | null;
+  severity: string;
+  state: string;
+  opened_at: string;
+  closed_at: string | null;
+  current_disposition: string | null;
+  current_next_stage: string | null;
+  current_decision_json: Record<string, unknown> | null;
+  last_run_id: string | null;
+}
+
 class FakeApiDatabase implements DatabaseClient {
   queries: string[] = [];
   runs = [
@@ -74,7 +88,7 @@ class FakeApiDatabase implements DatabaseClient {
       error_message: null,
     },
   ];
-  incidents = [
+  incidents: FakeIncidentRow[] = [
     {
       incident_id: 'INC-001',
       title: 'High 4xx',
@@ -211,6 +225,52 @@ describe('web API', () => {
         {
           stage: 'Decide',
           evidence: { transition_type: 'ready_for_mitigation' },
+        },
+      ],
+    });
+  });
+
+  it('dedupes legacy open incident rows in status responses', async () => {
+    const db = new FakeApiDatabase();
+    db.incidents = [
+      {
+        incident_id: 'hash-observation-id',
+        title: 'High 4xx',
+        service: 'data-pipeline-api',
+        severity: 'HIGH',
+        state: 'open',
+        opened_at: '2026-06-08T10:00:00Z',
+        closed_at: null,
+        current_disposition: null,
+        current_next_stage: null,
+        current_decision_json: null,
+        last_run_id: 'run-1',
+      },
+      {
+        incident_id: 'INC-001',
+        title: 'High 4xx',
+        service: 'data-pipeline-api',
+        severity: 'HIGH',
+        state: 'decision',
+        opened_at: '2026-06-08T10:01:00Z',
+        closed_at: null,
+        current_disposition: 'MITIGATE',
+        current_next_stage: 'Mitigate',
+        current_decision_json: { disposition: 'MITIGATE' },
+        last_run_id: 'run-1',
+      },
+    ];
+    const { app } = appFor(db);
+
+    const response = await app.inject({ method: 'GET', url: '/api/status' });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      openIncidentCounts: { HIGH: 1 },
+      openIncidents: [
+        {
+          incidentId: 'INC-001',
+          currentDisposition: 'MITIGATE',
         },
       ],
     });
