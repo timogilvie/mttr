@@ -3,6 +3,7 @@ import { rmSync } from 'node:fs';
 import { Orchestrator } from '../orchestrator.js';
 import type { Config } from '../config.js';
 import type { StageResult, ClassificationResult } from '../types.js';
+import { canonicalObservationKey } from '../state/agentState.js';
 
 vi.mock('../stages/classify.js');
 vi.mock('../stages/investigate.js');
@@ -259,6 +260,61 @@ describe('Orchestrator', () => {
     expect(call[0]).toEqual(expect.objectContaining({ stage: 'Investigate' }));
     expect(call[1]).toEqual(config);
     expect((call[2] as ClassificationResult).findings).toHaveLength(1);
+
+    orchestrator.stop();
+  });
+
+  it('passes canonical incident ids to downstream stages', async () => {
+    const classifyStage = await import('../stages/classify.js');
+    const investigateStage = await import('../stages/investigate.js');
+    await mockReport();
+
+    const incident = {
+      incident_id: 'INC-001',
+      title: 'High 5xx',
+      classification: 'APPLICATION_ERROR' as const,
+      severity: 'HIGH' as const,
+      confidence: 0.95,
+      affected_services: ['api'],
+      evidence: ['ALB 5xx spike'],
+      signals: {
+        alarms: ['api-5xx'],
+        metrics: ['HTTPCode_Target_5XX_Count'],
+        logs: [],
+      },
+      suspected_causes: ['Application errors'],
+      investigation_plan: {
+        priority: 1,
+        estimated_user_impact: 'PARTIAL' as const,
+        first_actions: ['Check logs'],
+        questions_to_answer: ['Which endpoint failed?'],
+        suggested_cloudwatch_queries: ['5xx query'],
+      },
+      recommended_next_stage: 'INVESTIGATE',
+    };
+    const expectedId = canonicalObservationKey('incident', incident);
+
+    vi.mocked(classifyStage.runWithReport).mockResolvedValue({
+      stage: 'Classify',
+      status: 'success',
+      timestamp: 't',
+      data: {
+        summary: 'Incident to investigate.',
+        overall_severity: 'HIGH',
+        incidents: [incident],
+        findings: [],
+      },
+    });
+    vi.mocked(investigateStage.run).mockResolvedValue(investigateResult);
+
+    const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+    const orchestrator = new Orchestrator(config);
+    orchestrator.start();
+
+    await vi.waitFor(() => expect(investigateStage.run).toHaveBeenCalledTimes(1));
+
+    const call = vi.mocked(investigateStage.run).mock.calls[0]!;
+    expect((call[2] as ClassificationResult).incidents[0]?.incident_id).toBe(expectedId);
 
     orchestrator.stop();
   });

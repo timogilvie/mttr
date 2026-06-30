@@ -117,6 +117,43 @@ function incidentDto(row: IncidentRow): JsonRecord {
   };
 }
 
+function incidentDedupeKey(row: IncidentRow): string {
+  return [
+    row.title.trim().toLowerCase().replace(/\s+/g, ' '),
+    row.service?.trim().toLowerCase() ?? '',
+    row.severity,
+  ].join('|');
+}
+
+function incidentPreference(row: IncidentRow): number {
+  return [
+    row.current_disposition ? 8 : 0,
+    row.current_next_stage ? 4 : 0,
+    row.current_decision_json ? 2 : 0,
+    row.last_run_id ? 1 : 0,
+  ].reduce((sum, value) => sum + value, 0);
+}
+
+function dedupeIncidents(rows: IncidentRow[]): IncidentRow[] {
+  const byKey = new Map<string, IncidentRow>();
+  for (const row of rows) {
+    const key = incidentDedupeKey(row);
+    const existing = byKey.get(key);
+    if (!existing || incidentPreference(row) > incidentPreference(existing)) {
+      byKey.set(key, row);
+    }
+  }
+  return [...byKey.values()];
+}
+
+function incidentCounts(rows: IncidentRow[]): Partial<Record<Severity, number>> {
+  const counts: Partial<Record<Severity, number>> = {};
+  for (const row of rows) {
+    counts[row.severity] = (counts[row.severity] ?? 0) + 1;
+  }
+  return counts;
+}
+
 function eventDto(row: IncidentEventRow): JsonRecord {
   return {
     id: row.id,
@@ -200,7 +237,7 @@ export function createWebServer(
 
   app.get('/api/status', async () => {
     const staleAfterMs = config.monitoring.intervalMs * 2;
-    const [runResult, incidentResult, countResult, heartbeatResult, transitionResult] =
+    const [runResult, incidentResult, heartbeatResult, transitionResult] =
       await Promise.all([
       db.query<RunRow>(
         `SELECT id, started_at, finished_at, status, health_report_s3_uri, report_hash,
@@ -217,12 +254,6 @@ export function createWebServer(
          ORDER BY opened_at DESC
          LIMIT 20`
       ),
-      db.query<{ severity: Severity; count: string }>(
-        `SELECT severity, count(*)::text AS count
-         FROM incidents
-         WHERE state NOT IN ('resolved', 'closed')
-         GROUP BY severity`
-      ),
       db.query<WorkerHeartbeatRow>(
         `SELECT worker_id, process_name, last_seen_at, metadata_json
          FROM worker_heartbeats
@@ -238,10 +269,11 @@ export function createWebServer(
       ),
     ]);
 
-    const openIncidents = incidentResult.rows.map(incidentDto);
+    const dedupedIncidentRows = dedupeIncidents(incidentResult.rows);
+    const openIncidents = dedupedIncidentRows.map(incidentDto);
     const lastRun = runResult.rows[0] ?? null;
     const workerHeartbeat = heartbeatResult.rows[0] ?? null;
-    const highestSeverity = incidentResult.rows.reduce<Severity | null>((highest, row) => {
+    const highestSeverity = dedupedIncidentRows.reduce<Severity | null>((highest, row) => {
       const order: Severity[] = ['NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];
       return !highest || order.indexOf(row.severity) > order.indexOf(highest)
         ? row.severity
@@ -256,9 +288,7 @@ export function createWebServer(
         worker: isOlderThan(workerHeartbeat?.last_seen_at ?? null, staleAfterMs),
         report: isOlderThan(lastRun?.started_at ?? null, staleAfterMs),
       },
-      openIncidentCounts: Object.fromEntries(
-        countResult.rows.map((row) => [row.severity, Number(row.count)])
-      ),
+      openIncidentCounts: incidentCounts(dedupedIncidentRows),
       openIncidents,
       recentTransitions: transitionResult.rows.map(eventDto),
     };
@@ -305,7 +335,7 @@ export function createWebServer(
     }
     return {
       run: runDetailDto(row),
-      incidents: incidentResult.rows.map(incidentDto),
+      incidents: dedupeIncidents(incidentResult.rows).map(incidentDto),
     };
   });
 
@@ -316,7 +346,7 @@ export function createWebServer(
        FROM incidents
        ORDER BY opened_at DESC`
     );
-    return { incidents: result.rows.map(incidentDto) };
+    return { incidents: dedupeIncidents(result.rows).map(incidentDto) };
   });
 
   app.get('/api/incidents/:id', async (request, reply) => {

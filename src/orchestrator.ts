@@ -14,6 +14,7 @@ import { mitigateStage } from './stages/stubs.js';
 import { sendSlackAlerts } from './alerts/slack.js';
 import { fetchReport } from './report/fetchReport.js';
 import {
+  canonicalObservationKey,
   hashReportContent,
   hasProcessedReport,
   reconcileObservations,
@@ -26,6 +27,47 @@ import {
   type AgentStateRepository,
 } from './state/repository.js';
 import type { IncidentTransition } from './state/transitions.js';
+
+function remapIncidentReference(value: string | null | undefined, idMap: Map<string, string>): string | null | undefined {
+  if (!value) {
+    return value;
+  }
+  return idMap.get(value) ?? value;
+}
+
+function canonicalizeClassificationIncidents(classification: ClassificationResult): ClassificationResult {
+  const idMap = new Map(
+    classification.incidents.map((incident) => [
+      incident.incident_id,
+      canonicalObservationKey('incident', incident),
+    ])
+  );
+
+  return {
+    ...classification,
+    incidents: classification.incidents.map((incident) => {
+      const canonicalId = idMap.get(incident.incident_id) ?? incident.incident_id;
+      const semantics = incident.semantics
+        ? {
+            ...incident.semantics,
+            duplicate_of: remapIncidentReference(incident.semantics.duplicate_of, idMap),
+            root_incident_id: remapIncidentReference(incident.semantics.root_incident_id, idMap),
+            upstream_incident_ids: incident.semantics.upstream_incident_ids.map(
+              (id) => idMap.get(id) ?? id
+            ),
+            downstream_incident_ids: incident.semantics.downstream_incident_ids.map(
+              (id) => idMap.get(id) ?? id
+            ),
+          }
+        : undefined;
+      return {
+        ...incident,
+        incident_id: canonicalId,
+        ...(semantics ? { semantics } : {}),
+      };
+    }),
+  };
+}
 
 export class Orchestrator {
   private intervalId: NodeJS.Timeout | null = null;
@@ -264,7 +306,9 @@ export class Orchestrator {
         console.log('[Orchestrator] Classify stage completed successfully');
         console.log(JSON.stringify(result.data, null, 2));
 
-        const classification = result.data as ClassificationResult;
+        const classification = canonicalizeClassificationIncidents(
+          result.data as ClassificationResult
+        );
         const now = new Date().toISOString();
         recordProcessedReport(state, this.config.healthReport.s3Uri, reportFingerprint, now);
         const reconciliation = reconcileObservations(state, classification, now);

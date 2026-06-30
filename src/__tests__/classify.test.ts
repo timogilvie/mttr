@@ -324,4 +324,61 @@ _ALB dims: TargetGroup=\`targetgroup/hokusai-reg-api-development/abc123\` LoadBa
       ])
     );
   });
+
+  it('does not append a mandatory duplicate when the LLM already covered the signal', async () => {
+    const { callOpenRouter } = await import('../llm/openrouter.js');
+
+    vi.mocked(callOpenRouter).mockResolvedValue(
+      JSON.stringify({
+        summary: 'ALB 5xx detected.',
+        overall_severity: 'HIGH',
+        incidents: [
+          {
+            incident_id: 'INC-001',
+            title: 'API 5xx spike',
+            classification: 'APPLICATION_ERROR',
+            severity: 'HIGH',
+            confidence: 0.9,
+            affected_services: ['data-pipeline-api'],
+            evidence: ['Health report shows 23 ALB 5xx responses for hokusai-reg-api-development.'],
+            signals: {
+              alarms: [],
+              metrics: ['ALB 5xx responses: 23'],
+              logs: [],
+            },
+            suspected_causes: ['Application errors behind the load balancer.'],
+            investigation_plan: {
+              priority: 1,
+              estimated_user_impact: 'PARTIAL',
+              first_actions: ['Inspect logs.'],
+              questions_to_answer: ['Which endpoint returned 5xx?'],
+              suggested_cloudwatch_queries: ['5xx query'],
+            },
+            recommended_next_stage: 'INVESTIGATE',
+          },
+        ],
+        findings: [],
+      })
+    );
+
+    const result = await classifyStage.runWithReport(
+      mockInput,
+      mockConfig,
+      `# Hokusai Service Health Report
+
+## Service Details
+
+### data-pipeline-api
+
+| ALB target | Requests | 2xx | 4xx | 5xx | Avg latency |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| \`hokusai-reg-api-development\` | 56 | 5 | 28 | 23 | 0.244s |
+`
+    );
+
+    expect(result.status).toBe('success');
+    const data = result.data as { incidents: Array<{ title: string }> };
+    expect(data.incidents).toHaveLength(1);
+    expect(data.incidents[0]?.title).toBe('API 5xx spike');
+  });
 });
