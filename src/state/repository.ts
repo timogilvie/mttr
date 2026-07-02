@@ -26,6 +26,29 @@ import {
 } from './transitions.js';
 
 type RunStatus = 'running' | 'success' | 'skipped' | 'error';
+export type TriggerSource = 'scheduled' | 'alarm';
+
+export interface AlarmTriggerRow {
+  id: string;
+  sns_message_id: string;
+  alarm_arn: string;
+  alarm_name: string;
+  new_state: 'ALARM' | 'OK' | 'INSUFFICIENT_DATA';
+  state_change_time: Date | string;
+  severity: string | null;
+  spec_key: string | null;
+  payload: unknown;
+  status: 'pending' | 'claimed' | 'done' | 'deferred' | 'error';
+  received_at: Date | string;
+  claimed_at: Date | string | null;
+  processed_at: Date | string | null;
+  run_id: string | null;
+}
+
+export interface ProcessedSnsMessageRow {
+  sns_message_id: string;
+  received_at: Date | string;
+}
 
 export interface RunRecordUpdate {
   status: Exclude<RunStatus, 'running'>;
@@ -181,6 +204,7 @@ interface ObservationStateRow {
 
 interface RunRow {
   id: string;
+  trigger_source?: TriggerSource;
 }
 
 interface IncidentSnapshotRow {
