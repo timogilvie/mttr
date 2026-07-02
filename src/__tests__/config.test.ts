@@ -230,4 +230,103 @@ describe('config', () => {
 
     expect(() => loadConfig()).toThrow('LLM_TIMEOUT_MS');
   });
+
+  describe('alarm', () => {
+    beforeEach(() => {
+      process.env['OPENROUTER_API_KEY'] = 'test-key';
+      for (const key of [
+        'ALARM_WEBHOOK_ENABLED',
+        'ALARM_WEBHOOK_PATH_TOKEN',
+        'ALARM_WEBHOOK_VERIFY_SIGNATURE',
+        'ALARM_WEBHOOK_AUTOCONFIRM',
+        'ALARM_TRIGGER_MIN_SEVERITY',
+        'ALARM_TRIGGER_COOLDOWN_MS',
+        'ALARM_TRIGGER_POLL_MS',
+        'ALARM_TRIGGER_COALESCE_MS',
+      ]) {
+        delete process.env[key];
+      }
+    });
+
+    it('applies ship-dark defaults when unset', () => {
+      const config = loadConfig();
+
+      expect(config.alarm.webhook.enabled).toBe(false);
+      expect(config.alarm.webhook.pathToken).toBeUndefined();
+      expect(config.alarm.webhook.verifySignature).toBe(true);
+      expect(config.alarm.webhook.autoconfirm).toBe(true);
+      expect(config.alarm.trigger.minSeverity).toBe('CRITICAL');
+      expect(config.alarm.trigger.cooldownMs).toBe(600000);
+      expect(config.alarm.trigger.pollMs).toBe(5000);
+      expect(config.alarm.trigger.coalesceMs).toBe(2000);
+    });
+
+    it('reads explicit overrides for all alarm vars', () => {
+      process.env['ALARM_WEBHOOK_ENABLED'] = 'true';
+      process.env['ALARM_WEBHOOK_PATH_TOKEN'] = 'super-secret-token';
+      process.env['ALARM_WEBHOOK_VERIFY_SIGNATURE'] = 'false';
+      process.env['ALARM_WEBHOOK_AUTOCONFIRM'] = 'false';
+      process.env['ALARM_TRIGGER_MIN_SEVERITY'] = 'HIGH';
+      process.env['ALARM_TRIGGER_COOLDOWN_MS'] = '120000';
+      process.env['ALARM_TRIGGER_POLL_MS'] = '1000';
+      process.env['ALARM_TRIGGER_COALESCE_MS'] = '500';
+
+      const config = loadConfig();
+
+      expect(config.alarm.webhook.enabled).toBe(true);
+      expect(config.alarm.webhook.pathToken).toBe('super-secret-token');
+      expect(config.alarm.webhook.verifySignature).toBe(false);
+      expect(config.alarm.webhook.autoconfirm).toBe(false);
+      expect(config.alarm.trigger.minSeverity).toBe('HIGH');
+      expect(config.alarm.trigger.cooldownMs).toBe(120000);
+      expect(config.alarm.trigger.pollMs).toBe(1000);
+      expect(config.alarm.trigger.coalesceMs).toBe(500);
+    });
+
+    it('normalizes severity case-insensitively', () => {
+      process.env['ALARM_TRIGGER_MIN_SEVERITY'] = 'medium';
+
+      const config = loadConfig();
+
+      expect(config.alarm.trigger.minSeverity).toBe('MEDIUM');
+    });
+
+    it('rejects an invalid severity, naming the var and accepted values', () => {
+      process.env['ALARM_TRIGGER_MIN_SEVERITY'] = 'banana';
+
+      expect(() => loadConfig()).toThrow(/ALARM_TRIGGER_MIN_SEVERITY/);
+      expect(() => loadConfig()).toThrow(/NONE, LOW, MEDIUM, HIGH, CRITICAL/);
+    });
+
+    it('rejects an invalid ALARM_WEBHOOK_ENABLED boolean', () => {
+      process.env['ALARM_WEBHOOK_ENABLED'] = 'maybe';
+
+      expect(() => loadConfig()).toThrow('ALARM_WEBHOOK_ENABLED');
+    });
+
+    it('rejects a non-numeric ALARM_TRIGGER_POLL_MS', () => {
+      process.env['ALARM_TRIGGER_POLL_MS'] = 'soon';
+
+      expect(() => loadConfig()).toThrow('ALARM_TRIGGER_POLL_MS');
+    });
+
+    it('loads without a path token when the webhook is disabled (ships dark)', () => {
+      delete process.env['ALARM_WEBHOOK_ENABLED'];
+      delete process.env['ALARM_WEBHOOK_PATH_TOKEN'];
+
+      const config = loadConfig();
+
+      expect(config.alarm.webhook.enabled).toBe(false);
+      expect(config.alarm.webhook.pathToken).toBeUndefined();
+    });
+
+    it('requires a path token when the webhook is enabled, without leaking any token value', () => {
+      process.env['ALARM_WEBHOOK_ENABLED'] = 'true';
+      delete process.env['ALARM_WEBHOOK_PATH_TOKEN'];
+
+      expect(() => loadConfig()).toThrow(
+        'ALARM_WEBHOOK_PATH_TOKEN is required when ALARM_WEBHOOK_ENABLED=true'
+      );
+    });
+  });
 });
