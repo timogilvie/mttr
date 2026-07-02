@@ -331,58 +331,84 @@ export async function markSnsMessageProcessed(
   return (result.rowCount ?? 0) > 0;
 }
 
+/**
+ * A pooled connection pinned for the lifetime of a transaction. `pg.Pool`
+ * exposes `connect()`; test fakes and already-pinned clients do not.
+ */
+interface PinnedClient extends DatabaseClient {
+  release(): void;
+}
+
+interface ConnectablePool extends DatabaseClient {
+  connect(): Promise<PinnedClient>;
+}
+
+function canConnect(client: DatabaseClient): client is ConnectablePool {
+  return typeof (client as Partial<ConnectablePool>).connect === 'function';
+}
+
 export async function enqueueAlarmTriggerOnce(
   client: DatabaseClient,
   input: AlarmTriggerEnqueueInput
 ): Promise<AlarmTriggerEnqueueResult> {
-  await client.query('BEGIN');
+  // A multi-statement transaction must run on a single connection. When given a
+  // pool, check out one dedicated connection for the whole BEGIN..COMMIT so the
+  // statements are actually atomic and the connection is not returned to the
+  // pool mid-transaction. Fakes/single connections fall back to direct use.
+  const pinned = canConnect(client) ? await client.connect() : null;
+  const tx: DatabaseClient = pinned ?? client;
   try {
-    const inserted = await client.query<{ sns_message_id: string }>(
-      `INSERT INTO processed_sns_messages (sns_message_id)
-       VALUES ($1)
-       ON CONFLICT (sns_message_id) DO NOTHING
-       RETURNING sns_message_id`,
-      [input.snsMessageId]
-    );
+    await tx.query('BEGIN');
+    try {
+      const inserted = await tx.query<{ sns_message_id: string }>(
+        `INSERT INTO processed_sns_messages (sns_message_id)
+         VALUES ($1)
+         ON CONFLICT (sns_message_id) DO NOTHING
+         RETURNING sns_message_id`,
+        [input.snsMessageId]
+      );
 
-    if ((inserted.rowCount ?? 0) === 0) {
-      await client.query('COMMIT');
-      return { duplicate: true, enqueued: false };
+      if ((inserted.rowCount ?? 0) === 0) {
+        await tx.query('COMMIT');
+        return { duplicate: true, enqueued: false };
+      }
+
+      if (input.newState !== 'ALARM') {
+        await tx.query('COMMIT');
+        return { duplicate: false, enqueued: false };
+      }
+
+      const result = await tx.query<{ id: string }>(
+        `INSERT INTO alarm_triggers (
+           sns_message_id, alarm_arn, alarm_name, new_state, state_change_time,
+           severity, spec_key, payload, status
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'pending')
+         RETURNING id`,
+        [
+          input.snsMessageId,
+          input.alarmArn,
+          input.alarmName,
+          input.newState,
+          input.stateChangeTime,
+          input.severity ?? null,
+          input.specKey ?? null,
+          JSON.stringify(sanitizeForStorage(input.payload)),
+        ]
+      );
+      const id = result.rows[0]?.id;
+      if (!id) {
+        throw new Error('Postgres did not return an alarm trigger id');
+      }
+
+      await tx.query('COMMIT');
+      return { duplicate: false, enqueued: true, id };
+    } catch (error) {
+      await tx.query('ROLLBACK');
+      throw error;
     }
-
-    if (input.newState !== 'ALARM') {
-      await client.query('COMMIT');
-      return { duplicate: false, enqueued: false };
-    }
-
-    const result = await client.query<{ id: string }>(
-      `INSERT INTO alarm_triggers (
-         sns_message_id, alarm_arn, alarm_name, new_state, state_change_time,
-         severity, spec_key, payload, status
-       )
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'pending')
-       RETURNING id`,
-      [
-        input.snsMessageId,
-        input.alarmArn,
-        input.alarmName,
-        input.newState,
-        input.stateChangeTime,
-        input.severity ?? null,
-        input.specKey ?? null,
-        JSON.stringify(sanitizeForStorage(input.payload)),
-      ]
-    );
-    const id = result.rows[0]?.id;
-    if (!id) {
-      throw new Error('Postgres did not return an alarm trigger id');
-    }
-
-    await client.query('COMMIT');
-    return { duplicate: false, enqueued: true, id };
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
+  } finally {
+    pinned?.release();
   }
 }
 

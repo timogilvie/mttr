@@ -385,6 +385,49 @@ describe('Postgres state repository', () => {
     expect(db.alarmTriggers).toHaveLength(0);
   });
 
+  it('runs the enqueue transaction on a single pinned pool connection and releases it', async () => {
+    const pinned = new FakeStateDatabase();
+    const poolQueries: string[] = [];
+    let released = 0;
+    // A pool-like client: query() would check out a fresh connection per call,
+    // so a real transaction must go through connect() to pin one connection.
+    const pool = {
+      async query<T extends QueryResultRow = QueryResultRow>(
+        text: string,
+        params: readonly unknown[] = []
+      ): Promise<QueryResult<T>> {
+        poolQueries.push(text.replace(/\s+/g, ' ').trim());
+        return pinned.query<T>(text, params);
+      },
+      async connect() {
+        return {
+          query: pinned.query.bind(pinned),
+          release: () => {
+            released += 1;
+          },
+        };
+      },
+    };
+
+    await expect(
+      enqueueAlarmTriggerOnce(pool as unknown as DatabaseClient, {
+        snsMessageId: 'sns-pinned',
+        alarmArn: 'arn:aws:cloudwatch:us-east-1:123456789012:alarm:CPUHigh',
+        alarmName: 'CPUHigh',
+        newState: 'ALARM',
+        stateChangeTime: '2026-07-01T12:34:56.000+0000',
+        payload: { AlarmName: 'CPUHigh', NewStateValue: 'ALARM' },
+      })
+    ).resolves.toMatchObject({ duplicate: false, enqueued: true });
+
+    // Every statement ran on the pinned connection; the pool was never queried
+    // directly, so BEGIN..COMMIT could not be split across connections.
+    expect(poolQueries).toHaveLength(0);
+    expect(pinned.queries[0]?.trim()).toBe('BEGIN');
+    expect(pinned.queries.at(-1)?.trim()).toBe('COMMIT');
+    expect(released).toBe(1);
+  });
+
   it('persists worker run lifecycle fields', async () => {
     const db = new FakeStateDatabase();
     const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
