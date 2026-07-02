@@ -701,9 +701,24 @@ describe('database migrations', () => {
       'incident_events',
       'alerts',
       'worker_heartbeats',
+      'alarm_triggers',
+      'processed_sns_messages',
     ]) {
       expect(sql).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
     }
+  });
+
+  it('adds alarm trigger queue migration with run provenance fields', () => {
+    const migration = MIGRATIONS.find((item) => item.id === 2);
+
+    expect(migration?.name).toBe('alarm_triggers_queue');
+    expect(migration?.sql).toContain('new_state text NOT NULL CHECK');
+    expect(migration?.sql).toContain("status text NOT NULL DEFAULT 'pending'");
+    expect(migration?.sql).toContain('CREATE INDEX IF NOT EXISTS alarm_triggers_status_received_idx');
+    expect(migration?.sql).toContain('ON alarm_triggers (status, received_at)');
+    expect(migration?.sql).toContain('run_id uuid REFERENCES runs(id) ON DELETE SET NULL');
+    expect(migration?.sql).toContain('ADD COLUMN IF NOT EXISTS trigger_source');
+    expect(migration?.sql).toContain("trigger_source text NOT NULL DEFAULT 'scheduled'");
   });
 
   it('runs migrations inside a transaction and records applied migrations', async () => {
@@ -725,6 +740,7 @@ describe('database migrations', () => {
 
     expect(queries[0]).toBe('BEGIN:');
     expect(queries.some((query) => query.includes('continuous_monitoring_state'))).toBe(true);
+    expect(queries.some((query) => query.includes('alarm_triggers_queue'))).toBe(true);
     expect(queries.at(-1)).toBe('COMMIT:');
   });
 });

@@ -116,6 +116,40 @@ CREATE TABLE IF NOT EXISTS worker_heartbeats (
 );
 `,
   },
+  {
+    id: 2,
+    name: 'alarm_triggers_queue',
+    sql: `
+CREATE TABLE IF NOT EXISTS alarm_triggers (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  sns_message_id text NOT NULL,
+  alarm_arn text NOT NULL,
+  alarm_name text NOT NULL,
+  new_state text NOT NULL CHECK (new_state IN ('ALARM', 'OK', 'INSUFFICIENT_DATA')),
+  state_change_time timestamptz NOT NULL,
+  severity text,
+  spec_key text,
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+  status text NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'claimed', 'done', 'deferred', 'error')),
+  received_at timestamptz NOT NULL DEFAULT now(),
+  claimed_at timestamptz,
+  processed_at timestamptz,
+  run_id uuid REFERENCES runs(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS alarm_triggers_status_received_idx
+  ON alarm_triggers (status, received_at);
+
+CREATE TABLE IF NOT EXISTS processed_sns_messages (
+  sns_message_id text PRIMARY KEY,
+  received_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE runs
+  ADD COLUMN IF NOT EXISTS trigger_source text NOT NULL DEFAULT 'scheduled';
+`,
+  },
 ];
 
 export async function runMigrations(client: DatabaseClient): Promise<void> {
