@@ -172,6 +172,12 @@ export function loadConfig(): Config {
   if (alarmWebhookEnabled && !alarmWebhookPathToken) {
     throw new Error('ALARM_WEBHOOK_PATH_TOKEN is required when ALARM_WEBHOOK_ENABLED=true');
   }
+  // Bind the ingress to a single expected topic. Without it the Notification
+  // handler would fail open, accepting any validly-signed SNS message from any
+  // AWS account/topic, so require it rather than let it default to unset.
+  if (alarmWebhookEnabled && !alarmWebhookTopicArn) {
+    throw new Error('ALARM_WEBHOOK_TOPIC_ARN is required when ALARM_WEBHOOK_ENABLED=true');
+  }
 
   return {
     openrouter: {

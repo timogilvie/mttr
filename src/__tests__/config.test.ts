@@ -341,5 +341,15 @@ describe('config', () => {
         'ALARM_WEBHOOK_PATH_TOKEN is required when ALARM_WEBHOOK_ENABLED=true'
       );
     });
+
+    it('requires a topic ARN when the webhook is enabled so ingress cannot fail open', () => {
+      process.env['ALARM_WEBHOOK_ENABLED'] = 'true';
+      process.env['ALARM_WEBHOOK_PATH_TOKEN'] = 'super-secret-token';
+      delete process.env['ALARM_WEBHOOK_TOPIC_ARN'];
+
+      expect(() => loadConfig()).toThrow(
+        'ALARM_WEBHOOK_TOPIC_ARN is required when ALARM_WEBHOOK_ENABLED=true'
+      );
+    });
   });
 });
