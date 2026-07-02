@@ -1,0 +1,8 @@
+{
+  "Type": "SubscriptionConfirmation",
+  "MessageId": "4f5d4fd3-1111-2222-3333-444455556666",
+  "Token": "token",
+  "TopicArn": "arn:aws:sns:us-east-1:123456789012:cloudwatch-alarms",
+  "Message": "You have chosen to subscribe.",
+  "SubscribeURL": "https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription"
+}

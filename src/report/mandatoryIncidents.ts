@@ -4,9 +4,10 @@ import type {
   Incident,
   IncidentClassification,
   Severity,
+  UserImpact,
 } from '../types.js';
 
-interface MandatoryIncidentSpec {
+export interface MandatoryIncidentSpec {
   key: string;
   title: string;
   classification: IncidentClassification;
@@ -23,7 +24,13 @@ interface MandatoryIncidentSpec {
   firstActions: string[];
   questions: string[];
   queries: string[];
-  userImpact: 'NONE' | 'MINIMAL' | 'PARTIAL' | 'SIGNIFICANT' | 'COMPLETE';
+  userImpact: UserImpact;
+}
+
+export interface ActiveAlarmSpecInput {
+  service: string;
+  alarmName: string;
+  ecsService?: string | undefined;
 }
 
 interface ServiceSection {
@@ -126,7 +133,7 @@ function extractEcsTaskCounts(body: string): { running: number; desired: number;
   return { running, desired, pending };
 }
 
-function isTaskHealthAlarm(alarmName: string): boolean {
+export function isTaskHealthAlarm(alarmName: string): boolean {
   return /(?:task|service|target|container)[-_ ]?(?:health|unhealthy)|(?:health|unhealthy)[-_ ]?(?:task|service|target|container)/i.test(
     alarmName
   );
@@ -255,40 +262,47 @@ function enrichIncidentWithSpec(incident: Incident, spec: MandatoryIncidentSpec)
   };
 }
 
-function extractActiveAlarmSpecs(report: string): MandatoryIncidentSpec[] {
+export function buildActiveAlarmSpec({
+  service,
+  alarmName,
+  ecsService,
+}: ActiveAlarmSpecInput): MandatoryIncidentSpec {
+  const taskHealthAlarm = isTaskHealthAlarm(alarmName);
+  const affectedService = ecsService ?? service;
+
+  return {
+    key: `active-alarm-${alarmName.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`,
+    title: `Active alarm for ${service}: ${alarmName}`,
+    classification: 'UNKNOWN',
+    severity: taskHealthAlarm ? 'CRITICAL' : 'HIGH',
+    confidence: 0.95,
+    affectedService,
+    serviceAliases: ecsService && ecsService !== service ? [service] : [],
+    evidence: [
+      `Health report lists alarm ${alarmName} in ALARM state for ${service}.`,
+      ...(ecsService && ecsService !== service ? [`ECS service is ${ecsService}.`] : []),
+    ],
+    alarms: [alarmName],
+    suspectedCauses: ['CloudWatch alarm threshold is currently breached.'],
+    firstActions: [`Inspect CloudWatch alarm ${alarmName} history and reason.`],
+    questions: [
+      'When did the alarm enter ALARM state?',
+      'Which underlying metric or event triggered the alarm?',
+      'Is the alarm correlated with task health, deploys, errors, or traffic changes?',
+    ],
+    queries: [`CloudWatch alarm history and metric data for ${alarmName}.`],
+    userImpact: taskHealthAlarm ? 'COMPLETE' : 'PARTIAL',
+  };
+}
+
+export function extractActiveAlarmSpecs(report: string): MandatoryIncidentSpec[] {
   return splitServiceSections(report).flatMap(({ service, body }) => {
     const ecsService = extractEcsServiceName(body);
     const alarms = [...body.matchAll(ALARM_ROW_RE)]
       .map((match) => match[1]?.trim())
       .filter((alarmName): alarmName is string => Boolean(alarmName));
 
-    return alarms.map((alarmName) => {
-      const taskHealthAlarm = isTaskHealthAlarm(alarmName);
-      const affectedService = ecsService ?? service;
-      return {
-        key: `active-alarm-${alarmName.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`,
-        title: `Active alarm for ${service}: ${alarmName}`,
-        classification: 'UNKNOWN' as const,
-        severity: taskHealthAlarm ? ('CRITICAL' as const) : ('HIGH' as const),
-        confidence: 0.95,
-        affectedService,
-        serviceAliases: ecsService && ecsService !== service ? [service] : [],
-        evidence: [
-          `Health report lists alarm ${alarmName} in ALARM state for ${service}.`,
-          ...(ecsService && ecsService !== service ? [`ECS service is ${ecsService}.`] : []),
-        ],
-        alarms: [alarmName],
-        suspectedCauses: ['CloudWatch alarm threshold is currently breached.'],
-        firstActions: [`Inspect CloudWatch alarm ${alarmName} history and reason.`],
-        questions: [
-          'When did the alarm enter ALARM state?',
-          'Which underlying metric or event triggered the alarm?',
-          'Is the alarm correlated with task health, deploys, errors, or traffic changes?',
-        ],
-        queries: [`CloudWatch alarm history and metric data for ${alarmName}.`],
-        userImpact: taskHealthAlarm ? ('COMPLETE' as const) : ('PARTIAL' as const),
-      };
-    });
+    return alarms.map((alarmName) => buildActiveAlarmSpec({ service, alarmName, ecsService }));
   });
 }
 
@@ -446,12 +460,13 @@ function mandatoryIncidentSpecs(report: string): MandatoryIncidentSpec[] {
   ];
 }
 
-function maxSeverity(a: Severity, b: Severity): Severity {
-  const order: Severity[] = ['NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];
-  return order.indexOf(a) >= order.indexOf(b) ? a : b;
+export const SEVERITY_ORDER: Severity[] = ['NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];
+
+export function maxSeverity(a: Severity, b: Severity): Severity {
+  return SEVERITY_ORDER.indexOf(a) >= SEVERITY_ORDER.indexOf(b) ? a : b;
 }
 
-function specDedupeKey(spec: MandatoryIncidentSpec): string {
+export function specDedupeKey(spec: MandatoryIncidentSpec): string {
   return [
     normalizeSignal(spec.affectedService),
     spec.classification,
