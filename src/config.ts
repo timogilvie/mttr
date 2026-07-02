@@ -65,6 +65,7 @@ export interface Config {
       pathToken?: string;
       verifySignature: boolean;
       autoconfirm: boolean;
+      topicArn?: string;
     };
     trigger: {
       minSeverity: Severity;
@@ -170,6 +171,7 @@ export function loadConfig(): Config {
   if (alarmWebhookEnabled && !alarmWebhookPathToken) {
     throw new Error('ALARM_WEBHOOK_PATH_TOKEN is required when ALARM_WEBHOOK_ENABLED=true');
   }
+  const alarmWebhookTopicArn = getEnvOptional('ALARM_WEBHOOK_TOPIC_ARN');
 
   return {
     openrouter: {
@@ -239,6 +241,7 @@ export function loadConfig(): Config {
         ...(alarmWebhookPathToken ? { pathToken: alarmWebhookPathToken } : {}),
         verifySignature: getEnvBoolean('ALARM_WEBHOOK_VERIFY_SIGNATURE', true),
         autoconfirm: getEnvBoolean('ALARM_WEBHOOK_AUTOCONFIRM', true),
+        ...(alarmWebhookTopicArn ? { topicArn: alarmWebhookTopicArn } : {}),
       },
       trigger: {
         minSeverity: getEnvSeverity('ALARM_TRIGGER_MIN_SEVERITY', 'CRITICAL'),

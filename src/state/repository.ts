@@ -702,6 +702,71 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
   }
 }
 
+export interface EnqueueAlarmTriggerInput {
+  messageId: string;
+  alarmArn: string;
+  alarmName: string;
+  newState: 'ALARM' | 'OK' | 'INSUFFICIENT_DATA';
+  stateChangeTime: string;
+  payload: unknown;
+}
+
+export interface EnqueueAlarmTriggerResult {
+  enqueued: boolean;
+  triggerId?: string;
+}
+
+/**
+ * Idempotently enqueues a CloudWatch alarm trigger. Dedupes on SNS
+ * `MessageId` via `processed_sns_messages`; only when that insert wins the
+ * race (`ON CONFLICT DO NOTHING` affects a row) does it insert the
+ * corresponding `alarm_triggers` row, in the same transaction. This
+ * guarantees exactly-once enqueue under concurrent duplicate SNS deliveries.
+ */
+export async function enqueueAlarmTriggerIfNew(
+  client: DatabaseClient,
+  input: EnqueueAlarmTriggerInput
+): Promise<EnqueueAlarmTriggerResult> {
+  await client.query('BEGIN');
+  try {
+    const dedupe = await client.query<{ sns_message_id: string }>(
+      `INSERT INTO processed_sns_messages (sns_message_id)
+       VALUES ($1)
+       ON CONFLICT (sns_message_id) DO NOTHING
+       RETURNING sns_message_id`,
+      [input.messageId]
+    );
+
+    if (dedupe.rows.length === 0) {
+      await client.query('COMMIT');
+      return { enqueued: false };
+    }
+
+    const inserted = await client.query<{ id: string }>(
+      `INSERT INTO alarm_triggers (
+         sns_message_id, alarm_arn, alarm_name, new_state, state_change_time, payload, status
+       )
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'pending')
+       RETURNING id`,
+      [
+        input.messageId,
+        input.alarmArn,
+        input.alarmName,
+        input.newState,
+        input.stateChangeTime,
+        JSON.stringify(input.payload),
+      ]
+    );
+
+    await client.query('COMMIT');
+    const triggerId = inserted.rows[0]?.id;
+    return triggerId ? { enqueued: true, triggerId } : { enqueued: true };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  }
+}
+
 export function createAgentStateRepository(config: Config): AgentStateRepository {
   if (config.state.backend === 'postgres') {
     const pool = createPostgresPool(config);
