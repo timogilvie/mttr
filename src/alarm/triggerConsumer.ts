@@ -106,18 +106,21 @@ export async function runAlarmTriggerConsumerOnce(
     return emptyOutcome('disabled');
   }
 
-  // D6: self-heal rows stranded in `claimed` by a crash between claim and launch. Bounded by a
-  // multiple of the poll/coalesce cadence so a healthy in-progress tick is never reclaimed.
-  const reclaimTimeoutMs = Math.max(trigger.pollMs * 3, trigger.coalesceMs + trigger.pollMs);
-  const reclaimed = await repository.reclaimStaleClaimedTriggers?.(reclaimTimeoutMs);
-  if (reclaimed) {
-    logger.warn(`[AlarmTriggerConsumer] Reclaimed ${reclaimed} stale claimed trigger(s) to pending`);
-  }
-
   // Concurrency: queue, don't preempt. Checked again after the debounce and again before launch —
   // no TOCTOU because JS is single-threaded and the in-flight flag flips synchronously on entry.
   if (launcher.isBusy()) {
     return emptyOutcome('in-flight');
+  }
+
+  // D6: self-heal rows stranded in `claimed` by a crash between claim and launch. This runs only
+  // when the launcher is NOT busy (guarded by the early-return above) — a live investigation holds
+  // its batch in `claimed` for the full launch duration, and the isBusy guard, not the timeout, is
+  // what keeps those rows from being reclaimed. So the timeout only bounds crash recovery latency
+  // (a dead process can no longer report busy), where a short poll-cadence bound is desirable.
+  const reclaimTimeoutMs = Math.max(trigger.pollMs * 3, trigger.coalesceMs + trigger.pollMs);
+  const reclaimed = await repository.reclaimStaleClaimedTriggers?.(reclaimTimeoutMs);
+  if (reclaimed) {
+    logger.warn(`[AlarmTriggerConsumer] Reclaimed ${reclaimed} stale claimed trigger(s) to pending`);
   }
 
   const pendingCount = (await repository.countPendingAlarmTriggers?.()) ?? 0;

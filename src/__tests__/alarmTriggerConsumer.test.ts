@@ -723,6 +723,32 @@ describe('runAlarmTriggerConsumerOnce', () => {
     expect(repo.rows.get(stale.id)?.status).not.toBe('claimed');
   });
 
+  it('D6: does not reclaim while an investigation is in flight (busy)', async () => {
+    // A live investigation holds its batch in `claimed` for the whole launch; the isBusy guard,
+    // not the reclaim timeout, must keep those rows from being flipped back to pending.
+    const repo = new FakeAlarmTriggerRepository();
+    const inFlight = makeRow({
+      status: 'claimed',
+      claimed_at: new Date(Date.now() - 60_000).toISOString(),
+    });
+    repo.seed(inFlight);
+    const launcher = new SpyLauncher();
+    launcher.busy = true;
+    const config = buildConfig({ pollMs: 1000, coalesceMs: 500 });
+
+    const outcome = await runAlarmTriggerConsumerOnce({
+      config,
+      repository: repo,
+      launcher,
+      sleep: instantSleep,
+      logger: silentLogger(),
+    });
+
+    expect(outcome.skipped).toBe('in-flight');
+    expect(repo.reclaimCalls).toHaveLength(0);
+    expect(repo.rows.get(inFlight.id)?.status).toBe('claimed');
+  });
+
   it('D8: negative/zero coalesceMs is clamped to zero and never throws', async () => {
     const repo = new FakeAlarmTriggerRepository();
     const row = makeRow({ spec_key: 'svc-clamp' });
