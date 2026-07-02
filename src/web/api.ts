@@ -6,7 +6,14 @@ import fastifyStatic from '@fastify/static';
 import type { Config } from '../config.js';
 import type { DatabaseClient, DatabasePool } from '../db/postgres.js';
 import { createPostgresPool } from '../db/postgres.js';
+import { enqueueAlarmTriggerOnce, markSnsMessageProcessed } from '../state/repository.js';
 import type { Severity } from '../types.js';
+import {
+  confirmSnsSubscription,
+  parseCloudWatchAlarmMessage,
+  parseSnsMessage,
+  verifySnsMessageSignature,
+} from './sns.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -66,6 +73,11 @@ interface WorkerHeartbeatRow {
   process_name: string;
   last_seen_at: Date | string;
   metadata_json: unknown;
+}
+
+interface WebhookDependencies {
+  fetchSigningCert?: (url: string, signal: AbortSignal) => Promise<string>;
+  confirmSubscriptionGet?: (url: string, signal: AbortSignal) => Promise<void>;
 }
 
 function toIso(value: Date | string | null): string | null {
@@ -217,12 +229,14 @@ function isOlderThan(value: Date | string | null, thresholdMs: number): boolean 
 export function createWebServer(
   config: Config,
   client?: DatabaseClient,
-  ownedPool?: DatabasePool
+  ownedPool?: DatabasePool,
+  webhookDependencies: WebhookDependencies = {}
 ): FastifyInstance {
   const db = client ?? createPostgresPool(config);
   const poolToClose = ownedPool ?? (client ? undefined : (db as DatabasePool));
   const app = Fastify({ logger: false });
   const staticRoot = resolve(process.cwd(), 'dist/web');
+  const snsCertCache = new Map<string, string>();
 
   app.addHook('onClose', async () => {
     await poolToClose?.end();
@@ -232,6 +246,80 @@ export function createWebServer(
     void app.register(fastifyStatic, {
       root: staticRoot,
       prefix: '/',
+    });
+  }
+
+  if (config.alarm.webhook.enabled) {
+    void app.register(async (webhookApp) => {
+      webhookApp.addContentTypeParser(
+        'text/plain',
+        { parseAs: 'string' },
+        (_request, body, done) => done(null, body)
+      );
+
+      webhookApp.post('/webhooks/cloudwatch/:token', async (request, reply) => {
+        const { token } = request.params as { token: string };
+        if (token !== config.alarm.webhook.pathToken) {
+          return reply.code(404).send({ error: 'not_found' });
+        }
+
+        let message;
+        try {
+          message = parseSnsMessage(request.body);
+        } catch {
+          return reply.code(400).send({ error: 'invalid_sns_message' });
+        }
+
+        if (config.alarm.webhook.verifySignature) {
+          const verificationOptions = { cache: snsCertCache };
+          if (webhookDependencies.fetchSigningCert) {
+            Object.assign(verificationOptions, {
+              fetchCert: webhookDependencies.fetchSigningCert,
+            });
+          }
+          const verified = await verifySnsMessageSignature(message, verificationOptions);
+          if (!verified) {
+            return reply.code(403).send({ error: 'invalid_sns_signature' });
+          }
+        }
+
+        if (message.Type === 'SubscriptionConfirmation') {
+          if (
+            config.alarm.webhook.autoconfirm &&
+            config.alarm.webhook.topicArn &&
+            message.TopicArn === config.alarm.webhook.topicArn
+          ) {
+            try {
+              const confirmationOptions = {};
+              if (webhookDependencies.confirmSubscriptionGet) {
+                Object.assign(confirmationOptions, {
+                  confirmGet: webhookDependencies.confirmSubscriptionGet,
+                });
+              }
+              await confirmSnsSubscription(message.SubscribeURL, confirmationOptions);
+            } catch {
+              request.log.warn({ topicArn: message.TopicArn }, 'SNS subscription confirmation failed');
+            }
+          }
+          return reply.code(200).send({ ok: true });
+        }
+
+        const alarmMessage = parseCloudWatchAlarmMessage(message.Message);
+        if (!alarmMessage) {
+          await markSnsMessageProcessed(db, message.MessageId);
+          return reply.code(200).send({ ok: true });
+        }
+
+        await enqueueAlarmTriggerOnce(db, {
+          snsMessageId: message.MessageId,
+          alarmArn: alarmMessage.AlarmArn,
+          alarmName: alarmMessage.AlarmName,
+          newState: alarmMessage.NewStateValue,
+          stateChangeTime: alarmMessage.StateChangeTime,
+          payload: alarmMessage,
+        });
+        return reply.code(200).send({ ok: true });
+      });
     });
   }
 

@@ -3,7 +3,11 @@ import type { QueryResult, QueryResultRow } from 'pg';
 import type { ClassificationResult, DecisionResult, VerificationResult } from '../types.js';
 import type { DatabaseClient } from '../db/postgres.js';
 import { MIGRATIONS, runMigrations } from '../db/migrations.js';
-import { PostgresAgentStateRepository } from '../state/repository.js';
+import {
+  enqueueAlarmTriggerOnce,
+  markSnsMessageProcessed,
+  PostgresAgentStateRepository,
+} from '../state/repository.js';
 import {
   hashReportContent,
   hasProcessedReport,
@@ -51,8 +55,16 @@ class FakeStateDatabase implements DatabaseClient {
   alerts = new Map<string, Record<string, unknown>>();
   workerHeartbeats = new Map<string, Record<string, unknown>>();
   incidentEvents: Array<Record<string, unknown>> = [];
+  processedSnsMessages = new Set<string>();
+  alarmTriggers: Array<Record<string, unknown>> = [];
   queries: string[] = [];
   private runCounter = 0;
+  private snapshot?:
+    | {
+        processedSnsMessages: Set<string>;
+        alarmTriggers: Array<Record<string, unknown>>;
+      }
+    | undefined;
 
   async query<T extends QueryResultRow = QueryResultRow>(
     text: string,
@@ -62,7 +74,47 @@ class FakeStateDatabase implements DatabaseClient {
     const normalized = text.replace(/\s+/g, ' ').trim();
 
     if (normalized === 'BEGIN' || normalized === 'COMMIT' || normalized === 'ROLLBACK') {
+      if (normalized === 'BEGIN') {
+        this.snapshot = {
+          processedSnsMessages: new Set(this.processedSnsMessages),
+          alarmTriggers: this.alarmTriggers.map((row) => ({ ...row })),
+        };
+      }
+      if (normalized === 'COMMIT') {
+        this.snapshot = undefined;
+      }
+      if (normalized === 'ROLLBACK' && this.snapshot) {
+        this.processedSnsMessages = this.snapshot.processedSnsMessages;
+        this.alarmTriggers = this.snapshot.alarmTriggers;
+        this.snapshot = undefined;
+      }
       return result<T>([]);
+    }
+
+    if (normalized.startsWith('INSERT INTO processed_sns_messages')) {
+      const snsMessageId = String(params[0]);
+      if (this.processedSnsMessages.has(snsMessageId)) {
+        return result<T>([]);
+      }
+      this.processedSnsMessages.add(snsMessageId);
+      return result<T>([{ sns_message_id: snsMessageId } as unknown as T]);
+    }
+
+    if (normalized.startsWith('INSERT INTO alarm_triggers')) {
+      const id = `trigger-${this.alarmTriggers.length + 1}`;
+      this.alarmTriggers.push({
+        id,
+        sns_message_id: params[0],
+        alarm_arn: params[1],
+        alarm_name: params[2],
+        new_state: params[3],
+        state_change_time: params[4],
+        severity: params[5],
+        spec_key: params[6],
+        payload: JSON.parse(String(params[7])),
+        status: 'pending',
+      });
+      return result<T>([{ id } as unknown as T]);
     }
 
     if (normalized.startsWith('SELECT health_report_s3_uri')) {
@@ -278,6 +330,61 @@ class FakeStateDatabase implements DatabaseClient {
 }
 
 describe('Postgres state repository', () => {
+  it('marks SNS messages processed once', async () => {
+    const db = new FakeStateDatabase();
+
+    await expect(markSnsMessageProcessed(db, 'sns-1')).resolves.toBe(true);
+    await expect(markSnsMessageProcessed(db, 'sns-1')).resolves.toBe(false);
+    expect(db.processedSnsMessages.has('sns-1')).toBe(true);
+  });
+
+  it('atomically enqueues an ALARM trigger once per SNS message id', async () => {
+    const db = new FakeStateDatabase();
+
+    await expect(
+      enqueueAlarmTriggerOnce(db, {
+        snsMessageId: 'sns-1',
+        alarmArn: 'arn:aws:cloudwatch:us-east-1:123456789012:alarm:CPUHigh',
+        alarmName: 'CPUHigh',
+        newState: 'ALARM',
+        stateChangeTime: '2026-07-01T12:34:56.000+0000',
+        payload: { AlarmName: 'CPUHigh', NewStateValue: 'ALARM' },
+      })
+    ).resolves.toMatchObject({ duplicate: false, enqueued: true, id: 'trigger-1' });
+
+    await expect(
+      enqueueAlarmTriggerOnce(db, {
+        snsMessageId: 'sns-1',
+        alarmArn: 'arn:aws:cloudwatch:us-east-1:123456789012:alarm:CPUHigh',
+        alarmName: 'CPUHigh',
+        newState: 'ALARM',
+        stateChangeTime: '2026-07-01T12:34:56.000+0000',
+        payload: { AlarmName: 'CPUHigh', NewStateValue: 'ALARM' },
+      })
+    ).resolves.toMatchObject({ duplicate: true, enqueued: false });
+
+    expect(db.processedSnsMessages.size).toBe(1);
+    expect(db.alarmTriggers).toHaveLength(1);
+  });
+
+  it('records non-ALARM messages without enqueueing a trigger row', async () => {
+    const db = new FakeStateDatabase();
+
+    await expect(
+      enqueueAlarmTriggerOnce(db, {
+        snsMessageId: 'sns-2',
+        alarmArn: 'arn:aws:cloudwatch:us-east-1:123456789012:alarm:CPUHigh',
+        alarmName: 'CPUHigh',
+        newState: 'OK',
+        stateChangeTime: '2026-07-01T12:34:56.000+0000',
+        payload: { AlarmName: 'CPUHigh', NewStateValue: 'OK' },
+      })
+    ).resolves.toMatchObject({ duplicate: false, enqueued: false });
+
+    expect(db.processedSnsMessages.has('sns-2')).toBe(true);
+    expect(db.alarmTriggers).toHaveLength(0);
+  });
+
   it('persists worker run lifecycle fields', async () => {
     const db = new FakeStateDatabase();
     const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');

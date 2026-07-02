@@ -50,6 +50,23 @@ export interface ProcessedSnsMessageRow {
   received_at: Date | string;
 }
 
+export interface AlarmTriggerEnqueueInput {
+  snsMessageId: string;
+  alarmArn: string;
+  alarmName: string;
+  newState: 'ALARM' | 'OK' | 'INSUFFICIENT_DATA';
+  stateChangeTime: string;
+  severity?: string | null;
+  specKey?: string | null;
+  payload: unknown;
+}
+
+export interface AlarmTriggerEnqueueResult {
+  duplicate: boolean;
+  enqueued: boolean;
+  id?: string;
+}
+
 export interface RunRecordUpdate {
   status: Exclude<RunStatus, 'running'>;
   finishedAt: string;
@@ -298,6 +315,75 @@ function transitionEvents(
     service: item.service,
     evidence: item.evidence,
   }));
+}
+
+export async function markSnsMessageProcessed(
+  client: DatabaseClient,
+  snsMessageId: string
+): Promise<boolean> {
+  const result = await client.query<{ sns_message_id: string }>(
+    `INSERT INTO processed_sns_messages (sns_message_id)
+     VALUES ($1)
+     ON CONFLICT (sns_message_id) DO NOTHING
+     RETURNING sns_message_id`,
+    [snsMessageId]
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+export async function enqueueAlarmTriggerOnce(
+  client: DatabaseClient,
+  input: AlarmTriggerEnqueueInput
+): Promise<AlarmTriggerEnqueueResult> {
+  await client.query('BEGIN');
+  try {
+    const inserted = await client.query<{ sns_message_id: string }>(
+      `INSERT INTO processed_sns_messages (sns_message_id)
+       VALUES ($1)
+       ON CONFLICT (sns_message_id) DO NOTHING
+       RETURNING sns_message_id`,
+      [input.snsMessageId]
+    );
+
+    if ((inserted.rowCount ?? 0) === 0) {
+      await client.query('COMMIT');
+      return { duplicate: true, enqueued: false };
+    }
+
+    if (input.newState !== 'ALARM') {
+      await client.query('COMMIT');
+      return { duplicate: false, enqueued: false };
+    }
+
+    const result = await client.query<{ id: string }>(
+      `INSERT INTO alarm_triggers (
+         sns_message_id, alarm_arn, alarm_name, new_state, state_change_time,
+         severity, spec_key, payload, status
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'pending')
+       RETURNING id`,
+      [
+        input.snsMessageId,
+        input.alarmArn,
+        input.alarmName,
+        input.newState,
+        input.stateChangeTime,
+        input.severity ?? null,
+        input.specKey ?? null,
+        JSON.stringify(sanitizeForStorage(input.payload)),
+      ]
+    );
+    const id = result.rows[0]?.id;
+    if (!id) {
+      throw new Error('Postgres did not return an alarm trigger id');
+    }
+
+    await client.query('COMMIT');
+    return { duplicate: false, enqueued: true, id };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  }
 }
 
 export class PostgresAgentStateRepository implements AgentStateRepository {

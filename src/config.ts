@@ -63,6 +63,7 @@ export interface Config {
     webhook: {
       enabled: boolean;
       pathToken?: string;
+      topicArn?: string;
       verifySignature: boolean;
       autoconfirm: boolean;
     };
@@ -167,6 +168,7 @@ export function loadConfig(): Config {
   }
   const alarmWebhookEnabled = getEnvBoolean('ALARM_WEBHOOK_ENABLED', false);
   const alarmWebhookPathToken = getEnvOptional('ALARM_WEBHOOK_PATH_TOKEN');
+  const alarmWebhookTopicArn = getEnvOptional('ALARM_WEBHOOK_TOPIC_ARN');
   if (alarmWebhookEnabled && !alarmWebhookPathToken) {
     throw new Error('ALARM_WEBHOOK_PATH_TOKEN is required when ALARM_WEBHOOK_ENABLED=true');
   }
@@ -237,6 +239,7 @@ export function loadConfig(): Config {
       webhook: {
         enabled: alarmWebhookEnabled,
         ...(alarmWebhookPathToken ? { pathToken: alarmWebhookPathToken } : {}),
+        ...(alarmWebhookTopicArn ? { topicArn: alarmWebhookTopicArn } : {}),
         verifySignature: getEnvBoolean('ALARM_WEBHOOK_VERIFY_SIGNATURE', true),
         autoconfirm: getEnvBoolean('ALARM_WEBHOOK_AUTOCONFIRM', true),
       },
