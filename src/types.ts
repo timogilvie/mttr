@@ -184,6 +184,74 @@ export interface PriorityItem {
   reason: string;
 }
 
+export type FailureConcentrationDimension =
+  | 'endpoint'
+  | 'method'
+  | 'statusCode'
+  | 'modelOrResourceId'
+  | 'logStream';
+
+export interface FailureConcentrationEntry {
+  dimension: FailureConcentrationDimension;
+  topValue: string;
+  share: number | null;
+  note?: string | undefined;
+}
+
+export type EvidenceConfidence = 'high' | 'medium' | 'low' | 'unknown';
+
+export interface FirstBadTimestamp {
+  value: string | null;
+  source: string | null;
+  confidence: EvidenceConfidence;
+}
+
+export type ChangeEventType = 'deploy' | 'config' | 'runtime';
+
+export interface ChangeCorrelationEntry {
+  type: ChangeEventType;
+  reference: string;
+  timestamp: string | null;
+  correlatesWithFirstBad: boolean;
+}
+
+export type HealthAssessmentStatus = 'healthy' | 'degraded' | 'unknown' | 'unavailable';
+
+export interface HealthAssessment {
+  status: HealthAssessmentStatus;
+  detail: string;
+}
+
+export interface HighestValueNextQuery {
+  description: string;
+  targetTool: string | null;
+  rationale: string;
+}
+
+export type MitigationConfidence = 'high' | 'medium' | 'low' | 'unknown';
+
+/**
+ * Second-level causal-evidence section for a confirmed application-level
+ * (API 5xx / ALB-backed) incident. Additive and optional so symptom-only
+ * investigations (and pre-existing persisted investigations) keep validating
+ * without it. When present, every child field is required — a confirmed
+ * application incident must produce a complete structured section, even if
+ * every value ends up recording that evidence was missing/unavailable.
+ */
+export interface CausalEvidence {
+  failureConcentration: FailureConcentrationEntry[];
+  firstBadTimestamp: FirstBadTimestamp;
+  changeCorrelation: ChangeCorrelationEntry[];
+  taskHealth: HealthAssessment;
+  resourceSaturation: HealthAssessment;
+  dependencyHealth: HealthAssessment;
+  evidenceFound: string[];
+  evidenceMissing: string[];
+  highestValueNextQuery: HighestValueNextQuery;
+  mitigationConfidence: MitigationConfidence;
+  mitigationConfidenceRationale: string;
+}
+
 export interface Investigation {
   incident_id: string;
   title: string;
@@ -203,6 +271,7 @@ export interface Investigation {
   recommended_next_investigation_steps: NextInvestigationStep[];
   requires_more_evidence_before_mitigation: boolean;
   possible_future_remediation: string[];
+  causalEvidence?: CausalEvidence | undefined;
 }
 
 export interface InvestigationResult {

@@ -60,6 +60,51 @@ function validResult(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function validCausalEvidence(overrides: Record<string, unknown> = {}) {
+  return {
+    failureConcentration: [
+      { dimension: 'endpoint', topValue: '/v1/models/{id}/predict', share: 0.9 },
+      { dimension: 'statusCode', topValue: '503', share: 0.9, note: 'Concentrated on target 503s.' },
+    ],
+    firstBadTimestamp: {
+      value: '2026-07-02T10:15:00Z',
+      source: 'CloudWatch Logs Insights first-bad-log-timestamp query on /ecs/hokusai-api-development',
+      confidence: 'high',
+    },
+    changeCorrelation: [
+      {
+        type: 'deploy',
+        reference: 'UpdateService for data-pipeline-api at 2026-07-02T10:12:00Z',
+        timestamp: '2026-07-02T10:12:00Z',
+        correlatesWithFirstBad: true,
+      },
+    ],
+    taskHealth: {
+      status: 'degraded',
+      detail: 'One task stopped with a failed target-group health check.',
+    },
+    resourceSaturation: {
+      status: 'healthy',
+      detail: 'CPU and memory utilization stayed under 40% through the window.',
+    },
+    dependencyHealth: {
+      status: 'unknown',
+      detail: 'No downstream dependency was named in Step 1 evidence or suspected_causes.',
+    },
+    evidenceFound: ['Deploy at 10:12Z correlates with the first 503 at 10:15Z.'],
+    evidenceMissing: [],
+    highestValueNextQuery: {
+      description: 'No further query needed.',
+      targetTool: null,
+      rationale: 'All causal-evidence dimensions were resolved.',
+    },
+    mitigationConfidence: 'high',
+    mitigationConfidenceRationale:
+      'Deploy at 10:12Z correlates with the first 503 at 10:15Z, and 503s concentrate on /v1/models/{id}/predict.',
+    ...overrides,
+  };
+}
+
 describe('investigationSchema', () => {
   it('accepts valid no-actionable payload', () => {
     const valid = {
@@ -232,6 +277,144 @@ describe('investigationSchema', () => {
   it('rejects non-boolean requires_more_evidence_before_mitigation', () => {
     const result = validResult({
       investigations: [validInvestigation({ requires_more_evidence_before_mitigation: 'yes' })],
+    });
+    expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
+  });
+
+  it('accepts an investigation payload without causalEvidence (backwards compatible)', () => {
+    const result = parseInvestigation(validResult());
+
+    expect(result.investigations[0]?.causalEvidence).toBeUndefined();
+  });
+
+  it('accepts a fully populated causalEvidence payload for a confirmed application-error incident', () => {
+    const result = parseInvestigation(
+      validResult({
+        investigations: [
+          validInvestigation({
+            title: 'data-pipeline-api returned 503s on /v1/models/{id}/predict',
+            original_classification: 'APPLICATION_ERROR',
+            investigation_status: 'CONFIRMED_INCIDENT',
+            requires_more_evidence_before_mitigation: false,
+            causalEvidence: validCausalEvidence(),
+          }),
+        ],
+      })
+    );
+
+    const causalEvidence = result.investigations[0]?.causalEvidence;
+    expect(causalEvidence).toBeDefined();
+    expect(causalEvidence?.failureConcentration).toHaveLength(2);
+    expect(causalEvidence?.firstBadTimestamp.value).toBe('2026-07-02T10:15:00Z');
+    expect(causalEvidence?.changeCorrelation[0]?.correlatesWithFirstBad).toBe(true);
+    expect(causalEvidence?.taskHealth.status).toBe('degraded');
+    expect(causalEvidence?.mitigationConfidence).toBe('high');
+  });
+
+  it('accepts a causalEvidence payload with empty evidenceFound and populated evidenceMissing', () => {
+    const result = parseInvestigation(
+      validResult({
+        investigations: [
+          validInvestigation({
+            original_classification: 'APPLICATION_ERROR',
+            investigation_status: 'CONFIRMED_INCIDENT',
+            causalEvidence: validCausalEvidence({
+              failureConcentration: [],
+              evidenceFound: [],
+              evidenceMissing: [
+                'endpoint dimension not present in logs',
+                'change correlation unavailable: CloudTrail throttled',
+              ],
+              mitigationConfidence: 'low',
+              mitigationConfidenceRationale:
+                'No causal evidence tools returned data; confidence capped at low.',
+            }),
+          }),
+        ],
+      })
+    );
+
+    const causalEvidence = result.investigations[0]?.causalEvidence;
+    expect(causalEvidence?.failureConcentration).toEqual([]);
+    expect(causalEvidence?.evidenceFound).toEqual([]);
+    expect(causalEvidence?.evidenceMissing).toHaveLength(2);
+    expect(causalEvidence?.mitigationConfidence).toBe('low');
+  });
+
+  it('rejects an invalid failureConcentration dimension', () => {
+    const result = validResult({
+      investigations: [
+        validInvestigation({
+          causalEvidence: validCausalEvidence({
+            failureConcentration: [{ dimension: 'ipAddress', topValue: '1.2.3.4', share: 0.5 }],
+          }),
+        }),
+      ],
+    });
+    expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
+  });
+
+  it('rejects an invalid firstBadTimestamp confidence', () => {
+    const result = validResult({
+      investigations: [
+        validInvestigation({
+          causalEvidence: validCausalEvidence({
+            firstBadTimestamp: { value: null, source: null, confidence: 'certain' },
+          }),
+        }),
+      ],
+    });
+    expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
+  });
+
+  it('rejects an invalid changeCorrelation type', () => {
+    const result = validResult({
+      investigations: [
+        validInvestigation({
+          causalEvidence: validCausalEvidence({
+            changeCorrelation: [
+              { type: 'schema-migration', reference: 'x', timestamp: null, correlatesWithFirstBad: false },
+            ],
+          }),
+        }),
+      ],
+    });
+    expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
+  });
+
+  it('rejects an invalid health-assessment status for taskHealth/resourceSaturation/dependencyHealth', () => {
+    const result = validResult({
+      investigations: [
+        validInvestigation({
+          causalEvidence: validCausalEvidence({
+            resourceSaturation: { status: 'critical', detail: 'x' },
+          }),
+        }),
+      ],
+    });
+    expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
+  });
+
+  it('rejects an invalid mitigationConfidence', () => {
+    const result = validResult({
+      investigations: [
+        validInvestigation({
+          causalEvidence: validCausalEvidence({ mitigationConfidence: 'maybe' }),
+        }),
+      ],
+    });
+    expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
+  });
+
+  it('rejects a failureConcentration share outside [0, 1]', () => {
+    const result = validResult({
+      investigations: [
+        validInvestigation({
+          causalEvidence: validCausalEvidence({
+            failureConcentration: [{ dimension: 'statusCode', topValue: '503', share: 1.2 }],
+          }),
+        }),
+      ],
     });
     expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
   });

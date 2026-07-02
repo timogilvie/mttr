@@ -75,6 +75,67 @@ const PriorityItemSchema = z.object({
   reason: z.string(),
 });
 
+const FailureConcentrationDimensionSchema = z.enum([
+  'endpoint',
+  'method',
+  'statusCode',
+  'modelOrResourceId',
+  'logStream',
+]);
+
+const FailureConcentrationEntrySchema = z.object({
+  dimension: FailureConcentrationDimensionSchema,
+  topValue: z.string(),
+  share: z.number().min(0).max(1).nullable(),
+  note: z.string().optional(),
+});
+
+const EvidenceConfidenceSchema = z.enum(['high', 'medium', 'low', 'unknown']);
+
+const FirstBadTimestampSchema = z.object({
+  value: z.string().nullable(),
+  source: z.string().nullable(),
+  confidence: EvidenceConfidenceSchema,
+});
+
+const ChangeEventTypeSchema = z.enum(['deploy', 'config', 'runtime']);
+
+const ChangeCorrelationEntrySchema = z.object({
+  type: ChangeEventTypeSchema,
+  reference: z.string(),
+  timestamp: z.string().nullable(),
+  correlatesWithFirstBad: z.boolean(),
+});
+
+const HealthAssessmentStatusSchema = z.enum(['healthy', 'degraded', 'unknown', 'unavailable']);
+
+const HealthAssessmentSchema = z.object({
+  status: HealthAssessmentStatusSchema,
+  detail: z.string(),
+});
+
+const HighestValueNextQuerySchema = z.object({
+  description: z.string(),
+  targetTool: z.string().nullable(),
+  rationale: z.string(),
+});
+
+const MitigationConfidenceSchema = z.enum(['high', 'medium', 'low', 'unknown']);
+
+const CausalEvidenceSchema = z.object({
+  failureConcentration: z.array(FailureConcentrationEntrySchema),
+  firstBadTimestamp: FirstBadTimestampSchema,
+  changeCorrelation: z.array(ChangeCorrelationEntrySchema),
+  taskHealth: HealthAssessmentSchema,
+  resourceSaturation: HealthAssessmentSchema,
+  dependencyHealth: HealthAssessmentSchema,
+  evidenceFound: z.array(z.string()),
+  evidenceMissing: z.array(z.string()),
+  highestValueNextQuery: HighestValueNextQuerySchema,
+  mitigationConfidence: MitigationConfidenceSchema,
+  mitigationConfidenceRationale: z.string(),
+});
+
 const InvestigationSchema = z.object({
   incident_id: z.string(),
   title: z.string(),
@@ -94,6 +155,7 @@ const InvestigationSchema = z.object({
   recommended_next_investigation_steps: z.array(NextInvestigationStepSchema),
   requires_more_evidence_before_mitigation: z.boolean(),
   possible_future_remediation: z.array(z.string()),
+  causalEvidence: CausalEvidenceSchema.optional(),
 });
 
 const InvestigationResultSchema = z.object({

@@ -404,6 +404,36 @@ const LAMBDA_CHANGE_EVENTS = [
   'TagResource',
 ];
 const EVENTBRIDGE_CHANGE_EVENTS = ['PutRule', 'PutTargets', 'EnableRule', 'DisableRule', 'TagResource'];
+const ECS_CHANGE_EVENTS = [
+  'CreateService',
+  'UpdateService',
+  'RegisterTaskDefinition',
+  'DeregisterTaskDefinition',
+  'UpdateServicePrimaryTaskSet',
+  'TagResource',
+];
+
+// Matches the ECS service-events tool's own summary line, e.g.
+// "Service data-pipeline-api (cluster hokusai-development): status=ACTIVE".
+// Parsing the tool's own output (rather than any literal service name) is what
+// keeps the causal-evidence resource-saturation/change-correlation follow-up
+// generic across services.
+const ECS_SERVICE_EVENTS_HEADER_RE = /^Service\s+(\S+)\s+\(cluster\s+([^)]+)\)/m;
+
+interface ResolvedEcsServiceForCausalEvidence {
+  service: string;
+  cluster: string;
+}
+
+function parseEcsServiceForCausalEvidence(
+  ecsServiceEventsResult: string
+): ResolvedEcsServiceForCausalEvidence | null {
+  const match = ecsServiceEventsResult.match(ECS_SERVICE_EVENTS_HEADER_RE);
+  if (!match || !match[1] || !match[2]) {
+    return null;
+  }
+  return { service: match[1], cluster: match[2] };
+}
 
 interface SpikeWindow {
   start: string;
@@ -948,6 +978,73 @@ async function gatherEventBridgeRootCauseEvidence(
   return sections;
 }
 
+/**
+ * Causal-evidence follow-up for a confirmed API 5xx / ALB-backed application
+ * error: ECS resource saturation (CPU/Memory) and deploy/config change
+ * correlation for the specific ECS service+cluster the service-events tool
+ * resolved. Keyed off the tool's own resolved names (see
+ * parseEcsServiceForCausalEvidence), not any literal service name, so the
+ * same pivot works for any ECS-backed service.
+ */
+async function gatherEcsCausalEvidence(
+  id: string,
+  kind: InvestigationItem['kind'],
+  resolved: ResolvedEcsServiceForCausalEvidence,
+  ctx: ToolContext,
+  tracker: EvidenceRequirementTracker
+): Promise<string[]> {
+  const sections = [
+    await runEvidenceTool(
+      `### ${id} ${kind}: ECS resource saturation (CPU/Memory) for ${resolved.service} (root-cause context)`,
+      async () => {
+        const dimensions = [
+          { name: 'ServiceName', value: resolved.service },
+          { name: 'ClusterName', value: resolved.cluster },
+        ];
+        const cpu = await metricsAndAlarmsTool.handler(
+          { namespace: 'AWS/ECS', metric_name: 'CPUUtilization', dimensions, stat: 'Average' },
+          ctx
+        );
+        const memory = await metricsAndAlarmsTool.handler(
+          { namespace: 'AWS/ECS', metric_name: 'MemoryUtilization', dimensions, stat: 'Average' },
+          ctx
+        );
+        return `CPUUtilization:\n${cpu}\n\nMemoryUtilization:\n${memory}`;
+      }
+    ),
+  ];
+
+  const changeWindow = rootCauseChangeWindow(ctx);
+  if (changeWindow) {
+    const changeDetailsRequirement = tracker.require(
+      id,
+      'CHANGE_EVENT_DETAILS',
+      resolved.service,
+      `Inspect ECS service deploy/config change events for ${resolved.service}.`,
+      'Use lookup_cloudtrail_events for ECS service change event details.'
+    );
+    sections.push(
+      await runRequiredEvidenceTool(
+        `### ${id} ${kind}: CloudTrail ECS service changes for ${resolved.service} (72h before report window through window end)`,
+        changeDetailsRequirement,
+        tracker,
+        () =>
+          cloudTrailLookupTool.handler(
+            {
+              resource_name: resolved.service,
+              event_names: ECS_CHANGE_EVENTS,
+              ...changeWindow,
+              limit: 50,
+            },
+            ctx
+          )
+      )
+    );
+  }
+
+  return sections;
+}
+
 async function runEvidenceTool(label: string, action: () => Promise<string>): Promise<string> {
   try {
     const result = await action();
@@ -1084,12 +1181,18 @@ async function gatherStandardEvidence(
       console.log(`[Investigate] Pre-gathering standard evidence for ${id} (${service})`);
 
       if (shouldQuery5xx) {
-        sections.push(
-          await runEvidenceTool(
-            `### ${id} ${kind}: ECS service events for ${service} (${windowLabel})`,
-            () => ecsServiceEventsTool.handler({ service_name: service, ...windowArgs }, ctx)
-          )
+        const ecsServiceEventsEvidence = await runEvidenceTool(
+          `### ${id} ${kind}: ECS service events for ${service} (${windowLabel})`,
+          () => ecsServiceEventsTool.handler({ service_name: service, ...windowArgs }, ctx)
         );
+        sections.push(ecsServiceEventsEvidence);
+
+        const resolvedEcsService = parseEcsServiceForCausalEvidence(ecsServiceEventsEvidence);
+        if (resolvedEcsService) {
+          sections.push(
+            ...(await gatherEcsCausalEvidence(id, kind, resolvedEcsService, ctx, tracker))
+          );
+        }
       }
 
       if (shouldQueryObservability) {

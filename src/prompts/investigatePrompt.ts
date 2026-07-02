@@ -59,6 +59,28 @@ Use suggested_cloudwatch_queries and signals to target your queries. For finding
 - Do not fabricate logs, metrics, timestamps, or service names. Preserve service names exactly as given in Step 1.
 - Do not recommend remediation. Any remediation idea goes in possible_future_remediation, labelled as a possibility, never an instruction.
 
+## Causal-evidence pivot for confirmed application errors
+
+A confirmed application-level incident (original_classification APPLICATION_ERROR, or any incident/finding whose evidence is API 5xx / ALB-backed) does NOT stop at symptom corroboration. Once you set investigation_status to CONFIRMED_INCIDENT for such an item, execute a second-level causal-evidence plan and populate the item's causalEvidence object. This applies generically to any service resolvable from affected_services — never key this behavior off a literal service name.
+
+Do not populate causalEvidence for items that are not both (a) application-level (APPLICATION_ERROR / API 5xx / ALB-backed) and (b) CONFIRMED_INCIDENT. For every other item, omit causalEvidence entirely (leave the key out); do not emit an empty or partial object.
+
+When the pivot applies, work through this playbook using the pre-gathered evidence and any additional tool calls your remaining budget allows:
+
+1. Failure concentration: from the ALB access-log breakdown and application log breakdown, determine whether 5xx responses concentrate by endpoint/path, HTTP method, status code, a model/resource id embedded in the path (e.g. /v1/models/{id}/predict), or CloudWatch @logStream. Report one failureConcentration entry per dimension the logs actually support, with the top concentrating value and its share of failures (0.0-1.0) when computable. Never fabricate a dimension the logs do not carry — omit it and record the gap in evidenceMissing instead (e.g. "endpoint dimension not present in logs").
+2. First-bad timestamp: use the pre-gathered first-bad-log-timestamp evidence (grouped by @logStream) to set firstBadTimestamp.value and firstBadTimestamp.source. If no bad event is found in the window, set value to null and confidence to "unknown", and record the gap in evidenceMissing.
+3. Adjacent error logs: use the pre-gathered error-context sample to explain WHY the endpoint failed (exception, timeout, dependency name), not just which endpoint failed.
+4. Change correlation: inspect any pre-gathered CloudTrail deploy/config change evidence for the affected service(s). A deploy, configuration, or runtime event counts as correlatesWithFirstBad=true only if its timestamp falls within +/- 15 minutes of firstBadTimestamp.value; otherwise set it false. If no change-event evidence is available, record "change correlation unavailable: <reason>" in evidenceMissing rather than leaving it silently empty.
+5. Task health: use the pre-gathered ECS service events (deployment state, stopped-task reasons, exit codes, OOM kills, failed health checks) to set taskHealth.
+6. Resource saturation: use any pre-gathered CPU/Memory utilization metrics for the service to set resourceSaturation. If saturation metrics were not resolvable, set status "unknown" and record the gap in evidenceMissing.
+7. Dependency health: if affected_services or suspected_causes name a downstream dependency (database, cache, queue, another internal service), use that dependency's own pre-gathered evidence (or a targeted tool call if budget allows) to set dependencyHealth. If no dependency is named or resolvable, set status "unknown" with a detail explaining that no dependency was identified — do not guess a dependency name.
+
+For every item in this list, record what you actually found in evidenceFound (as concrete, specific statements) and what you could not determine in evidenceMissing (naming why: not-checked, no-data, tool-unavailable, or permission). causalEvidence must still be emitted, with empty evidenceFound and populated evidenceMissing, when a confirmed application incident's causal tools return nothing — never omit the section just because evidence was thin.
+
+Set highestValueNextQuery to the single query that would close the highest-value remaining unknown in evidenceMissing, choosing deterministically by this priority order when multiple gaps exist: (1) dependency health, (2) change correlation, (3) first-bad timestamp, (4) failure concentration, (5) resource saturation, (6) task health. If nothing is missing, set a short "no further query needed" description with targetTool null and a brief rationale.
+
+Set mitigationConfidence ("high" | "medium" | "low" | "unknown") and mitigationConfidenceRationale by naming the specific causalEvidence items (e.g. concentration + change correlation) that justify the confidence level, or the missing evidence that caps it. requires_more_evidence_before_mitigation and mitigationConfidence must agree: do not set requires_more_evidence_before_mitigation=false while mitigationConfidence is "low" or "unknown".
+
 ## Identifiers
 
 - For each incident, copy incident_id into the investigation's incident_id.
@@ -71,7 +93,7 @@ If incidents[] and findings[] are both empty, return overall_assessment NO_ACTIO
 
 ## Output
 
-Return valid JSON only. Do not include markdown. Use this schema:
+Return valid JSON only. Do not include markdown. Use this schema. causalEvidence is optional: include it only for a CONFIRMED_INCIDENT item that is application-level (APPLICATION_ERROR / API 5xx / ALB-backed) per the Causal-evidence pivot section above; omit the key entirely for every other item.
 
 {
 "summary": "",
@@ -106,7 +128,20 @@ Return valid JSON only. Do not include markdown. Use this schema:
 "unresolved_evidence_requirements": [ { "type": "CUSTOM_METRIC_HISTORY | FIRST_BAD_LOG_TIMESTAMP | LAMBDA_FAILURE_SUMMARY | CHANGE_EVENT_DETAILS | DEPLOYMENT_PROVENANCE | ALARM_COVERAGE", "description": "", "tool_hint": "" } ],
 "recommended_next_investigation_steps": [ { "priority": 1, "action": "", "expected_signal": "" } ],
 "requires_more_evidence_before_mitigation": true,
-"possible_future_remediation": []
+"possible_future_remediation": [],
+"causalEvidence": {
+  "failureConcentration": [ { "dimension": "endpoint | method | statusCode | modelOrResourceId | logStream", "topValue": "", "share": 0.0, "note": "" } ],
+  "firstBadTimestamp": { "value": null, "source": null, "confidence": "high | medium | low | unknown" },
+  "changeCorrelation": [ { "type": "deploy | config | runtime", "reference": "", "timestamp": null, "correlatesWithFirstBad": false } ],
+  "taskHealth": { "status": "healthy | degraded | unknown | unavailable", "detail": "" },
+  "resourceSaturation": { "status": "healthy | degraded | unknown | unavailable", "detail": "" },
+  "dependencyHealth": { "status": "healthy | degraded | unknown | unavailable", "detail": "" },
+  "evidenceFound": [],
+  "evidenceMissing": [],
+  "highestValueNextQuery": { "description": "", "targetTool": null, "rationale": "" },
+  "mitigationConfidence": "high | medium | low | unknown",
+  "mitigationConfidenceRationale": ""
+}
 }
 ],
 "cross_cutting_observations": [],
@@ -120,6 +155,7 @@ Return valid JSON only. Do not include markdown. Use this schema:
 - Set requires_more_evidence_before_mitigation=false ONLY for CONFIRMED_INCIDENT items whose root cause is supported by gathered evidence. A repeated application error is a proximate failure, not a root cause, unless deployment/configuration/schema/API-contract evidence explains why it started; otherwise keep this true and name the missing root-cause evidence.
 - You MAY raise overall_severity above the Step 1 overall_severity when findings warrant it.
 - Emit one investigations[] entry per Step 1 incident and finding.
+- For a confirmed application-level incident, the final recommendation must state whether mitigation confidence is high enough via causalEvidence.mitigationConfidence, and mitigationConfidenceRationale must name the specific causal-evidence items (or gaps) that justify it. Never derive the causal-evidence pivot from a literal service name; derive targets only from affected_services and the pre-gathered evidence for those services.
 
 ## Step 1 Input
 

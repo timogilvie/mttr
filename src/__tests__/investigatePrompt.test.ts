@@ -120,4 +120,63 @@ describe('investigatePrompt', () => {
     expect(prompt).toContain('Do not fabricate');
     expect(prompt).toContain('Preserve service names exactly');
   });
+
+  it('instructs the causal-evidence pivot for confirmed application-level incidents, gated generically', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('Causal-evidence pivot for confirmed application errors');
+    expect(prompt).toContain('does NOT stop at symptom corroboration');
+    expect(prompt).toContain('CONFIRMED_INCIDENT');
+    expect(prompt).toContain('never key this behavior off a literal service name');
+    expect(prompt).toContain('causalEvidence');
+  });
+
+  it('instructs the failure-concentration dimensions without fabrication', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('endpoint/path, HTTP method, status code');
+    expect(prompt).toContain('model/resource id embedded in the path');
+    expect(prompt).toContain('@logStream');
+    expect(prompt).toContain('Never fabricate a dimension the logs do not carry');
+  });
+
+  it('instructs the 15-minute change-correlation rule', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('+/- 15 minutes of firstBadTimestamp.value');
+    expect(prompt).toContain('correlatesWithFirstBad=true');
+  });
+
+  it('instructs a deterministic highest-value-next-query priority order', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('highestValueNextQuery');
+    expect(prompt).toContain(
+      '(1) dependency health, (2) change correlation, (3) first-bad timestamp, (4) failure concentration, (5) resource saturation, (6) task health'
+    );
+  });
+
+  it('instructs mitigation-confidence reporting that names the justifying evidence', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('mitigationConfidence');
+    expect(prompt).toContain('mitigationConfidenceRationale');
+    expect(prompt).toContain(
+      'requires_more_evidence_before_mitigation and mitigationConfidence must agree'
+    );
+  });
+
+  it('emits an optional causalEvidence block in the output schema', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('"causalEvidence"');
+    expect(prompt).toContain('"failureConcentration"');
+    expect(prompt).toContain('"firstBadTimestamp"');
+    expect(prompt).toContain('"changeCorrelation"');
+    expect(prompt).toContain('"taskHealth"');
+    expect(prompt).toContain('"resourceSaturation"');
+    expect(prompt).toContain('"dependencyHealth"');
+    expect(prompt).toContain('"highestValueNextQuery"');
+    expect(prompt).toContain('causalEvidence is optional');
+  });
 });

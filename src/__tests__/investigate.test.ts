@@ -614,6 +614,147 @@ describe('investigate stage', () => {
     expect(mockLoop.mock.calls[0]![0].prompt).toContain('error-context sample');
   });
 
+  it('pre-gathers ECS resource saturation and deploy/config change correlation for confirmed application-error incidents, resolved generically from the ECS service-events tool output', async () => {
+    mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+    mockMetricsAndAlarms.mockResolvedValue(
+      'Metric datapoints (2):\n' +
+        '2026-06-05T14:18:00.000Z: Sum=2 Count\n' +
+        '2026-06-05T15:48:00.000Z: Sum=3 Count'
+    );
+    mockEcsServiceEvents.mockResolvedValue(
+      'Service data-pipeline-api (cluster hokusai-development): status=ACTIVE'
+    );
+    mockCloudTrailLookup.mockResolvedValue(
+      'Found 1 event(s):\neventName=UpdateService, eventTime=2026-06-05T14:10:00.000Z'
+    );
+
+    const result = await investigateStage.run(mockInput, mockConfig, fiveXxClassification);
+
+    expect(result.status).toBe('success');
+    expect(mockMetricsAndAlarms).toHaveBeenCalledWith(
+      expect.objectContaining({
+        namespace: 'AWS/ECS',
+        metric_name: 'CPUUtilization',
+        dimensions: [
+          { name: 'ServiceName', value: 'data-pipeline-api' },
+          { name: 'ClusterName', value: 'hokusai-development' },
+        ],
+        stat: 'Average',
+      }),
+      expect.anything()
+    );
+    expect(mockMetricsAndAlarms).toHaveBeenCalledWith(
+      expect.objectContaining({
+        namespace: 'AWS/ECS',
+        metric_name: 'MemoryUtilization',
+        dimensions: [
+          { name: 'ServiceName', value: 'data-pipeline-api' },
+          { name: 'ClusterName', value: 'hokusai-development' },
+        ],
+        stat: 'Average',
+      }),
+      expect.anything()
+    );
+    expect(mockCloudTrailLookup).toHaveBeenCalledWith(
+      expect.objectContaining({
+        resource_name: 'data-pipeline-api',
+        event_names: expect.arrayContaining(['UpdateService', 'RegisterTaskDefinition']),
+      }),
+      expect.anything()
+    );
+    expect(mockLoop.mock.calls[0]![0].prompt).toContain(
+      'ECS resource saturation (CPU/Memory) for data-pipeline-api'
+    );
+    expect(mockLoop.mock.calls[0]![0].prompt).toContain(
+      'CloudTrail ECS service changes for data-pipeline-api'
+    );
+  });
+
+  it('resolves ECS causal-evidence targets generically for a different, unregistered service with no literal service-name branching', async () => {
+    mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+    mockMetricsAndAlarms.mockResolvedValue('No metric datapoints in the requested window.');
+    mockEcsServiceEvents.mockResolvedValue(
+      'Service another-widget-service (cluster hokusai-production): status=ACTIVE'
+    );
+
+    const firstIncident = fiveXxClassification.incidents[0]!;
+    const otherServiceClassification: ClassificationResult = {
+      ...fiveXxClassification,
+      incidents: [
+        {
+          ...firstIncident,
+          incident_id: 'mandatory-alb-5xx-another-widget-service-0',
+          title: 'ALB 5xx responses for another-widget-service',
+          affected_services: ['another-widget-service'],
+        },
+      ],
+    };
+
+    const result = await investigateStage.run(mockInput, mockConfig, otherServiceClassification);
+
+    expect(result.status).toBe('success');
+    expect(mockMetricsAndAlarms).toHaveBeenCalledWith(
+      expect.objectContaining({
+        namespace: 'AWS/ECS',
+        metric_name: 'CPUUtilization',
+        dimensions: [
+          { name: 'ServiceName', value: 'another-widget-service' },
+          { name: 'ClusterName', value: 'hokusai-production' },
+        ],
+      }),
+      expect.anything()
+    );
+    expect(mockCloudTrailLookup).toHaveBeenCalledWith(
+      expect.objectContaining({ resource_name: 'another-widget-service' }),
+      expect.anything()
+    );
+  });
+
+  it('degrades gracefully when the ECS deploy/config change-correlation lookup fails, without failing the stage', async () => {
+    mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+    mockMetricsAndAlarms.mockResolvedValue('No metric datapoints in the requested window.');
+    mockEcsServiceEvents.mockResolvedValue(
+      'Service data-pipeline-api (cluster hokusai-development): status=ACTIVE'
+    );
+    mockCloudTrailLookup.mockRejectedValue(new Error('CloudTrail throttled'));
+
+    const result = await investigateStage.run(mockInput, mockConfig, fiveXxClassification);
+
+    expect(result.status).toBe('success');
+    expect(mockLoop.mock.calls[0]![0].prompt).toContain(
+      'CloudTrail ECS service changes for data-pipeline-api'
+    );
+    expect(mockLoop.mock.calls[0]![0].prompt).toContain('CloudTrail throttled');
+  });
+
+  it('skips ECS causal-evidence follow-up when the service cannot be resolved from ECS service events', async () => {
+    mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+    mockEcsServiceEvents.mockResolvedValue('No ECS services found matching "data-pipeline-api".');
+
+    const result = await investigateStage.run(mockInput, mockConfig, fiveXxClassification);
+
+    expect(result.status).toBe('success');
+    expect(mockCloudTrailLookup).not.toHaveBeenCalled();
+    expect(mockMetricsAndAlarms).not.toHaveBeenCalledWith(
+      expect.objectContaining({ namespace: 'AWS/ECS' }),
+      expect.anything()
+    );
+  });
+
+  it('does not gather ECS resource-saturation or change-correlation evidence for non-application-error findings', async () => {
+    mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+
+    const result = await investigateStage.run(mockInput, mockConfig, classificationWithFinding);
+
+    expect(result.status).toBe('success');
+    expect(mockEcsServiceEvents).not.toHaveBeenCalled();
+    expect(mockCloudTrailLookup).not.toHaveBeenCalled();
+    expect(mockMetricsAndAlarms).not.toHaveBeenCalledWith(
+      expect.objectContaining({ namespace: 'AWS/ECS' }),
+      expect.anything()
+    );
+  });
+
   it('pre-gathers metric discovery, alarm coverage, extended metric history, and a runtime activity sample for observability incidents', async () => {
     mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
     const observabilityClassification: ClassificationResult = {
