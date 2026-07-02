@@ -75,6 +75,68 @@ const PriorityItemSchema = z.object({
   reason: z.string(),
 });
 
+const FailureConcentrationDimensionSchema = z.enum([
+  'endpoint',
+  'method',
+  'statusCode',
+  'resourceId',
+  'logStream',
+]);
+
+const FailureConcentrationValueSchema = z.object({
+  value: z.string(),
+  count: z.number(),
+});
+
+const FailureConcentrationSchema = z.object({
+  dimension: FailureConcentrationDimensionSchema,
+  values: z.array(FailureConcentrationValueSchema),
+});
+
+const ChangeEventTypeSchema = z.enum(['deploy', 'config', 'runtime', 'other']);
+
+const ChangeCorrelationEventSchema = z.object({
+  type: ChangeEventTypeSchema,
+  timestamp: z.string(),
+  description: z.string(),
+});
+
+const TaskHealthFindingSchema = z.object({
+  summary: z.string(),
+  stopped_task_count: z.number().optional(),
+  details: z.array(z.string()).default([]),
+});
+
+const ResourceSaturationFindingSchema = z.object({
+  resource: z.string(),
+  metric: z.string(),
+  summary: z.string(),
+});
+
+const DependencyHealthStatusSchema = z.enum(['healthy', 'degraded', 'unknown']);
+
+const DependencyHealthFindingSchema = z.object({
+  dependency: z.string(),
+  status: DependencyHealthStatusSchema,
+  summary: z.string(),
+});
+
+const CausalEvidenceSchema = z.object({
+  performed: z.boolean(),
+  failure_concentration: FailureConcentrationSchema.optional(),
+  first_bad_timestamp: z.string().nullable().optional(),
+  first_bad_source: z.string().optional(),
+  change_correlation: z.array(ChangeCorrelationEventSchema).default([]),
+  task_health: TaskHealthFindingSchema.optional(),
+  resource_saturation: z.array(ResourceSaturationFindingSchema).default([]),
+  dependency_health: z.array(DependencyHealthFindingSchema).default([]),
+  found: z.array(z.string()).default([]),
+  missing: z.array(z.string()).default([]),
+  next_highest_value_query: z.string().default(''),
+});
+
+const MitigationConfidenceSchema = z.enum(['high', 'medium', 'low']);
+
 const InvestigationSchema = z.object({
   incident_id: z.string(),
   title: z.string(),
@@ -94,6 +156,9 @@ const InvestigationSchema = z.object({
   recommended_next_investigation_steps: z.array(NextInvestigationStepSchema),
   requires_more_evidence_before_mitigation: z.boolean(),
   possible_future_remediation: z.array(z.string()),
+  causal_evidence: CausalEvidenceSchema.optional(),
+  mitigation_confidence: MitigationConfidenceSchema.optional(),
+  confidence_justification: z.string().optional(),
 });
 
 const InvestigationResultSchema = z.object({

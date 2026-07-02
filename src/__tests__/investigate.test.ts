@@ -614,6 +614,260 @@ describe('investigate stage', () => {
     expect(mockLoop.mock.calls[0]![0].prompt).toContain('error-context sample');
   });
 
+  describe('causal-evidence pivot for confirmed application errors', () => {
+    it('gathers resource-saturation metrics and deployment-change correlation for a known ECS-backed service', async () => {
+      mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+      mockMetricsAndAlarms.mockResolvedValue(
+        'Metric datapoints (2):\n' +
+          '2026-06-05T14:18:00.000Z: Sum=2 Count\n' +
+          '2026-06-05T15:48:00.000Z: Sum=3 Count'
+      );
+
+      const result = await investigateStage.run(mockInput, mockConfig, fiveXxClassification);
+
+      expect(result.status).toBe('success');
+
+      const spikeWindow = {
+        start_time: '2026-06-05T14:03:00.000Z',
+        end_time: '2026-06-05T16:03:00.000Z',
+      };
+
+      expect(mockMetricsAndAlarms).toHaveBeenCalledWith(
+        expect.objectContaining({
+          namespace: 'AWS/ECS',
+          metric_name: 'CPUUtilization',
+          dimensions: [
+            { name: 'ClusterName', value: 'hokusai-development' },
+            { name: 'ServiceName', value: 'hokusai-api-development' },
+          ],
+          ...spikeWindow,
+        }),
+        expect.anything()
+      );
+      expect(mockMetricsAndAlarms).toHaveBeenCalledWith(
+        expect.objectContaining({
+          namespace: 'AWS/ECS',
+          metric_name: 'MemoryUtilization',
+          dimensions: [
+            { name: 'ClusterName', value: 'hokusai-development' },
+            { name: 'ServiceName', value: 'hokusai-api-development' },
+          ],
+          ...spikeWindow,
+        }),
+        expect.anything()
+      );
+      expect(mockCloudTrailLookup).toHaveBeenCalledWith(
+        expect.objectContaining({
+          resource_name: 'hokusai-api-development',
+          event_names: expect.arrayContaining(['UpdateService', 'RegisterTaskDefinition']),
+        }),
+        expect.anything()
+      );
+
+      const prompt = mockLoop.mock.calls[0]![0].prompt;
+      expect(prompt).toContain('resource saturation CPUUtilization for hokusai-api-development');
+      expect(prompt).toContain('CloudTrail deployment changes for hokusai-api-development');
+    });
+
+    it('resolves ECS targets generically from tool evidence for a service outside the known registry', async () => {
+      mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+      mockEcsServiceEvents.mockResolvedValue(
+        'Service checkout-service (cluster checkout-cluster): status=ACTIVE'
+      );
+      mockDiscoverLogGroups.mockResolvedValue(
+        'Found 1 candidate log group(s):\n' + 'logGroupName=/ecs/checkout-service, storedBytes=4096'
+      );
+
+      const genericClassification: ClassificationResult = {
+        summary: 'Widget checkout 5xx detected.',
+        overall_severity: 'HIGH',
+        report_context: {
+          window_start: '2026-06-05T11:35:04.881Z',
+          window_end: '2026-06-06T11:35:04.881Z',
+        },
+        incidents: [
+          {
+            incident_id: 'mandatory-5xx-checkout-service-0',
+            title: '5xx responses for checkout-service',
+            classification: 'APPLICATION_ERROR',
+            severity: 'HIGH',
+            confidence: 0.9,
+            affected_services: ['checkout-service'],
+            evidence: ['Health report shows elevated 5xx responses.'],
+            signals: { alarms: [], metrics: ['5xx responses elevated'], logs: [] },
+            suspected_causes: ['Application errors.'],
+            investigation_plan: {
+              priority: 1,
+              estimated_user_impact: 'PARTIAL',
+              first_actions: [],
+              questions_to_answer: [],
+              suggested_cloudwatch_queries: [],
+            },
+            recommended_next_stage: 'INVESTIGATE',
+          },
+        ],
+        findings: [],
+      };
+
+      const result = await investigateStage.run(mockInput, mockConfig, genericClassification);
+
+      expect(result.status).toBe('success');
+      expect(mockMetricsAndAlarms).toHaveBeenCalledWith(
+        expect.objectContaining({
+          namespace: 'AWS/ECS',
+          metric_name: 'CPUUtilization',
+          dimensions: [
+            { name: 'ClusterName', value: 'checkout-cluster' },
+            { name: 'ServiceName', value: 'checkout-service' },
+          ],
+        }),
+        expect.anything()
+      );
+      expect(mockCloudTrailLookup).toHaveBeenCalledWith(
+        expect.objectContaining({ resource_name: 'checkout-service' }),
+        expect.anything()
+      );
+    });
+
+    it('records a resolution gap when no ECS service can be matched, without crashing', async () => {
+      mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+      mockEcsServiceEvents.mockResolvedValue('No ECS services found matching "orphan-service".');
+
+      const orphanClassification: ClassificationResult = {
+        summary: 'Orphan service 5xx detected.',
+        overall_severity: 'HIGH',
+        report_context: {
+          window_start: '2026-06-05T11:35:04.881Z',
+          window_end: '2026-06-06T11:35:04.881Z',
+        },
+        incidents: [
+          {
+            incident_id: 'mandatory-5xx-orphan-service-0',
+            title: '5xx responses for orphan-service',
+            classification: 'APPLICATION_ERROR',
+            severity: 'HIGH',
+            confidence: 0.9,
+            affected_services: ['orphan-service'],
+            evidence: ['Health report shows elevated 5xx responses.'],
+            signals: { alarms: [], metrics: ['5xx responses elevated'], logs: [] },
+            suspected_causes: ['Application errors.'],
+            investigation_plan: {
+              priority: 1,
+              estimated_user_impact: 'PARTIAL',
+              first_actions: [],
+              questions_to_answer: [],
+              suggested_cloudwatch_queries: [],
+            },
+            recommended_next_stage: 'INVESTIGATE',
+          },
+        ],
+        findings: [],
+      };
+
+      const result = await investigateStage.run(mockInput, mockConfig, orphanClassification);
+
+      expect(result.status).toBe('success');
+      expect(
+        mockMetricsAndAlarms.mock.calls.some(
+          ([args]) => (args as { namespace?: string }).namespace === 'AWS/ECS'
+        )
+      ).toBe(false);
+      expect(mockCloudTrailLookup).not.toHaveBeenCalled();
+      const prompt = mockLoop.mock.calls[0]![0].prompt;
+      expect(prompt).toContain('No ECS cluster/service resource could be resolved for orphan-service');
+    });
+
+    it('falls back to the service-resource registry for ALB targeting when Step 1 omits the ALB metric signal', async () => {
+      mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+
+      const noMetricClassification: ClassificationResult = {
+        summary: 'data-pipeline-api 5xx detected without an ALB metric signal.',
+        overall_severity: 'HIGH',
+        report_context: {
+          window_start: '2026-06-05T11:35:04.881Z',
+          window_end: '2026-06-06T11:35:04.881Z',
+        },
+        incidents: [
+          {
+            incident_id: 'mandatory-5xx-data-pipeline-api-1',
+            title: '5xx responses for data-pipeline-api',
+            classification: 'APPLICATION_ERROR',
+            severity: 'HIGH',
+            confidence: 0.9,
+            affected_services: ['data-pipeline-api'],
+            evidence: ['Health report shows elevated 5xx responses.'],
+            signals: { alarms: [], metrics: ['5xx responses elevated'], logs: [] },
+            suspected_causes: ['Application errors.'],
+            investigation_plan: {
+              priority: 1,
+              estimated_user_impact: 'PARTIAL',
+              first_actions: [],
+              questions_to_answer: [],
+              suggested_cloudwatch_queries: [],
+            },
+            recommended_next_stage: 'INVESTIGATE',
+          },
+        ],
+        findings: [],
+      };
+
+      const result = await investigateStage.run(mockInput, mockConfig, noMetricClassification);
+
+      expect(result.status).toBe('success');
+      expect(mockAlbAccessLogs).toHaveBeenCalledWith(
+        expect.objectContaining({
+          load_balancer: 'app/hokusai-registry-development/78840d73e3e9652e',
+          status_class: '5xx',
+        }),
+        expect.anything()
+      );
+    });
+
+    it('does not run the causal-evidence pivot for non-application (observability) incidents', async () => {
+      mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
+      const observabilityOnlyClassification: ClassificationResult = {
+        summary: 'Detector liveness missing.',
+        overall_severity: 'HIGH',
+        report_context: {
+          window_start: '2026-06-05T11:35:04.881Z',
+          window_end: '2026-06-06T11:35:04.881Z',
+        },
+        incidents: [
+          {
+            incident_id: 'mandatory-missing-detector-liveness-0',
+            title: 'No detector liveness datapoints',
+            classification: 'OBSERVABILITY_FAILURE',
+            severity: 'HIGH',
+            confidence: 0.95,
+            affected_services: ['deltaone-anomaly-detection'],
+            evidence: ['No datapoints received from the detector liveness metric in this window.'],
+            signals: { alarms: [], metrics: ['Detector liveness metric has zero datapoints.'], logs: [] },
+            suspected_causes: ['Detector runtime or metric publication path broken.'],
+            investigation_plan: {
+              priority: 2,
+              estimated_user_impact: 'SIGNIFICANT',
+              first_actions: [],
+              questions_to_answer: [],
+              suggested_cloudwatch_queries: [],
+            },
+            recommended_next_stage: 'INVESTIGATE',
+          },
+        ],
+        findings: [],
+      };
+
+      const result = await investigateStage.run(mockInput, mockConfig, observabilityOnlyClassification);
+
+      expect(result.status).toBe('success');
+      expect(
+        mockMetricsAndAlarms.mock.calls.some(
+          ([args]) => (args as { namespace?: string }).namespace === 'AWS/ECS'
+        )
+      ).toBe(false);
+      expect(mockCloudTrailLookup).not.toHaveBeenCalled();
+    });
+  });
+
   it('pre-gathers metric discovery, alarm coverage, extended metric history, and a runtime activity sample for observability incidents', async () => {
     mockLoop.mockResolvedValue(loopResult(validInvestigationJson));
     const observabilityClassification: ClassificationResult = {

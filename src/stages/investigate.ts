@@ -24,6 +24,7 @@ import {
 import { eventBridgeRuleTool } from '../tools/eventbridge.js';
 import { cloudTrailLookupTool } from '../tools/cloudtrail.js';
 import { serviceSearchTerms } from '../tools/serviceNames.js';
+import { resolveServiceResource } from '../tools/serviceResources.js';
 import { parseInvestigation } from '../validation/investigationSchema.js';
 import { stripMarkdownFences } from '../llm/json.js';
 import type { Finding, Incident, IncidentClassification } from '../types.js';
@@ -404,6 +405,19 @@ const LAMBDA_CHANGE_EVENTS = [
   'TagResource',
 ];
 const EVENTBRIDGE_CHANGE_EVENTS = ['PutRule', 'PutTargets', 'EnableRule', 'DisableRule', 'TagResource'];
+const ECS_CHANGE_EVENTS = [
+  'CreateService',
+  'UpdateService',
+  'DeleteService',
+  'RegisterTaskDefinition',
+  'RunTask',
+  'StopTask',
+];
+const RESOURCE_SATURATION_METRICS: Array<{ metric_name: string; stat: 'Average' | 'Maximum' }> = [
+  { metric_name: 'CPUUtilization', stat: 'Average' },
+  { metric_name: 'MemoryUtilization', stat: 'Average' },
+];
+const MAX_CAUSAL_ECS_TARGETS = 2;
 
 interface SpikeWindow {
   start: string;
@@ -948,6 +962,136 @@ async function gatherEventBridgeRootCauseEvidence(
   return sections;
 }
 
+interface CausalEcsTarget {
+  cluster: string;
+  serviceName: string;
+}
+
+const ECS_EVENTS_SERVICE_LINE_RE = /^Service ([A-Za-z0-9_.:/-]+) \(cluster ([A-Za-z0-9_.:/-]+)\):/gm;
+
+/**
+ * Recover the ECS cluster/service names get_ecs_service_events actually
+ * matched from its formatted evidence text. This lets the causal-evidence
+ * pivot target resource-saturation metrics and CloudTrail change lookups
+ * generically for any service the ECS name search resolved, without relying
+ * on a static per-service registry.
+ */
+function extractEcsServiceMatches(ecsEvidenceText: string): CausalEcsTarget[] {
+  const matches: CausalEcsTarget[] = [];
+  for (const match of ecsEvidenceText.matchAll(ECS_EVENTS_SERVICE_LINE_RE)) {
+    const serviceName = match[1];
+    const clusterName = match[2];
+    if (serviceName && clusterName) {
+      matches.push({ serviceName, cluster: clusterName });
+    }
+  }
+  return matches;
+}
+
+/**
+ * Resolve the ECS cluster/service target(s) for the causal-evidence pivot.
+ * Prefers the generic service-resource registry (serviceResources.ts), which
+ * also covers services identified only by alias, and falls back to parsing
+ * the actual get_ecs_service_events output so unregistered services still
+ * resolve a target deterministically.
+ */
+function resolveCausalEcsTargets(service: string, ecsEvidenceText: string): CausalEcsTarget[] {
+  const registryTargets = resolveServiceResource(service)
+    .ecsServices.filter((candidate): candidate is { cluster: string; serviceName: string } =>
+      Boolean(candidate.cluster)
+    )
+    .map((candidate) => ({ cluster: candidate.cluster, serviceName: candidate.serviceName }));
+
+  const targets = registryTargets.length > 0 ? registryTargets : extractEcsServiceMatches(ecsEvidenceText);
+  return targets.slice(0, MAX_CAUSAL_ECS_TARGETS);
+}
+
+/**
+ * Second-level causal-evidence gathering for a confirmed application-error
+ * (API 5xx / ALB-backed) incident: resource saturation and deployment/config
+ * change correlation for the resolved ECS target(s). Generic across services
+ * — targets are resolved via resolveCausalEcsTargets, never a literal service
+ * name. Every tool call degrades gracefully (via runEvidenceTool /
+ * runRequiredEvidenceTool) so a missing or failing source is recorded as
+ * evidence text rather than aborting the investigation.
+ */
+async function gatherApplicationCausalEvidence(
+  id: string,
+  kind: InvestigationItem['kind'],
+  service: string,
+  ecsEvidenceText: string,
+  windowArgs: { start_time: string; end_time: string } | { lookback_minutes: number },
+  windowLabel: string,
+  ctx: ToolContext,
+  tracker: EvidenceRequirementTracker
+): Promise<string[]> {
+  const sections: string[] = [];
+  const targets = resolveCausalEcsTargets(service, ecsEvidenceText);
+
+  if (targets.length === 0) {
+    sections.push(
+      `### ${id} ${kind}: causal-evidence resource resolution for ${service}\n` +
+        `No ECS cluster/service resource could be resolved for ${service} via the service-resource registry or ECS service-event evidence; resource saturation and deployment-change correlation cannot be queried.`
+    );
+    return sections;
+  }
+
+  const changeWindow = rootCauseChangeWindow(ctx);
+
+  for (const target of targets) {
+    for (const metric of RESOURCE_SATURATION_METRICS) {
+      sections.push(
+        await runEvidenceTool(
+          `### ${id} ${kind}: resource saturation ${metric.metric_name} for ${target.serviceName} (cluster ${target.cluster}, ${windowLabel})`,
+          () =>
+            metricsAndAlarmsTool.handler(
+              {
+                namespace: 'AWS/ECS',
+                metric_name: metric.metric_name,
+                dimensions: [
+                  { name: 'ClusterName', value: target.cluster },
+                  { name: 'ServiceName', value: target.serviceName },
+                ],
+                stat: metric.stat,
+                ...windowArgs,
+              },
+              ctx
+            )
+        )
+      );
+    }
+
+    if (changeWindow) {
+      const changeDetailsRequirement = tracker.require(
+        id,
+        'CHANGE_EVENT_DETAILS',
+        target.serviceName,
+        `Inspect deployment/config change events for ${target.serviceName} around the failure window.`,
+        'Use lookup_cloudtrail_events for ECS deployment/task-definition change event details.'
+      );
+      sections.push(
+        await runRequiredEvidenceTool(
+          `### ${id} ${kind}: CloudTrail deployment changes for ${target.serviceName} (72h before report window through window end)`,
+          changeDetailsRequirement,
+          tracker,
+          () =>
+            cloudTrailLookupTool.handler(
+              {
+                resource_name: target.serviceName,
+                event_names: ECS_CHANGE_EVENTS,
+                ...changeWindow,
+                limit: 50,
+              },
+              ctx
+            )
+        )
+      );
+    }
+  }
+
+  return sections;
+}
+
 async function runEvidenceTool(label: string, action: () => Promise<string>): Promise<string> {
   try {
     const result = await action();
@@ -1057,12 +1201,21 @@ async function gatherStandardEvidence(
     const lambdaLogWindowLabel = spike ? windowLabel : 'report window';
 
     if (shouldQuery5xx) {
-      const albDimension = cloudwatchMetrics
+      const explicitAlbDimension = cloudwatchMetrics
         .filter((metric) => metric.namespace === 'AWS/ApplicationELB')
         .flatMap((metric) => metric.dimensions ?? [])
         .find((dimension) => dimension.name === 'LoadBalancer')?.value;
 
-      if (albDimension) {
+      // Fall back to the generic service-resource registry when Step 1 did not
+      // supply an explicit ALB metric signal, so the same 5xx drilldown works
+      // for any ALB-backed service, not only ones Classify instrumented.
+      const albTargets = explicitAlbDimension
+        ? [explicitAlbDimension]
+        : uniqueValues(
+            item.affected_services.map((service) => resolveServiceResource(service).albs[0]?.loadBalancer)
+          );
+
+      for (const albDimension of albTargets) {
         sections.push(
           await runEvidenceTool(
             `### ${id} ${kind}: ALB access-log 5xx breakdown for ${albDimension} (${windowLabel})`,
@@ -1083,13 +1236,13 @@ async function gatherStandardEvidence(
     for (const service of item.affected_services) {
       console.log(`[Investigate] Pre-gathering standard evidence for ${id} (${service})`);
 
+      let ecsEvidenceText = '';
       if (shouldQuery5xx) {
-        sections.push(
-          await runEvidenceTool(
-            `### ${id} ${kind}: ECS service events for ${service} (${windowLabel})`,
-            () => ecsServiceEventsTool.handler({ service_name: service, ...windowArgs }, ctx)
-          )
+        ecsEvidenceText = await runEvidenceTool(
+          `### ${id} ${kind}: ECS service events for ${service} (${windowLabel})`,
+          () => ecsServiceEventsTool.handler({ service_name: service, ...windowArgs }, ctx)
         );
+        sections.push(ecsEvidenceText);
       }
 
       if (shouldQueryObservability) {
@@ -1202,6 +1355,21 @@ async function gatherStandardEvidence(
         () => discoverLogGroupsTool.handler({ service_name: service, limit: 5 }, ctx)
       );
       sections.push(discovery);
+
+      if (shouldQuery5xx) {
+        sections.push(
+          ...(await gatherApplicationCausalEvidence(
+            id,
+            kind,
+            service,
+            `${discovery}\n${ecsEvidenceText}`,
+            windowArgs,
+            windowLabel,
+            ctx,
+            tracker
+          ))
+        );
+      }
 
       const logGroups = selectStandardLogGroups(discovery);
       if (logGroups.length === 0) {
