@@ -1,0 +1,28 @@
+{
+  "AlarmName": "hokusai-mlflow-development-service-health",
+  "AlarmDescription": "Composite service health check failing",
+  "AWSAccountId": "123456789012",
+  "AlarmConfigurationUpdatedTimestamp": "2026-07-02T08:00:00.000+0000",
+  "NewStateValue": "ALARM",
+  "NewStateReason": "Threshold Crossed",
+  "StateChangeTime": "2026-07-02T08:05:00.000+0000",
+  "Region": "US East (N. Virginia)",
+  "AlarmArn": "arn:aws:cloudwatch:us-east-1:123456789012:alarm:hokusai-mlflow-development-service-health",
+  "OldStateValue": "OK",
+  "OKActions": [],
+  "AlarmActions": ["arn:aws:sns:us-east-1:123456789012:mttr-alarm-triggers"],
+  "InsufficientDataActions": [],
+  "Trigger": {
+    "MetricName": "HealthyTaskCount",
+    "Namespace": "ECS/ContainerInsights",
+    "StatisticType": "Statistic",
+    "Statistic": "AVERAGE",
+    "Unit": null,
+    "Dimensions": [],
+    "Period": 60,
+    "EvaluationPeriods": 1,
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "TreatMissingData": "- TreatMissingData:                    missing"
+  }
+}

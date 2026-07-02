@@ -1,0 +1,31 @@
+{
+  "AlarmName": "hokusai-auth-development-task-health",
+  "AlarmDescription": "ECS task health check failing for hokusai-auth-development",
+  "AWSAccountId": "123456789012",
+  "AlarmConfigurationUpdatedTimestamp": "2026-07-02T10:00:00.000+0000",
+  "NewStateValue": "OK",
+  "NewStateReason": "Threshold Crossed: 1 datapoint [1.0] was not less than the threshold (1.0).",
+  "StateChangeTime": "2026-07-02T10:20:00.000+0000",
+  "Region": "US East (N. Virginia)",
+  "AlarmArn": "arn:aws:cloudwatch:us-east-1:123456789012:alarm:hokusai-auth-development-task-health",
+  "OldStateValue": "ALARM",
+  "OKActions": [],
+  "AlarmActions": ["arn:aws:sns:us-east-1:123456789012:mttr-alarm-triggers"],
+  "InsufficientDataActions": [],
+  "Trigger": {
+    "MetricName": "HealthyTaskCount",
+    "Namespace": "ECS/ContainerInsights",
+    "StatisticType": "Statistic",
+    "Statistic": "AVERAGE",
+    "Unit": null,
+    "Dimensions": [
+      { "value": "hokusai-auth-development", "name": "ServiceName" },
+      { "value": "hokusai-development", "name": "ClusterName" }
+    ],
+    "Period": 60,
+    "EvaluationPeriods": 1,
+    "ComparisonOperator": "LessThanThreshold",
+    "Threshold": 1,
+    "TreatMissingData": "- TreatMissingData:                    missing"
+  }
+}
