@@ -27,6 +27,13 @@ import {
   type AgentStateRepository,
 } from './state/repository.js';
 import type { IncidentTransition } from './state/transitions.js';
+import {
+  startAlarmTriggerConsumer,
+  type AlarmTriggerBatch,
+  type AlarmTriggerConsumerHandle,
+  type TriggerInvestigationLauncher,
+  type TriggerLaunchResult,
+} from './alarm/triggerConsumer.js';
 
 function remapIncidentReference(value: string | null | undefined, idMap: Map<string, string>): string | null | undefined {
   if (!value) {
@@ -75,10 +82,30 @@ export class Orchestrator {
   private investigateInFlight = false;
   private readonly config: Config;
   private readonly stateRepository: AgentStateRepository;
+  private triggerConsumerHandle: AlarmTriggerConsumerHandle | null = null;
 
   constructor(config: Config) {
     this.config = structuredClone(config);
     this.stateRepository = createAgentStateRepository(this.config);
+  }
+
+  /** Public read of the single-flight investigate guard — the T5 consumer's concurrency seam. */
+  get investigateBusy(): boolean {
+    return this.investigateInFlight;
+  }
+
+  /**
+   * T6 out-of-band entry point (design §5.4): builds a ClassificationResult-shaped payload from
+   * the coalesced alarm-trigger batch and drives the existing
+   * runInvestigate → runDecide → runSelectedResponseStage chain, recording `trigger_source =
+   * 'alarm'`. Not implemented in T5 — the feature ships dark (`ALARM_WEBHOOK_ENABLED=false`), so
+   * this placeholder never executes in practice; T5 tests inject a fake launcher instead.
+   */
+  async runInvestigationFromTrigger(_batch: AlarmTriggerBatch): Promise<TriggerLaunchResult> {
+    return {
+      status: 'error',
+      message: 'trigger investigation entry point not implemented (T6)',
+    };
   }
 
   private classificationEvents(
@@ -225,6 +252,21 @@ export class Orchestrator {
     this.intervalId = setInterval(() => {
       this.tick();
     }, this.config.monitoring.intervalMs);
+
+    if (this.config.alarm.webhook.enabled && !this.triggerConsumerHandle) {
+      const launcher: TriggerInvestigationLauncher = {
+        isBusy: () => this.investigateBusy,
+        launch: (batch) => this.runInvestigationFromTrigger(batch),
+      };
+      this.triggerConsumerHandle = startAlarmTriggerConsumer({
+        config: this.config,
+        repository: this.stateRepository,
+        launcher,
+      });
+      console.log(
+        `[Orchestrator] Alarm trigger consumer started (poll ${this.config.alarm.trigger.pollMs}ms)`
+      );
+    }
   }
 
   stop(): void {
@@ -232,6 +274,10 @@ export class Orchestrator {
       clearInterval(this.intervalId);
       this.intervalId = null;
       console.log('[Orchestrator] Stopped monitoring loop');
+    }
+    if (this.triggerConsumerHandle) {
+      this.triggerConsumerHandle.stop();
+      this.triggerConsumerHandle = null;
     }
     void this.stateRepository.close?.();
   }

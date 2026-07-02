@@ -108,6 +108,19 @@ export interface AgentStateRepository {
   hasAlert?(dedupeKey: string): Promise<boolean>;
   recordAlertSent?(alert: AlertRecordInput): Promise<void>;
   close?(): Promise<void>;
+
+  // Alarm trigger queue (T5) — optional; only implemented for the Postgres backend.
+  reclaimStaleClaimedTriggers?(olderThanMs: number): Promise<number>;
+  countPendingAlarmTriggers?(): Promise<number>;
+  claimPendingAlarmTriggers?(): Promise<AlarmTriggerRow[]>;
+  deferAlarmTriggers?(ids: string[]): Promise<void>;
+  completeAlarmTriggers?(ids: string[], runId: string | null): Promise<void>;
+  releaseAlarmTriggers?(ids: string[]): Promise<void>;
+  failAlarmTriggers?(ids: string[]): Promise<void>;
+  findRecentLaunchForSpecKey?(
+    specKey: string,
+    withinMs: number
+  ): Promise<{ runId: string } | null>;
 }
 
 export class FileAgentStateRepository implements AgentStateRepository {
@@ -176,6 +189,41 @@ export class FileAgentStateRepository implements AgentStateRepository {
 
   async recordAlertSent(alert: AlertRecordInput): Promise<void> {
     this.sentAlertKeys.add(alert.dedupeKey);
+  }
+
+  async reclaimStaleClaimedTriggers(_olderThanMs: number): Promise<number> {
+    return 0;
+  }
+
+  async countPendingAlarmTriggers(): Promise<number> {
+    return 0;
+  }
+
+  async claimPendingAlarmTriggers(): Promise<AlarmTriggerRow[]> {
+    return [];
+  }
+
+  async deferAlarmTriggers(_ids: string[]): Promise<void> {
+    return;
+  }
+
+  async completeAlarmTriggers(_ids: string[], _runId: string | null): Promise<void> {
+    return;
+  }
+
+  async releaseAlarmTriggers(_ids: string[]): Promise<void> {
+    return;
+  }
+
+  async failAlarmTriggers(_ids: string[]): Promise<void> {
+    return;
+  }
+
+  async findRecentLaunchForSpecKey(
+    _specKey: string,
+    _withinMs: number
+  ): Promise<{ runId: string } | null> {
+    return null;
   }
 }
 
@@ -677,6 +725,126 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
         JSON.stringify(sanitizeForStorage(alert.payload)),
       ]
     );
+  }
+
+  async reclaimStaleClaimedTriggers(olderThanMs: number): Promise<number> {
+    const result = await this.client.query(
+      `UPDATE alarm_triggers
+       SET status = 'pending', claimed_at = null
+       WHERE status = 'claimed'
+         AND claimed_at < now() - make_interval(secs => $1::double precision / 1000)`,
+      [olderThanMs]
+    );
+    return result.rowCount ?? 0;
+  }
+
+  async countPendingAlarmTriggers(): Promise<number> {
+    const result = await this.client.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+       FROM alarm_triggers
+       WHERE status = 'pending' AND new_state IN ('ALARM', 'INSUFFICIENT_DATA')`
+    );
+    return Number(result.rows[0]?.count ?? 0);
+  }
+
+  async claimPendingAlarmTriggers(): Promise<AlarmTriggerRow[]> {
+    await this.client.query('BEGIN');
+    try {
+      const pending = await this.client.query<{ id: string }>(
+        `SELECT id
+         FROM alarm_triggers
+         WHERE status = 'pending' AND new_state IN ('ALARM', 'INSUFFICIENT_DATA')
+         ORDER BY received_at
+         FOR UPDATE SKIP LOCKED`
+      );
+
+      const ids = pending.rows.map((row) => row.id);
+      if (ids.length === 0) {
+        await this.client.query('COMMIT');
+        return [];
+      }
+
+      const claimed = await this.client.query<AlarmTriggerRow>(
+        `UPDATE alarm_triggers
+         SET status = 'claimed', claimed_at = now()
+         WHERE id = ANY($1)
+         RETURNING *`,
+        [ids]
+      );
+
+      await this.client.query('COMMIT');
+      return claimed.rows;
+    } catch (error) {
+      await this.client.query('ROLLBACK');
+      throw error;
+    }
+  }
+
+  async deferAlarmTriggers(ids: string[]): Promise<void> {
+    if (ids.length === 0) {
+      return;
+    }
+    await this.client.query(
+      `UPDATE alarm_triggers
+       SET status = 'deferred', processed_at = now()
+       WHERE id = ANY($1)`,
+      [ids]
+    );
+  }
+
+  async completeAlarmTriggers(ids: string[], runId: string | null): Promise<void> {
+    if (ids.length === 0) {
+      return;
+    }
+    await this.client.query(
+      `UPDATE alarm_triggers
+       SET status = 'done', run_id = $2, processed_at = now()
+       WHERE id = ANY($1)`,
+      [ids, runId]
+    );
+  }
+
+  async releaseAlarmTriggers(ids: string[]): Promise<void> {
+    if (ids.length === 0) {
+      return;
+    }
+    await this.client.query(
+      `UPDATE alarm_triggers
+       SET status = 'pending', claimed_at = null
+       WHERE id = ANY($1)`,
+      [ids]
+    );
+  }
+
+  async failAlarmTriggers(ids: string[]): Promise<void> {
+    if (ids.length === 0) {
+      return;
+    }
+    await this.client.query(
+      `UPDATE alarm_triggers
+       SET status = 'error', processed_at = now()
+       WHERE id = ANY($1)`,
+      [ids]
+    );
+  }
+
+  async findRecentLaunchForSpecKey(
+    specKey: string,
+    withinMs: number
+  ): Promise<{ runId: string } | null> {
+    const result = await this.client.query<{ run_id: string }>(
+      `SELECT run_id
+       FROM alarm_triggers
+       WHERE spec_key = $1
+         AND status = 'done'
+         AND run_id IS NOT NULL
+         AND processed_at > now() - make_interval(secs => $2::double precision / 1000)
+       ORDER BY processed_at DESC
+       LIMIT 1`,
+      [specKey, withinMs]
+    );
+    const row = result.rows[0];
+    return row ? { runId: row.run_id } : null;
   }
 
   private async loadIncidentSnapshots(
