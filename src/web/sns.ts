@@ -30,6 +30,19 @@ export interface SnsSubscriptionConfirmation extends SnsMessageBase {
 
 export type SnsMessage = SnsNotification | SnsSubscriptionConfirmation;
 
+/**
+ * Thrown when the body is a structurally valid SNS envelope but of a type this
+ * handler does not act on (e.g. `UnsubscribeConfirmation`). Callers should
+ * acknowledge these with 200 and ignore them rather than returning 400, so SNS
+ * does not treat them as delivery failures and retry.
+ */
+export class UnsupportedSnsMessageError extends Error {
+  constructor(public readonly messageType: string) {
+    super(`Unsupported SNS message type: ${messageType}`);
+    this.name = 'UnsupportedSnsMessageError';
+  }
+}
+
 export interface CloudWatchAlarmMessage {
   AlarmArn: string;
   AlarmName: string;
@@ -145,7 +158,7 @@ export function parseSnsMessage(body: unknown): SnsMessage {
     };
   }
 
-  throw new Error(`Unsupported SNS message type: ${base.Type}`);
+  throw new UnsupportedSnsMessageError(base.Type);
 }
 
 export function buildCanonicalSnsMessage(message: SnsMessage): string {

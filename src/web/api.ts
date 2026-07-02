@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
@@ -9,6 +10,7 @@ import { createPostgresPool } from '../db/postgres.js';
 import { enqueueAlarmTriggerOnce, markSnsMessageProcessed } from '../state/repository.js';
 import type { Severity } from '../types.js';
 import {
+  UnsupportedSnsMessageError,
   confirmSnsSubscription,
   parseCloudWatchAlarmMessage,
   parseSnsMessage,
@@ -16,6 +18,19 @@ import {
 } from './sns.js';
 
 type JsonRecord = Record<string, unknown>;
+
+/**
+ * Constant-time comparison of the path token so a `!==` short-circuit cannot
+ * leak the matching-prefix length to a timing attacker.
+ */
+function tokensMatch(provided: string, expected: string): boolean {
+  const providedBuf = Buffer.from(provided);
+  const expectedBuf = Buffer.from(expected);
+  if (providedBuf.length !== expectedBuf.length) {
+    return false;
+  }
+  return timingSafeEqual(providedBuf, expectedBuf);
+}
 
 interface RunRow {
   id: string;
@@ -259,14 +274,21 @@ export function createWebServer(
 
       webhookApp.post('/webhooks/cloudwatch/:token', async (request, reply) => {
         const { token } = request.params as { token: string };
-        if (token !== config.alarm.webhook.pathToken) {
+        const expectedToken = config.alarm.webhook.pathToken;
+        if (!expectedToken || !tokensMatch(token, expectedToken)) {
           return reply.code(404).send({ error: 'not_found' });
         }
 
         let message;
         try {
           message = parseSnsMessage(request.body);
-        } catch {
+        } catch (error) {
+          if (error instanceof UnsupportedSnsMessageError) {
+            // Structurally valid SNS envelope we don't act on (e.g.
+            // UnsubscribeConfirmation): ack so SNS does not retry.
+            request.log.info({ messageType: error.messageType }, 'Ignoring unsupported SNS message type');
+            return reply.code(200).send({ ok: true });
+          }
           return reply.code(400).send({ error: 'invalid_sns_message' });
         }
 
@@ -302,6 +324,17 @@ export function createWebServer(
             }
           }
           return reply.code(200).send({ ok: true });
+        }
+
+        // A valid SNS signature only proves the message came from SNS, not that
+        // it came from *our* topic. Any account can publish a CloudWatch-shaped
+        // alarm to their own topic and replay the signed envelope here, so bind
+        // notifications to the expected topic ARN before enqueueing.
+        if (
+          config.alarm.webhook.topicArn &&
+          message.TopicArn !== config.alarm.webhook.topicArn
+        ) {
+          return reply.code(403).send({ error: 'unexpected_topic_arn' });
         }
 
         const alarmMessage = parseCloudWatchAlarmMessage(message.Message);

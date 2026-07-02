@@ -689,4 +689,60 @@ describe('web API', () => {
     expect(db.processedSnsMessages.has(message.MessageId)).toBe(true);
     expect(db.alarmTriggers).toHaveLength(0);
   });
+
+  it('rejects a validly-signed notification from an unexpected topic ARN', async () => {
+    const db = new FakeApiDatabase();
+    const { app } = appFor(configWithWebhook(), db, {
+      fetchSigningCert: async () => certPem,
+    });
+    // Genuine SNS signature, but published to a foreign topic the attacker owns.
+    const message = notificationMessage({
+      TopicArn: 'arn:aws:sns:us-east-1:999999999999:attacker-topic',
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/secret-token',
+      payload: JSON.stringify(message),
+      headers: { 'content-type': 'text/plain' },
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(db.alarmTriggers).toHaveLength(0);
+    expect(db.processedSnsMessages.size).toBe(0);
+  });
+
+  it('acknowledges an unsupported SNS message type without enqueueing', async () => {
+    const db = new FakeApiDatabase();
+    const { app } = appFor(configWithWebhook(), db, {
+      fetchSigningCert: async () => certPem,
+    });
+    const message = { ...notificationMessage(), Type: 'UnsubscribeConfirmation' };
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/secret-token',
+      payload: JSON.stringify(message),
+      headers: { 'content-type': 'text/plain' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(db.alarmTriggers).toHaveLength(0);
+    expect(db.processedSnsMessages.size).toBe(0);
+  });
+
+  it('returns 400 for a malformed (non-SNS) request body', async () => {
+    const { app } = appFor(configWithWebhook(), new FakeApiDatabase(), {
+      fetchSigningCert: async () => certPem,
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/secret-token',
+      payload: JSON.stringify({ not: 'an sns envelope' }),
+      headers: { 'content-type': 'text/plain' },
+    });
+
+    expect(response.statusCode).toBe(400);
+  });
 });
