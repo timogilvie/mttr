@@ -60,10 +60,18 @@ const SEVERITY_RANK: Record<Severity, number> = {
   CRITICAL: 4,
 };
 
-/** Null/unparseable severity ranks below every real severity — fail-safe defer, never fail-open. */
+/**
+ * Null/unparseable severity ranks below every real severity — fail-safe defer, never fail-open.
+ * Case is normalized to match `getEnvSeverity` (config uppercases `minSeverity`), so a stored
+ * severity of e.g. `"high"` is still gated correctly rather than defaulting to defer.
+ */
 function severityRank(value: string | null): number {
-  if (value !== null && Object.prototype.hasOwnProperty.call(SEVERITY_RANK, value)) {
-    return SEVERITY_RANK[value as Severity];
+  if (value === null) {
+    return -1;
+  }
+  const normalized = value.toUpperCase();
+  if (Object.prototype.hasOwnProperty.call(SEVERITY_RANK, normalized)) {
+    return SEVERITY_RANK[normalized as Severity];
   }
   return -1;
 }

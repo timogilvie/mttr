@@ -374,6 +374,26 @@ describe('runAlarmTriggerConsumerOnce', () => {
     expect(repo.rows.get(atFloor.id)).toMatchObject({ status: 'done' });
   });
 
+  it('REQ-F4: a non-canonical-case severity is normalized, not defaulted to defer', async () => {
+    const repo = new FakeAlarmTriggerRepository();
+    const lowerCase = makeRow({ severity: 'high', spec_key: 'svc-case' });
+    repo.seed(lowerCase);
+    const launcher = new SpyLauncher();
+    const config = buildConfig({ minSeverity: 'HIGH' });
+
+    const outcome = await runAlarmTriggerConsumerOnce({
+      config,
+      repository: repo,
+      launcher,
+      sleep: instantSleep,
+      logger: silentLogger(),
+    });
+
+    expect(outcome.deferred).toBe(0);
+    expect(launcher.calls).toHaveLength(1);
+    expect(repo.rows.get(lowerCase.id)).toMatchObject({ status: 'done' });
+  });
+
   it('REQ-F4: null severity is deferred fail-safe and logged', async () => {
     const repo = new FakeAlarmTriggerRepository();
     const nullSeverity = makeRow({ severity: null, spec_key: 'svc-null' });
