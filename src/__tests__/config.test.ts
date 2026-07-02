@@ -310,6 +310,13 @@ describe('config', () => {
       expect(() => loadConfig()).toThrow('ALARM_TRIGGER_POLL_MS');
     });
 
+    it('rejects a negative ALARM_TRIGGER_COOLDOWN_MS, naming the variable', () => {
+      process.env['ALARM_TRIGGER_COOLDOWN_MS'] = '-1';
+
+      expect(() => loadConfig()).toThrow(/ALARM_TRIGGER_COOLDOWN_MS/);
+      expect(() => loadConfig()).toThrow(/non-negative/);
+    });
+
     it('loads without a path token when the webhook is disabled (ships dark)', () => {
       delete process.env['ALARM_WEBHOOK_ENABLED'];
       delete process.env['ALARM_WEBHOOK_PATH_TOKEN'];

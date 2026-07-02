@@ -103,6 +103,21 @@ function getEnvNumber(key: string, defaultValue: number): number {
   return parsed;
 }
 
+function getEnvPositiveNumber(key: string, defaultValue: number): number {
+  const value = process.env[key];
+  if (value === undefined || value === '') {
+    return defaultValue;
+  }
+  const parsed = Number(value);
+  if (isNaN(parsed)) {
+    throw new Error(`Environment variable ${key} must be a valid number, got: ${value}`);
+  }
+  if (parsed < 0) {
+    throw new Error(`Environment variable ${key} must be non-negative, got: ${value}`);
+  }
+  return parsed;
+}
+
 function getEnvBoolean(key: string, defaultValue: boolean): boolean {
   const value = process.env[key];
   if (value === undefined || value === '') {
@@ -227,9 +242,9 @@ export function loadConfig(): Config {
       },
       trigger: {
         minSeverity: getEnvSeverity('ALARM_TRIGGER_MIN_SEVERITY', 'CRITICAL'),
-        cooldownMs: getEnvNumber('ALARM_TRIGGER_COOLDOWN_MS', 600000),
-        pollMs: getEnvNumber('ALARM_TRIGGER_POLL_MS', 5000),
-        coalesceMs: getEnvNumber('ALARM_TRIGGER_COALESCE_MS', 2000),
+        cooldownMs: getEnvPositiveNumber('ALARM_TRIGGER_COOLDOWN_MS', 600000),
+        pollMs: getEnvPositiveNumber('ALARM_TRIGGER_POLL_MS', 5000),
+        coalesceMs: getEnvPositiveNumber('ALARM_TRIGGER_COALESCE_MS', 2000),
       },
     },
   };

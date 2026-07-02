@@ -1,0 +1,18 @@
+{
+  "planner": "claude-opus-4-8",
+  "coder": "gpt-5.5",
+  "reviewer": "gpt-5.4",
+  "planDepth": "deep",
+  "codeDepth": "deep",
+  "reviewMode": "static+llm",
+  "reviewRecommended": "static+llm",
+  "provenance": {
+    "source": "bootstrap",
+    "inputKind": "issue",
+    "inputPath": "features/t2-config-env-plumbing-for-the-alarm-webhook/selected-task.json",
+    "inputHash": "",
+    "routedAt": "2026-07-02T18:33:12Z",
+    "routerMode": "normal"
+  },
+  "maxCostUsd": 25
+}
