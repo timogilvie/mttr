@@ -1079,6 +1079,7 @@ async function gatherStandardEvidence(
   const sections: string[] = [];
   const rootCauseFunctionsGathered = new Set<string>();
   const rootCauseRulesGathered = new Set<string>();
+  const ecsCausalServicesGathered = new Set<string>();
 
   for (const { id, kind, item } of allItems(classification)) {
     const text = itemText(item);
@@ -1188,7 +1189,8 @@ async function gatherStandardEvidence(
         sections.push(ecsServiceEventsEvidence);
 
         const resolvedEcsService = parseEcsServiceForCausalEvidence(ecsServiceEventsEvidence);
-        if (resolvedEcsService) {
+        if (resolvedEcsService && !ecsCausalServicesGathered.has(resolvedEcsService.service)) {
+          ecsCausalServicesGathered.add(resolvedEcsService.service);
           sections.push(
             ...(await gatherEcsCausalEvidence(id, kind, resolvedEcsService, ctx, tracker))
           );
