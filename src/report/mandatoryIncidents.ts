@@ -460,7 +460,7 @@ function mandatoryIncidentSpecs(report: string): MandatoryIncidentSpec[] {
   ];
 }
 
-export const SEVERITY_ORDER: Severity[] = ['NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];
+export const SEVERITY_ORDER: readonly Severity[] = ['NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];
 
 export function maxSeverity(a: Severity, b: Severity): Severity {
   return SEVERITY_ORDER.indexOf(a) >= SEVERITY_ORDER.indexOf(b) ? a : b;
