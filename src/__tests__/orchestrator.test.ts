@@ -67,6 +67,19 @@ const mockConfig: Config = {
     llmMs: 5000,
     s3Ms: 5000,
   },
+  alarm: {
+    webhook: {
+      enabled: false,
+      verifySignature: true,
+      autoconfirm: true,
+    },
+    trigger: {
+      minSeverity: 'CRITICAL',
+      cooldownMs: 600000,
+      pollMs: 5000,
+      coalesceMs: 2000,
+    },
+  },
 };
 
 describe('Orchestrator', () => {

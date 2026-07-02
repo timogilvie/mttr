@@ -1,0 +1,9 @@
+{
+  "stage": "review",
+  "status": "running",
+  "startedAt": "2026-07-02T18:45:54.985Z",
+  "finishedAt": null,
+  "agent": "claude",
+  "model": "claude-opus-4-8",
+  "notes": ""
+}

@@ -1,3 +1,5 @@
+import type { Severity } from './types.js';
+
 export interface Config {
   openrouter: {
     apiKey: string;
@@ -57,6 +59,20 @@ export interface Config {
     llmMs: number;
     s3Ms: number;
   };
+  alarm: {
+    webhook: {
+      enabled: boolean;
+      pathToken?: string;
+      verifySignature: boolean;
+      autoconfirm: boolean;
+    };
+    trigger: {
+      minSeverity: Severity;
+      cooldownMs: number;
+      pollMs: number;
+      coalesceMs: number;
+    };
+  };
 }
 
 function getEnv(key: string, defaultValue?: string): string {
@@ -87,6 +103,21 @@ function getEnvNumber(key: string, defaultValue: number): number {
   return parsed;
 }
 
+function getEnvPositiveNumber(key: string, defaultValue: number): number {
+  const value = process.env[key];
+  if (value === undefined || value === '') {
+    return defaultValue;
+  }
+  const parsed = Number(value);
+  if (isNaN(parsed)) {
+    throw new Error(`Environment variable ${key} must be a valid number, got: ${value}`);
+  }
+  if (parsed < 0) {
+    throw new Error(`Environment variable ${key} must be non-negative, got: ${value}`);
+  }
+  return parsed;
+}
+
 function getEnvBoolean(key: string, defaultValue: boolean): boolean {
   const value = process.env[key];
   if (value === undefined || value === '') {
@@ -109,6 +140,22 @@ function getStateBackend(): 'file' | 'postgres' {
   throw new Error(`Environment variable STATE_BACKEND must be "file" or "postgres", got: ${value}`);
 }
 
+const SEVERITIES: readonly Severity[] = ['NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];
+
+function getEnvSeverity(key: string, defaultValue: Severity): Severity {
+  const value = process.env[key];
+  if (value === undefined || value === '') {
+    return defaultValue;
+  }
+  const normalized = value.toUpperCase();
+  if ((SEVERITIES as readonly string[]).includes(normalized)) {
+    return normalized as Severity;
+  }
+  throw new Error(
+    `Environment variable ${key} must be one of ${SEVERITIES.join(', ')}, got: ${value}`
+  );
+}
+
 export function loadConfig(): Config {
   const stateBackend = getStateBackend();
   const databaseUrl = getEnvOptional('DATABASE_URL');
@@ -117,6 +164,11 @@ export function loadConfig(): Config {
   const slackWebhookUrl = getEnvOptional('SLACK_WEBHOOK_URL');
   if (stateBackend === 'postgres' && !databaseUrl) {
     throw new Error('DATABASE_URL is required when STATE_BACKEND=postgres');
+  }
+  const alarmWebhookEnabled = getEnvBoolean('ALARM_WEBHOOK_ENABLED', false);
+  const alarmWebhookPathToken = getEnvOptional('ALARM_WEBHOOK_PATH_TOKEN');
+  if (alarmWebhookEnabled && !alarmWebhookPathToken) {
+    throw new Error('ALARM_WEBHOOK_PATH_TOKEN is required when ALARM_WEBHOOK_ENABLED=true');
   }
 
   return {
@@ -180,6 +232,20 @@ export function loadConfig(): Config {
     timeouts: {
       llmMs: getEnvNumber('LLM_TIMEOUT_MS', 60000),
       s3Ms: getEnvNumber('S3_TIMEOUT_MS', 15000),
+    },
+    alarm: {
+      webhook: {
+        enabled: alarmWebhookEnabled,
+        ...(alarmWebhookPathToken ? { pathToken: alarmWebhookPathToken } : {}),
+        verifySignature: getEnvBoolean('ALARM_WEBHOOK_VERIFY_SIGNATURE', true),
+        autoconfirm: getEnvBoolean('ALARM_WEBHOOK_AUTOCONFIRM', true),
+      },
+      trigger: {
+        minSeverity: getEnvSeverity('ALARM_TRIGGER_MIN_SEVERITY', 'CRITICAL'),
+        cooldownMs: getEnvPositiveNumber('ALARM_TRIGGER_COOLDOWN_MS', 600000),
+        pollMs: getEnvPositiveNumber('ALARM_TRIGGER_POLL_MS', 5000),
+        coalesceMs: getEnvPositiveNumber('ALARM_TRIGGER_COALESCE_MS', 2000),
+      },
     },
   };
 }

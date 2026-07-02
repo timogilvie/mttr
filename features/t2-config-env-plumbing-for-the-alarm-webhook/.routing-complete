@@ -1,0 +1,68 @@
+{
+  "planner": "claude-opus-4-8",
+  "coder": "claude-sonnet-5",
+  "reviewer": "claude-opus-4-8",
+  "planDepth": "deep",
+  "codeDepth": "deep",
+  "reviewMode": "static+llm",
+  "reviewRecommended": "static+llm",
+  "provenance": {
+    "source": "expanded",
+    "inputKind": "task-packet",
+    "inputPath": "/Users/timothyogilvie/Dropbox/Hokusai/mttr/../worktrees/t2-config-env-plumbing-for-the-alarm-webhook/features/t2-config-env-plumbing-for-the-alarm-webhook/task-packet.md",
+    "inputHash": "7c46ce612908e5c105da3b9748607634c6f3d56775b9a82568b32b90c961836c",
+    "routedAt": "2026-07-02T18:41:02.408Z",
+    "routerMode": "normal",
+    "appliedFrom": "/Users/timothyogilvie/Dropbox/Hokusai/mttr/../worktrees/t2-config-env-plumbing-for-the-alarm-webhook/features/t2-config-env-plumbing-for-the-alarm-webhook/.post-expansion-route.json",
+    "appliedAt": "2026-07-02T18:41:02Z"
+  },
+  "maxCostUsd": 25,
+  "expectedSuccess": 0.95,
+  "confidence": 0.87,
+  "expectedCostPlan": 0.37,
+  "expectedCostCode": 4.26,
+  "expectedCostReview": 0.87,
+  "expectedCost": 5.5,
+  "reasoning": [
+    "Stage-aware routing used 20 similar historical tasks.",
+    "Similarity range 0.79-0.84 across nearest neighbors.",
+    "Planner=claude-opus-4-8, coder=claude-sonnet-5, reviewer=claude-opus-4-8 maximize weighted per-stage scores.",
+    "Expected success 95% with estimated workflow cost $5.50."
+  ],
+  "signals": {
+    "taskType": "bugfix",
+    "promptLength": "long",
+    "complexityScore": 1,
+    "fileTypes": [
+      ".ts",
+      ".md",
+      ".yml",
+      ".json"
+    ],
+    "riskScore": 13
+  },
+  "routingMode": "stage-aware",
+  "neighborCount": 20,
+  "neighborSimilarityRange": [
+    0.79,
+    0.84
+  ],
+  "exploration": {
+    "mode": "epsilon",
+    "explored": []
+  },
+  "constraints": {
+    "maxCostUsd": 25
+  },
+  "challengeRecommendation": {
+    "shouldChallenge": true,
+    "reason": "new-model",
+    "defaultModel": "claude-sonnet-4-6",
+    "challengerModel": "claude-opus-4-8",
+    "stage": "plan",
+    "priority": 300
+  },
+  "cache_hit": false,
+  "route_source": "single",
+  "packet_hash": "d43b1751fa21daa9d5ea1cb76f0127312f1e914fa36453b4f0d6164c7c0a8fd4"
+}

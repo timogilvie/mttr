@@ -1,0 +1,19 @@
+{
+  "planning": {
+    "model": "claude-opus-4-8",
+    "agent": "claude",
+    "depth": "deep"
+  },
+  "coding": {
+    "model": "claude-sonnet-5",
+    "agent": "claude",
+    "depth": "deep"
+  },
+  "review": {
+    "model": "claude-opus-4-8",
+    "agent": "claude",
+    "mode": "static+llm"
+  },
+  "resolvedAt": "2026-07-02T18:41:02Z",
+  "forceModel": null
+}

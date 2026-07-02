@@ -1,0 +1,10 @@
+{
+  "taskId": "HOK-2435",
+  "title": "T2 · Config & env plumbing for the alarm webhook",
+  "description": "T2 · Config & env plumbing for the alarm webhook\n\nAdd config surface in `src/config.ts` + `.env.example` (and compose env examples). See design doc §7.\n\n| Var | Default | Purpose |\n| -- | -- | -- |\n| `ALARM_WEBHOOK_ENABLED` | `false` | Master switch (ingress route + consumer) |\n| `ALARM_WEBHOOK_PATH_TOKEN` | — | Shared secret in route path |\n| `ALARM_WEBHOOK_VERIFY_SIGNATURE` | `true` | Verify SNS signatures |\n| `ALARM_WEBHOOK_AUTOCONFIRM` | `true` | Auto-confirm SNS subscription |\n| `ALARM_TRIGGER_MIN_SEVERITY` | `CRITICAL` | Min severity to trigger ASAP |\n| `ALARM_TRIGGER_COOLDOWN_MS` | `600000` | Per-alarm anti-flap window |\n| `ALARM_TRIGGER_POLL_MS` | `5000` | Worker consumer poll interval |\n| `ALARM_TRIGGER_COALESCE_MS` | `2000` | Storm debounce before draining |\n\n**Done when:** config validates/parses with defaults; disabled by default; documented in `.env.example`. Everything ships dark.",
+  "labels": [],
+  "workflowType": "feature",
+  "featureName": "t2-config-env-plumbing-for-the-alarm-webhook",
+  "contextPath": "features/t2-config-env-plumbing-for-the-alarm-webhook/selected-task.json",
+  "selectedAt": "2026-07-02T18:33:10Z"
+}
