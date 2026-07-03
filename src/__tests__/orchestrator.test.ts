@@ -715,6 +715,25 @@ describe('Orchestrator alarm trigger consumer seam (T5)', () => {
       startRunSpy.mockRestore();
     });
 
+    it('drives Investigate/Decide on the file backend even when startRun returns undefined', async () => {
+      // FileAgentStateRepository.startRun always returns undefined (the file backend does not
+      // record runs). The alarm path must tolerate that the same way the scheduled path does —
+      // proceeding with `runId = undefined` — instead of terminally failing every alarm batch.
+      const investigateStage = await import('../stages/investigate.js');
+      vi.mocked(investigateStage.run).mockResolvedValue(investigateResult);
+
+      const orchestrator = new Orchestrator(mockConfig);
+      const batch: AlarmTriggerBatch = {
+        triggers: [makeAlarmTriggerRow()],
+        specKeys: ['active-alarm-hokusai-auth-development-task-health'],
+      };
+
+      const result = await orchestrator.runInvestigationFromTrigger(batch);
+
+      expect(result).toEqual({ status: 'launched', runId: undefined });
+      expect(investigateStage.run).toHaveBeenCalledTimes(1);
+    });
+
     it('does not resolve unrelated active observations left by prior report runs', async () => {
       const classifyStage = await import('../stages/classify.js');
       const investigateStage = await import('../stages/investigate.js');

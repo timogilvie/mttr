@@ -157,13 +157,12 @@ export class Orchestrator {
       console.log(
         `[Orchestrator] Starting alarm-triggered investigation for ${specs.length} synthesized spec(s)`
       );
+      // Mirrors the scheduled path's tolerance (see runClassifyAsync): backends that don't record
+      // runs (e.g. FileAgentStateRepository) leave `runId` undefined and every downstream
+      // recordX(runId, ...) call short-circuits on that internally. `run_id` is only actually
+      // persisted by the Postgres backend, and that's the backend we require in production for
+      // the alarm path (webhook-enabled deploys use Postgres per config).
       runId = await this.stateRepository.startRun?.(now, 'alarm');
-      if (!runId) {
-        return {
-          status: 'error',
-          message: 'startRun did not return a run id for the alarm-triggered investigation',
-        };
-      }
 
       const state = await this.stateRepository.load();
       const {
