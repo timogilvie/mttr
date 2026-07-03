@@ -109,13 +109,18 @@ export class Orchestrator {
    * the returned `runId` itself (via `completeAlarmTriggers`) once this resolves `launched`.
    */
   async runInvestigationFromTrigger(batch: AlarmTriggerBatch): Promise<TriggerLaunchResult> {
-    // Claim `investigateInFlight` synchronously (no await between the check and the flip) so a
-    // concurrent scheduled tick's `runInvestigate` will see it busy and skip cleanly. Releasing
-    // this only after the alarm run's Investigate/Decide finish means a scheduled tick that
-    // collides with an alarm run yields to the alarm (rather than the alarm getting `false` back
-    // from runInvestigate and being terminally failed by failAlarmTriggers).
-    if (this.investigateInFlight) {
-      console.log('[Orchestrator] Investigate stage already in flight, deferring alarm trigger batch');
+    // Cross-path mutex: reject when EITHER the scheduled Classify tick or another Investigate
+    // stage is in flight. Both entry points share persistClassification, which does
+    // load()->reconcileObservations()->save() against the same AgentState; a concurrent scheduled
+    // Classify would race the alarm path here (last-writer-wins on PostgresAgentStateRepository's
+    // DELETE+INSERT of observation_states, silently dropping one run's changes). The fast-path
+    // check-and-flip is synchronous — no await between the checks and the flip — so any tick that
+    // arrives after this returns will see `investigateInFlight = true` and its `tick()` fast-path
+    // will skip.
+    if (this.classifyInFlight || this.investigateInFlight) {
+      console.log(
+        '[Orchestrator] Classify or Investigate stage already in flight, deferring alarm trigger batch'
+      );
       return { status: 'busy' };
     }
     this.investigateInFlight = true;
@@ -455,8 +460,13 @@ export class Orchestrator {
   }
 
   private tick(): void {
-    if (this.classifyInFlight) {
-      console.log('[Orchestrator] Classify stage still in flight, skipping tick');
+    // Same cross-path mutex as runInvestigationFromTrigger: skip when an alarm-triggered
+    // investigation is in flight, so scheduled and alarm paths cannot both be inside
+    // persistClassification's load->reconcile->save cycle at once.
+    if (this.classifyInFlight || this.investigateInFlight) {
+      console.log(
+        '[Orchestrator] Classify or Investigate stage still in flight, skipping tick'
+      );
       return;
     }
 

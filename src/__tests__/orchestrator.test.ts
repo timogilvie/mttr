@@ -590,6 +590,42 @@ describe('Orchestrator alarm trigger consumer seam (T5)', () => {
       orchestrator.stop();
     });
 
+    it('returns busy when a scheduled Classify tick is still in flight', async () => {
+      // Both entry points share persistClassification's load->reconcile->save cycle; a scheduled
+      // Classify tick holding classifyInFlight must block the alarm path from racing it against
+      // the same AgentState snapshot.
+      const classifyStage = await import('../stages/classify.js');
+      await mockReport();
+
+      let resolveClassify: ((result: StageResult) => void) | null = null;
+      const pending = new Promise<StageResult>((resolve) => {
+        resolveClassify = resolve;
+      });
+      vi.mocked(classifyStage.runWithReport).mockReturnValue(pending);
+
+      const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+      const orchestrator = new Orchestrator(config);
+      orchestrator.start();
+
+      await vi.waitFor(() => expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1));
+
+      const batch: AlarmTriggerBatch = {
+        triggers: [makeAlarmTriggerRow()],
+        specKeys: ['active-alarm-hokusai-auth-development-task-health'],
+      };
+      await expect(orchestrator.runInvestigationFromTrigger(batch)).resolves.toEqual({
+        status: 'busy',
+      });
+
+      resolveClassify!({
+        stage: 'Classify',
+        status: 'success',
+        timestamp: 't',
+        data: { summary: '', overall_severity: 'NONE', incidents: [], findings: [] },
+      });
+      orchestrator.stop();
+    });
+
     it('returns an error when no trigger in the batch produces a valid incident spec', async () => {
       const orchestrator = new Orchestrator(mockConfig);
 
