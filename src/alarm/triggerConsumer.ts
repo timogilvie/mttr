@@ -14,7 +14,7 @@ export interface AlarmTriggerBatch {
 }
 
 export type TriggerLaunchResult =
-  | { status: 'launched'; runId: string }
+  | { status: 'launched'; runId: string | undefined }
   | { status: 'busy' }
   | { status: 'error'; message: string };
 
@@ -254,10 +254,13 @@ export async function runAlarmTriggerConsumerOnce(
   try {
     const result = await launcher.launch(batch);
     if (result.status === 'launched') {
-      await repository.completeAlarmTriggers?.(batchIds, result.runId);
+      // File backend leaves runId undefined; normalize to null so we don't leak `undefined` into
+      // the `run_id` column downstream. The file backend also short-circuits the write, so this
+      // is only actually persisted by Postgres — but keep the type honest.
+      await repository.completeAlarmTriggers?.(batchIds, result.runId ?? null);
       outcome.launched = batchIds.length;
       logger.log(
-        `[AlarmTriggerConsumer] Launched investigation ${result.runId} for ${specKeys.length} spec_key(s), ${batchIds.length} trigger(s)`
+        `[AlarmTriggerConsumer] Launched investigation ${result.runId ?? '<no-run-id>'} for ${specKeys.length} spec_key(s), ${batchIds.length} trigger(s)`
       );
     } else if (result.status === 'busy') {
       await repository.releaseAlarmTriggers?.(batchIds);

@@ -187,11 +187,23 @@ export function recordProcessedReport(
   state.lastReport = { s3Uri, fingerprint, processedAt: now };
 }
 
+export interface ReconcileOptions {
+  /**
+   * When true, the classification is a partial snapshot (e.g. an alarm-triggered batch that
+   * synthesizes incidents only for the alarms in flight). Active observations whose keys aren't
+   * in the current classification are left as-is instead of being auto-marked 'resolved'. Only
+   * the complete-report path may pass `false` (the default).
+   */
+  partial?: boolean;
+}
+
 export function reconcileObservations(
   state: AgentState,
   classification: ClassificationResult,
-  now: string
+  now: string,
+  options: ReconcileOptions = {}
 ): ObservationReconciliation {
+  const { partial = false } = options;
   const newObservations: ObservationState[] = [];
   const changedObservations: ObservationState[] = [];
   const recurringObservations: ObservationState[] = [];
@@ -230,16 +242,18 @@ export function reconcileObservations(
     }
   }
 
-  for (const previous of Object.values(state.observations)) {
-    if (previous.status === 'active' && !seenKeys.has(previous.key)) {
-      const resolved: ObservationState = {
-        ...previous,
-        status: 'resolved',
-        resolvedAt: now,
-        lastChangedAt: now,
-      };
-      state.observations[previous.key] = resolved;
-      resolvedObservations.push(resolved);
+  if (!partial) {
+    for (const previous of Object.values(state.observations)) {
+      if (previous.status === 'active' && !seenKeys.has(previous.key)) {
+        const resolved: ObservationState = {
+          ...previous,
+          status: 'resolved',
+          resolvedAt: now,
+          lastChangedAt: now,
+        };
+        state.observations[previous.key] = resolved;
+        resolvedObservations.push(resolved);
+      }
     }
   }
 
