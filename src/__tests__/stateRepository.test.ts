@@ -151,6 +151,11 @@ class FakeStateDatabase implements DatabaseClient {
       return result<T>(alert ? [alert as T] : []);
     }
 
+    if (normalized.startsWith('SELECT trigger_source FROM runs')) {
+      const run = this.runs.get(String(params[0]));
+      return result<T>(run ? [run as T] : []);
+    }
+
     if (normalized.startsWith('INSERT INTO report_states')) {
       this.reports.set(String(params[0]), {
         health_report_s3_uri: params[0],
@@ -476,6 +481,17 @@ describe('Postgres state repository', () => {
     const runId = await repository.startRun('2026-06-08T10:00:00Z', 'alarm');
 
     expect(db.runs.get(runId)).toMatchObject({ trigger_source: 'alarm' });
+  });
+
+  it('reads persisted run trigger source for alert provenance', async () => {
+    const db = new FakeStateDatabase();
+    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
+
+    const runId = await repository.startRun('2026-06-08T10:00:00Z', 'alarm');
+
+    await expect(repository.getRunTriggerSource(runId)).resolves.toBe('alarm');
+    await expect(repository.getRunTriggerSource(undefined)).resolves.toBeUndefined();
+    await expect(repository.getRunTriggerSource('missing-run')).resolves.toBeUndefined();
   });
 
   it('persists report hashes and recurring observations', async () => {

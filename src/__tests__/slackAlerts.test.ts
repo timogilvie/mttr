@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Config } from '../config.js';
-import type { AgentStateRepository, AlertRecordInput } from '../state/repository.js';
+import type {
+  AgentStateRepository,
+  AlertRecordInput,
+  TriggerSource,
+} from '../state/repository.js';
 import type { IncidentTransition } from '../state/transitions.js';
 import {
   AlertDeliveryError,
@@ -76,7 +80,10 @@ function transition(overrides: Partial<IncidentTransition> = {}): IncidentTransi
   };
 }
 
-function repository(existingKeys = new Set<string>()): {
+function repository(
+  existingKeys = new Set<string>(),
+  triggerSource?: TriggerSource
+): {
   repo: AgentStateRepository;
   alerts: AlertRecordInput[];
 } {
@@ -96,25 +103,46 @@ function repository(existingKeys = new Set<string>()): {
         existingKeys.add(alert.dedupeKey);
         alerts.push(alert);
       },
+      ...(triggerSource
+        ? {
+            async getRunTriggerSource() {
+              return triggerSource;
+            },
+          }
+        : {}),
     },
     alerts,
   };
 }
 
-function okFetch(): SlackFetch {
-  return vi.fn(async () => ({
-    ok: true,
-    status: 200,
-    async text() {
-      return 'ok';
-    },
-  }));
+function okFetch(bodies: string[] = []): SlackFetch {
+  return vi.fn(async (_url, init) => {
+    bodies.push(init.body);
+    return {
+      ok: true,
+      status: 200,
+      async text() {
+        return 'ok';
+      },
+    };
+  });
+}
+
+function sentPayload(bodies: string[]): Record<string, unknown> {
+  return JSON.parse(bodies[0] ?? '{}') as Record<string, unknown>;
+}
+
+function contextText(payload: Record<string, unknown>): string {
+  const blocks = payload['blocks'] as Array<{ type: string; elements?: Array<{ text?: string }> }>;
+  const context = blocks.find((block) => block.type === 'context');
+  return context?.elements?.map((element) => element.text ?? '').join('\n') ?? '';
 }
 
 describe('Slack alerts', () => {
   it('sends alertable transitions and persists the sent alert dedupe key', async () => {
-    const { repo, alerts } = repository();
-    const fetchImpl = okFetch();
+    const { repo, alerts } = repository(new Set(), 'scheduled');
+    const bodies: string[] = [];
+    const fetchImpl = okFetch(bodies);
     const item = transition();
 
     const result = await sendSlackAlerts(config(), repo, 'run-1', [item], fetchImpl);
@@ -139,7 +167,40 @@ describe('Slack alerts', () => {
       runId: 'run-1',
       channel: 'slack',
       dedupeKey: 'slack:INC-001:new_incident:HIGH:MITIGATE',
+      payload: {
+        text: '[HIGH] [scheduled] New incident: High 4xx',
+      },
     });
+    expect(contextText(sentPayload(bodies))).toContain('Trigger: scheduled');
+  });
+
+  it('marks alarm-triggered alerts visibly without changing the dedupe key', async () => {
+    const { repo, alerts } = repository(new Set(), 'alarm');
+    const bodies: string[] = [];
+    const fetchImpl = okFetch(bodies);
+    const item = transition();
+    const beforeKey = slackDedupeKey('slack', item);
+
+    const result = await sendSlackAlerts(config(), repo, 'run-1', [item], fetchImpl);
+
+    expect(result[0]?.dedupeKey).toBe(beforeKey);
+    expect(slackDedupeKey('slack', item)).toBe('slack:INC-001:new_incident:HIGH:MITIGATE');
+    expect(sentPayload(bodies)['text']).toBe('[HIGH] [alarm] New incident: High 4xx');
+    expect(contextText(sentPayload(bodies))).toContain('Trigger: ALARM triggered');
+    expect(alerts[0]?.payload).toMatchObject({
+      text: '[HIGH] [alarm] New incident: High 4xx',
+    });
+  });
+
+  it('falls back to scheduled provenance when run metadata is unavailable', async () => {
+    const { repo } = repository();
+    const bodies: string[] = [];
+    const fetchImpl = okFetch(bodies);
+
+    await sendSlackAlerts(config(), repo, undefined, [transition()], fetchImpl);
+
+    expect(sentPayload(bodies)['text']).toBe('[HIGH] [scheduled] New incident: High 4xx');
+    expect(contextText(sentPayload(bodies))).toContain('Trigger: scheduled');
   });
 
   it('dedupes alerts before sending to Slack', async () => {

@@ -57,6 +57,27 @@ select {
   font-size: 15px;
 }
 
+.source-badge {
+  display: inline-grid;
+  place-items: center;
+  min-height: 24px;
+  margin-top: 10px;
+  padding: 0 10px;
+  border: 1px solid #c4d0d5;
+  border-radius: 999px;
+  color: #334044;
+  background: #f7fafb;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.source-alarm {
+  border-color: #c2413a;
+  color: #8f2f2a;
+  background: #fff7f6;
+}
+
 .eyebrow {
   margin-bottom: 10px !important;
   color: #617176 !important;
