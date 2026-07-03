@@ -241,6 +241,33 @@ const instantSleep = async (): Promise<void> => {
   return;
 };
 
+// The consumer's logger has no `.info`, so emitCounter/emitTiming fall back to
+// `logger.log(JSON.stringify(payload))`. Plain human-readable log lines (e.g.
+// "[AlarmTriggerConsumer] Launched...") are not valid JSON, so parse defensively and
+// keep only the structured metric payloads.
+function metricPayloads(logger: Pick<Console, 'log' | 'warn' | 'error'>): Array<Record<string, unknown>> {
+  const calls = (logger.log as ReturnType<typeof vi.fn>).mock.calls as [string][];
+  const payloads: Array<Record<string, unknown>> = [];
+  for (const [line] of calls) {
+    try {
+      const parsed = JSON.parse(line) as Record<string, unknown>;
+      if (typeof parsed['metric'] === 'string') {
+        payloads.push(parsed);
+      }
+    } catch {
+      // Not a JSON metric line — ignore.
+    }
+  }
+  return payloads;
+}
+
+function metricsNamed(
+  logger: Pick<Console, 'log' | 'warn' | 'error'>,
+  metric: string
+): Array<Record<string, unknown>> {
+  return metricPayloads(logger).filter((payload) => payload['metric'] === metric);
+}
+
 describe('runAlarmTriggerConsumerOnce', () => {
   it('REQ-F1: is fully inert when disabled — no DB calls, no launch', async () => {
     const repo = new FakeAlarmTriggerRepository();
@@ -787,6 +814,162 @@ describe('runAlarmTriggerConsumerOnce', () => {
 
     expect(sleepSpy).toHaveBeenCalledWith(0);
     expect(outcome.launched).toBe(1);
+  });
+
+  it('T9: emits severity_deferred for a below-threshold trigger', async () => {
+    const repo = new FakeAlarmTriggerRepository();
+    const low = makeRow({ severity: 'HIGH', spec_key: 'svc-low' });
+    repo.seed(low);
+    const launcher = new SpyLauncher();
+    const config = buildConfig({ minSeverity: 'CRITICAL' });
+    const logger = silentLogger();
+
+    await runAlarmTriggerConsumerOnce({
+      config,
+      repository: repo,
+      launcher,
+      sleep: instantSleep,
+      logger,
+    });
+
+    expect(metricsNamed(logger, 'alarm_pipeline.severity_deferred')).toEqual([
+      expect.objectContaining({ trigger_id: low.id, alarm_name: low.alarm_name, spec_key: 'svc-low' }),
+    ]);
+  });
+
+  it('T9: emits severity_deferred for a null-severity fail-safe defer', async () => {
+    const repo = new FakeAlarmTriggerRepository();
+    const nullSeverity = makeRow({ severity: null, spec_key: 'svc-null' });
+    repo.seed(nullSeverity);
+    const launcher = new SpyLauncher();
+    const config = buildConfig();
+    const logger = silentLogger();
+
+    await runAlarmTriggerConsumerOnce({
+      config,
+      repository: repo,
+      launcher,
+      sleep: instantSleep,
+      logger,
+    });
+
+    expect(metricsNamed(logger, 'alarm_pipeline.severity_deferred')).toEqual([
+      expect.objectContaining({ trigger_id: nullSeverity.id, alarm_name: nullSeverity.alarm_name }),
+    ]);
+  });
+
+  it('T9: emits cooldown_attached per row when a spec_key is in cooldown', async () => {
+    const repo = new FakeAlarmTriggerRepository();
+    repo.cooldownHits.set('svc-d', { runId: 'run-prior' });
+    const row = makeRow({ spec_key: 'svc-d' });
+    repo.seed(row);
+    const launcher = new SpyLauncher();
+    const config = buildConfig();
+    const logger = silentLogger();
+
+    await runAlarmTriggerConsumerOnce({
+      config,
+      repository: repo,
+      launcher,
+      sleep: instantSleep,
+      logger,
+    });
+
+    expect(metricsNamed(logger, 'alarm_pipeline.cooldown_attached')).toEqual([
+      expect.objectContaining({ trigger_id: row.id, alarm_name: row.alarm_name, spec_key: 'svc-d' }),
+    ]);
+  });
+
+  it('T9: emits one coalesced event per spec_key storm with coalesced_count = rows.length - 1', async () => {
+    const repo = new FakeAlarmTriggerRepository();
+    const rows = Array.from({ length: 4 }, () => makeRow({ spec_key: 'svc-storm' }));
+    repo.seed(...rows);
+    const launcher = new SpyLauncher();
+    const config = buildConfig();
+    const logger = silentLogger();
+
+    await runAlarmTriggerConsumerOnce({
+      config,
+      repository: repo,
+      launcher,
+      sleep: instantSleep,
+      logger,
+    });
+
+    expect(metricsNamed(logger, 'alarm_pipeline.coalesced')).toEqual([
+      expect.objectContaining({ spec_key: 'svc-storm', coalesced_count: 3 }),
+    ]);
+  });
+
+  it('T9: does not emit coalesced for a singleton spec_key group', async () => {
+    const repo = new FakeAlarmTriggerRepository();
+    const row = makeRow({ spec_key: 'svc-solo' });
+    repo.seed(row);
+    const launcher = new SpyLauncher();
+    const config = buildConfig();
+    const logger = silentLogger();
+
+    await runAlarmTriggerConsumerOnce({
+      config,
+      repository: repo,
+      launcher,
+      sleep: instantSleep,
+      logger,
+    });
+
+    expect(metricsNamed(logger, 'alarm_pipeline.coalesced')).toHaveLength(0);
+  });
+
+  it('T9: emits investigations_launched per row and trigger-to-investigation latency from received_at', async () => {
+    const repo = new FakeAlarmTriggerRepository();
+    const receivedAt = new Date('2026-07-01T00:00:00.000Z');
+    const row = makeRow({ spec_key: 'svc-latency', received_at: receivedAt.toISOString() });
+    repo.seed(row);
+    const launcher = new SpyLauncher();
+    const config = buildConfig();
+    const logger = silentLogger();
+    const launchedAtMs = receivedAt.getTime() + 5000;
+
+    await runAlarmTriggerConsumerOnce({
+      config,
+      repository: repo,
+      launcher,
+      sleep: instantSleep,
+      logger,
+      now: () => launchedAtMs,
+    });
+
+    expect(metricsNamed(logger, 'alarm_pipeline.investigations_launched')).toEqual([
+      expect.objectContaining({
+        trigger_id: row.id,
+        alarm_name: row.alarm_name,
+        spec_key: 'svc-latency',
+      }),
+    ]);
+    expect(metricsNamed(logger, 'alarm_pipeline.trigger_to_investigation_ms')).toEqual([
+      expect.objectContaining({ trigger_id: row.id, value_ms: 5000 }),
+    ]);
+  });
+
+  it('T9: does not emit investigations_launched or latency for a released (busy) batch', async () => {
+    const repo = new FakeAlarmTriggerRepository();
+    const row = makeRow({ spec_key: 'svc-busy' });
+    repo.seed(row);
+    const launcher = new SpyLauncher();
+    launcher.launchImpl = () => ({ status: 'busy' });
+    const config = buildConfig();
+    const logger = silentLogger();
+
+    await runAlarmTriggerConsumerOnce({
+      config,
+      repository: repo,
+      launcher,
+      sleep: instantSleep,
+      logger,
+    });
+
+    expect(metricsNamed(logger, 'alarm_pipeline.investigations_launched')).toHaveLength(0);
+    expect(metricsNamed(logger, 'alarm_pipeline.trigger_to_investigation_ms')).toHaveLength(0);
   });
 });
 
