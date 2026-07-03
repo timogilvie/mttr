@@ -2,9 +2,10 @@
  * Thin instrumentation adapter for the alarm pipeline (design doc §5.6/§10).
  *
  * The repo has no shared logger: ingress uses Fastify's `request.log` (a pino-like logger
- * exposing `.info`/`.warn`/`.error`), and the trigger consumer uses an injected
- * console-like logger (`.log`/`.warn`/`.error`). `MetricSink` is intentionally structural
- * over both so call sites never need to adapt their logger, and emission never throws —
+ * exposing `.info`/`.warn`/`.error` and no `.log`), and the trigger consumer uses an
+ * injected console-like logger (`.log`/`.warn`/`.error`, defaulting to the global `console`).
+ * `MetricSink` is intentionally structural over both, and `emit()` discriminates on the
+ * presence of `.log` — call sites never need to adapt their logger. Emission never throws;
  * instrumentation must not be able to break the alarm hot path it observes.
  */
 
@@ -45,12 +46,18 @@ function emit(sink: MetricSink | undefined, payload: Record<string, unknown>): v
     return;
   }
   try {
-    if (typeof sink.info === 'function') {
-      sink.info(payload, String(payload['metric']));
-      return;
-    }
+    // Discriminate console-style (has `.log`) from pino-style (has `.info` only). `console.info`
+    // is a documented alias of `console.log` that formats args via util.inspect — not a single
+    // JSON line — so the presence of `.log` is what tells us we're looking at a console-like
+    // sink and should emit `JSON.stringify(payload)` per the runbook. Only when `.log` is
+    // absent (Fastify's `request.log`, a bare pino instance) do we route the payload+message
+    // pair to `.info` for a structured emit.
     if (typeof sink.log === 'function') {
       sink.log(JSON.stringify(payload));
+      return;
+    }
+    if (typeof sink.info === 'function') {
+      sink.info(payload, String(payload['metric']));
     }
   } catch {
     // Never let a broken/throwing logger take down the alarm ingress or consumer path.

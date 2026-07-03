@@ -8,7 +8,7 @@ import {
 
 describe('metrics', () => {
   describe('emitCounter', () => {
-    it('prefers an `.info` sink and includes the metric name as both field and message', () => {
+    it('uses a pino-style `.info` sink with the metric name as both field and message', () => {
       const info = vi.fn();
       emitCounter(
         { info },
@@ -28,7 +28,7 @@ describe('metrics', () => {
       );
     });
 
-    it('falls back to a console-like `.log` sink as a single structured JSON string', () => {
+    it('emits through `.log` as a single structured JSON string', () => {
       const log = vi.fn();
       emitCounter({ log }, ALARM_PIPELINE_COUNTER_METRICS.SEVERITY_DEFERRED, {
         trigger_id: 'trigger-2',
@@ -39,6 +39,26 @@ describe('metrics', () => {
       expect(JSON.parse(line)).toEqual({
         metric: 'alarm_pipeline.severity_deferred',
         trigger_id: 'trigger-2',
+      });
+    });
+
+    it('prefers `.log` over `.info` on a console-like sink (single JSON line, not util.inspect)', () => {
+      // `console` exposes both `.info` and `.log`, and `.info` is just an alias of `.log` that
+      // formats args via util.inspect. The trigger consumer's default logger is the global
+      // `console`, so this is exactly the shape the runbook's "one JSON line per event" contract
+      // depends on. Ensure `.log` wins so metrics land as greppable JSON, not util.inspect output.
+      const log = vi.fn();
+      const info = vi.fn();
+      emitCounter({ log, info }, ALARM_PIPELINE_COUNTER_METRICS.INVESTIGATIONS_LAUNCHED, {
+        trigger_id: 'trigger-x',
+      });
+
+      expect(info).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledTimes(1);
+      const [line] = log.mock.calls[0] as [string];
+      expect(JSON.parse(line)).toEqual({
+        metric: 'alarm_pipeline.investigations_launched',
+        trigger_id: 'trigger-x',
       });
     });
 
