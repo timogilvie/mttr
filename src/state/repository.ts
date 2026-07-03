@@ -102,7 +102,7 @@ export interface AlertRecordInput {
 export interface AgentStateRepository {
   load(): Promise<AgentState>;
   save(state: AgentState): Promise<void>;
-  startRun?(startedAt: string): Promise<string | undefined>;
+  startRun?(startedAt: string, triggerSource?: TriggerSource): Promise<string | undefined>;
   finishRun?(runId: string | undefined, update: RunRecordUpdate): Promise<void>;
   recordReconciliation?(
     runId: string | undefined,
@@ -153,7 +153,7 @@ export class FileAgentStateRepository implements AgentStateRepository {
     await saveAgentState(this.path, state);
   }
 
-  async startRun(_startedAt: string): Promise<undefined> {
+  async startRun(_startedAt: string, _triggerSource?: TriggerSource): Promise<string | undefined> {
     return undefined;
   }
 
@@ -572,7 +572,7 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
     }
   }
 
-  async startRun(startedAt: string): Promise<string> {
+  async startRun(startedAt: string, triggerSource: TriggerSource = 'scheduled'): Promise<string> {
     await this.client.query(
       `INSERT INTO worker_heartbeats (worker_id, process_name, last_seen_at, metadata_json)
        VALUES ($1, $2, $3, $4::jsonb)
@@ -589,10 +589,10 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
     );
 
     const result = await this.client.query<RunRow>(
-      `INSERT INTO runs (started_at, status, health_report_s3_uri)
-       VALUES ($1, $2, $3)
+      `INSERT INTO runs (started_at, status, health_report_s3_uri, trigger_source)
+       VALUES ($1, $2, $3, $4)
        RETURNING id`,
-      [startedAt, 'running', this.healthReportS3Uri]
+      [startedAt, 'running', this.healthReportS3Uri, triggerSource]
     );
     const id = result.rows[0]?.id;
     if (!id) {

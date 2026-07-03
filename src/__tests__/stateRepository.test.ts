@@ -178,6 +178,7 @@ class FakeStateDatabase implements DatabaseClient {
         started_at: params[0],
         status: params[1],
         health_report_s3_uri: params[2],
+        trigger_source: params[3],
       });
       return result<T>([{ id } as unknown as T]);
     }
@@ -457,6 +458,24 @@ describe('Postgres state repository', () => {
       last_seen_at: '2026-06-08T10:00:00Z',
       metadata_json: { health_report_s3_uri: 's3://bucket/report.md' },
     });
+  });
+
+  it('defaults startRun to trigger_source=scheduled', async () => {
+    const db = new FakeStateDatabase();
+    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
+
+    const runId = await repository.startRun('2026-06-08T10:00:00Z');
+
+    expect(db.runs.get(runId)).toMatchObject({ trigger_source: 'scheduled' });
+  });
+
+  it('persists trigger_source=alarm when startRun is called with an alarm trigger source', async () => {
+    const db = new FakeStateDatabase();
+    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
+
+    const runId = await repository.startRun('2026-06-08T10:00:00Z', 'alarm');
+
+    expect(db.runs.get(runId)).toMatchObject({ trigger_source: 'alarm' });
   });
 
   it('persists report hashes and recurring observations', async () => {

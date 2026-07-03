@@ -475,7 +475,7 @@ export function specDedupeKey(spec: MandatoryIncidentSpec): string {
   ].join('|');
 }
 
-function dedupeMandatorySpecs(specs: MandatoryIncidentSpec[]): MandatoryIncidentSpec[] {
+export function dedupeMandatorySpecs(specs: MandatoryIncidentSpec[]): MandatoryIncidentSpec[] {
   const byKey = new Map<string, MandatoryIncidentSpec>();
   for (const spec of specs) {
     const key = specDedupeKey(spec);
@@ -487,11 +487,18 @@ function dedupeMandatorySpecs(specs: MandatoryIncidentSpec[]): MandatoryIncident
   return [...byKey.values()];
 }
 
-export function enforceMandatoryIncidents(
+/**
+ * Core mandatory-incident reconciliation: given a set of specs (already deduped by
+ * `specDedupeKey`), enrich classification incidents that already cover a spec and add new
+ * incidents for the rest, using the fuzzy `incidentCoversSpec` match. Shared by the report path
+ * (`enforceMandatoryIncidents`, specs parsed from report text) and the alarm path
+ * (`buildClassificationFromSpecs`, specs synthesized from SNS payloads) so both stay reconciled
+ * through the same dedupe logic.
+ */
+export function enforceIncidentSpecs(
   classification: ClassificationResult,
-  report: string
+  specs: MandatoryIncidentSpec[]
 ): ClassificationResult {
-  const specs = dedupeMandatorySpecs(mandatoryIncidentSpecs(report));
   let didEnrichIncident = false;
   const enrichedIncidents = classification.incidents.map((incident) => {
     const coveringSpec = specs.find((spec) => incidentCoversSpec(incident, spec));
@@ -537,4 +544,30 @@ export function enforceMandatoryIncidents(
     incidents: allIncidents,
     findings: classification.findings.filter((_, index) => !coveredFindings.has(index)),
   };
+}
+
+export function enforceMandatoryIncidents(
+  classification: ClassificationResult,
+  report: string
+): ClassificationResult {
+  const specs = dedupeMandatorySpecs(mandatoryIncidentSpecs(report));
+  return enforceIncidentSpecs(classification, specs);
+}
+
+const EMPTY_CLASSIFICATION: ClassificationResult = {
+  summary: '',
+  overall_severity: 'NONE',
+  incidents: [],
+  findings: [],
+};
+
+/**
+ * T6 alarm entry point: synthesizes a `ClassificationResult`-shaped payload directly from
+ * out-of-band alarm specs (see `alarmSpecFromSns`), bypassing the LLM Classify stage entirely.
+ * Reuses `enforceIncidentSpecs` so an alarm-born incident is built with the exact same
+ * title/classification/affected_services as the report-path mandatory incident for the same
+ * signal, which is what lets the write-time `canonicalObservationKey` layer merge the two.
+ */
+export function buildClassificationFromSpecs(specs: MandatoryIncidentSpec[]): ClassificationResult {
+  return enforceIncidentSpecs(EMPTY_CLASSIFICATION, dedupeMandatorySpecs(specs));
 }

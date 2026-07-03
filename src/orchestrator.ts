@@ -13,16 +13,23 @@ import * as verifyStage from './stages/verify.js';
 import { mitigateStage } from './stages/stubs.js';
 import { sendSlackAlerts } from './alerts/slack.js';
 import { fetchReport } from './report/fetchReport.js';
+import { alarmSpecFromSns } from './report/alarmSpecFromSns.js';
+import {
+  buildClassificationFromSpecs,
+  type MandatoryIncidentSpec,
+} from './report/mandatoryIncidents.js';
 import {
   canonicalObservationKey,
   hashReportContent,
   hasProcessedReport,
   reconcileObservations,
   recordProcessedReport,
+  type AgentState,
   type ObservationReconciliation,
 } from './state/agentState.js';
 import {
   createAgentStateRepository,
+  type AlarmTriggerRow,
   type IncidentEventInput,
   type AgentStateRepository,
 } from './state/repository.js';
@@ -96,16 +103,168 @@ export class Orchestrator {
 
   /**
    * T6 out-of-band entry point (design §5.4): builds a ClassificationResult-shaped payload from
-   * the coalesced alarm-trigger batch and drives the existing
-   * runInvestigate → runDecide → runSelectedResponseStage chain, recording `trigger_source =
-   * 'alarm'`. Not implemented in T5 — the feature ships dark (`ALARM_WEBHOOK_ENABLED=false`), so
-   * this placeholder never executes in practice; T5 tests inject a fake launcher instead.
+   * the coalesced alarm-trigger batch — bypassing the LLM Classify stage entirely — and drives
+   * the existing runInvestigate → runDecide → runSelectedResponseStage chain, recording
+   * `trigger_source = 'alarm'`. The consumer links the originating `alarm_triggers` rows back to
+   * the returned `runId` itself (via `completeAlarmTriggers`) once this resolves `launched`.
    */
-  async runInvestigationFromTrigger(_batch: AlarmTriggerBatch): Promise<TriggerLaunchResult> {
-    return {
-      status: 'error',
-      message: 'trigger investigation entry point not implemented (T6)',
+  async runInvestigationFromTrigger(batch: AlarmTriggerBatch): Promise<TriggerLaunchResult> {
+    // Fast-path only: the authoritative single-flight guard lives inside runInvestigate(), which
+    // checks-and-flips `investigateInFlight` synchronously right before launching. This check just
+    // avoids doing synthesis/persistence work we'd have to throw away if another investigation is
+    // already running.
+    if (this.investigateInFlight) {
+      console.log('[Orchestrator] Investigate stage already in flight, deferring alarm trigger batch');
+      return { status: 'busy' };
+    }
+
+    const specs = this.buildAlarmSpecs(batch.triggers);
+    if (specs.length === 0) {
+      return {
+        status: 'error',
+        message: 'No alarm trigger in the batch produced a valid incident spec',
+      };
+    }
+
+    const classification = buildClassificationFromSpecs(specs);
+    const now = new Date().toISOString();
+    let runId: string | undefined;
+    let finished = false;
+
+    const finishRun = async (update: {
+      status: 'success' | 'error';
+      summary?: string;
+      overallSeverity?: ClassificationResult['overall_severity'];
+      errorMessage?: string;
+    }): Promise<void> => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      await this.stateRepository.finishRun?.(runId, {
+        status: update.status,
+        finishedAt: new Date().toISOString(),
+        ...(update.summary ? { summary: update.summary } : {}),
+        ...(update.overallSeverity ? { overallSeverity: update.overallSeverity } : {}),
+        ...(update.errorMessage ? { errorMessage: update.errorMessage } : {}),
+      });
     };
+
+    try {
+      console.log(
+        `[Orchestrator] Starting alarm-triggered investigation for ${specs.length} synthesized spec(s)`
+      );
+      runId = await this.stateRepository.startRun?.(now, 'alarm');
+      if (!runId) {
+        return {
+          status: 'error',
+          message: 'startRun did not return a run id for the alarm-triggered investigation',
+        };
+      }
+
+      const state = await this.stateRepository.load();
+      const {
+        classification: canonical,
+        reconciliation,
+        actionable,
+      } = await this.persistClassification(runId, state, classification, now);
+
+      if (!actionable || !reconciliation.shouldInvestigate) {
+        console.log(
+          '[Orchestrator] Alarm-triggered batch produced no new/changed observations; finishing run'
+        );
+        await finishRun({
+          status: 'success',
+          summary: canonical.summary,
+          overallSeverity: canonical.overall_severity,
+        });
+        return { status: 'launched', runId };
+      }
+
+      const downstreamSucceeded = await this.runInvestigate(canonical, runId);
+      if (!downstreamSucceeded) {
+        const message = 'Investigate or Decide stage failed for alarm-triggered run';
+        await finishRun({
+          status: 'error',
+          summary: canonical.summary,
+          overallSeverity: canonical.overall_severity,
+          errorMessage: message,
+        });
+        return { status: 'error', message };
+      }
+
+      await finishRun({
+        status: 'success',
+        summary: canonical.summary,
+        overallSeverity: canonical.overall_severity,
+      });
+      return { status: 'launched', runId };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('[Orchestrator] Unhandled error in alarm-triggered investigation:', error);
+      await finishRun({ status: 'error', errorMessage: message });
+      return { status: 'error', message };
+    }
+  }
+
+  /**
+   * Converts each eligible alarm-trigger row's raw SNS payload into a `MandatoryIncidentSpec`,
+   * reusing `alarmSpecFromSns` — the same spec builder the report path uses for active-alarm rows
+   * — so alarm-born and report-born incidents for the same signal always share the same
+   * title/classification/affected_services. Rows whose payload can't be converted (e.g. a shape
+   * `alarmSpecFromSns` rejects) are skipped rather than failing the whole batch.
+   */
+  private buildAlarmSpecs(triggers: AlarmTriggerRow[]): MandatoryIncidentSpec[] {
+    const specs: MandatoryIncidentSpec[] = [];
+    for (const trigger of triggers) {
+      const result = alarmSpecFromSns(trigger.payload);
+      if (result.ok) {
+        specs.push(result.spec);
+      } else {
+        console.warn(
+          `[Orchestrator] Alarm trigger ${trigger.id} (${trigger.alarm_name}) could not be ` +
+            `converted to an incident spec: ${result.reason}`
+        );
+      }
+    }
+    return specs;
+  }
+
+  /**
+   * Shared classification-persistence path (design §5.4 Phase 1): canonicalizes incident ids,
+   * reconciles observations against state, saves state, and records the Classify-stage output and
+   * incident events. Used by both the scheduled report path (`runClassifyAsync`) and the alarm
+   * out-of-band path (`runInvestigationFromTrigger`) so the three dedupe layers stay aligned
+   * between them. Report-fingerprint bookkeeping (`recordProcessedReport`) is deliberately kept
+   * out of this helper — that's report-path-only state that must not leak into alarm-triggered
+   * runs.
+   */
+  private async persistClassification(
+    runId: string | undefined,
+    state: AgentState,
+    classificationInput: ClassificationResult,
+    now: string
+  ): Promise<{
+    classification: ClassificationResult;
+    reconciliation: ObservationReconciliation;
+    actionable: boolean;
+  }> {
+    const classification = canonicalizeClassificationIncidents(classificationInput);
+    const reconciliation = reconcileObservations(state, classification, now);
+    await this.stateRepository.save(state);
+    await this.stateRepository.recordReconciliation?.(runId, reconciliation);
+    await this.stateRepository.recordStageOutput?.(runId, {
+      stage: 'Classify',
+      data: classification,
+    });
+    await this.stateRepository.recordIncidentEvents?.(
+      runId,
+      this.classificationEvents(classification, reconciliation)
+    );
+    this.logObservationReconciliation(reconciliation);
+
+    const actionable = classification.incidents.length > 0 || classification.findings.length > 0;
+    return { classification, reconciliation, actionable };
   }
 
   private classificationEvents(
@@ -352,26 +511,13 @@ export class Orchestrator {
         console.log('[Orchestrator] Classify stage completed successfully');
         console.log(JSON.stringify(result.data, null, 2));
 
-        const classification = canonicalizeClassificationIncidents(
-          result.data as ClassificationResult
-        );
         const now = new Date().toISOString();
         recordProcessedReport(state, this.config.healthReport.s3Uri, reportFingerprint, now);
-        const reconciliation = reconcileObservations(state, classification, now);
-        await this.stateRepository.save(state);
-        await this.stateRepository.recordReconciliation?.(runId, reconciliation);
-        await this.stateRepository.recordStageOutput?.(runId, {
-          stage: 'Classify',
-          data: classification,
-        });
-        await this.stateRepository.recordIncidentEvents?.(
-          runId,
-          this.classificationEvents(classification, reconciliation)
-        );
-        this.logObservationReconciliation(reconciliation);
-
-        const actionable =
-          classification.incidents.length > 0 || classification.findings.length > 0;
+        const {
+          classification,
+          reconciliation,
+          actionable,
+        } = await this.persistClassification(runId, state, result.data as ClassificationResult, now);
 
         if (actionable && reconciliation.shouldInvestigate) {
           const downstreamSucceeded = await this.runInvestigate(classification, runId);

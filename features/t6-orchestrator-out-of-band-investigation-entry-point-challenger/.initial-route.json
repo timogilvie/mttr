@@ -1,0 +1,18 @@
+{
+  "planner": "gpt-5.4",
+  "coder": "gpt-5.5",
+  "reviewer": "claude-opus-4-7",
+  "planDepth": "light",
+  "codeDepth": "medium",
+  "reviewMode": "static",
+  "reviewRecommended": "static",
+  "provenance": {
+    "source": "bootstrap",
+    "inputKind": "issue",
+    "inputPath": "features/t6-orchestrator-out-of-band-investigation-entry-point-challenger/selected-task.json",
+    "inputHash": "",
+    "routedAt": "2026-07-03T15:09:17Z",
+    "routerMode": "normal"
+  },
+  "maxCostUsd": 25
+}

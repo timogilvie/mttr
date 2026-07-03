@@ -1,9 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { rmSync } from 'node:fs';
+import { readFileSync, rmSync } from 'node:fs';
+import path from 'node:path';
 import { Orchestrator } from '../orchestrator.js';
 import type { Config } from '../config.js';
 import type { StageResult, ClassificationResult } from '../types.js';
 import { canonicalObservationKey } from '../state/agentState.js';
+import { FileAgentStateRepository, type AlarmTriggerRow } from '../state/repository.js';
+import type { AlarmTriggerBatch } from '../alarm/triggerConsumer.js';
 
 vi.mock('../stages/classify.js');
 vi.mock('../stages/investigate.js');
@@ -527,14 +530,189 @@ describe('Orchestrator alarm trigger consumer seam (T5)', () => {
     orchestrator.stop();
   });
 
-  it('runInvestigationFromTrigger placeholder returns the T6-not-implemented error', async () => {
-    const orchestrator = new Orchestrator(mockConfig);
+  function loadAlarmFixture(name: string): unknown {
+    return JSON.parse(
+      readFileSync(path.resolve('test/fixtures/sns-cloudwatch-alarm', name), 'utf8')
+    ) as unknown;
+  }
 
-    const result = await orchestrator.runInvestigationFromTrigger({ triggers: [], specKeys: [] });
+  function makeAlarmTriggerRow(overrides: Partial<AlarmTriggerRow> = {}): AlarmTriggerRow {
+    return {
+      id: 'trigger-1',
+      sns_message_id: 'sns-1',
+      alarm_arn: 'arn:aws:cloudwatch:us-east-1:123456789012:alarm:hokusai-auth-development-task-health',
+      alarm_name: 'hokusai-auth-development-task-health',
+      new_state: 'ALARM',
+      state_change_time: '2026-07-01T10:00:00.000Z',
+      severity: 'CRITICAL',
+      spec_key: 'active-alarm-hokusai-auth-development-task-health',
+      payload: loadAlarmFixture('task-health-alarm.json'),
+      status: 'claimed',
+      received_at: '2026-07-01T10:00:00.000Z',
+      claimed_at: '2026-07-01T10:00:01.000Z',
+      processed_at: null,
+      run_id: null,
+      ...overrides,
+    };
+  }
 
-    expect(result).toEqual({
-      status: 'error',
-      message: expect.stringContaining('T6'),
+  describe('runInvestigationFromTrigger (T6)', () => {
+    it('returns busy without doing work when an investigation is already in flight', async () => {
+      const classifyStage = await import('../stages/classify.js');
+      const investigateStage = await import('../stages/investigate.js');
+      await mockReport();
+      vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
+
+      let resolveInvestigate: (() => void) | null = null;
+      const pending = new Promise<StageResult>((resolve) => {
+        resolveInvestigate = () => resolve(investigateResult);
+      });
+      vi.mocked(investigateStage.run).mockReturnValue(pending);
+
+      const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+      const orchestrator = new Orchestrator(config);
+      orchestrator.start();
+
+      await vi.waitFor(() => expect(investigateStage.run).toHaveBeenCalledTimes(1));
+      expect(orchestrator.investigateBusy).toBe(true);
+
+      const batch: AlarmTriggerBatch = {
+        triggers: [makeAlarmTriggerRow()],
+        specKeys: ['active-alarm-hokusai-auth-development-task-health'],
+      };
+      await expect(orchestrator.runInvestigationFromTrigger(batch)).resolves.toEqual({
+        status: 'busy',
+      });
+
+      resolveInvestigate!();
+      await vi.waitFor(() => expect(orchestrator.investigateBusy).toBe(false));
+
+      orchestrator.stop();
+    });
+
+    it('returns an error when no trigger in the batch produces a valid incident spec', async () => {
+      const orchestrator = new Orchestrator(mockConfig);
+
+      const result = await orchestrator.runInvestigationFromTrigger({ triggers: [], specKeys: [] });
+
+      expect(result).toEqual({
+        status: 'error',
+        message: expect.stringContaining('valid incident spec'),
+      });
+    });
+
+    it('launches a run tagged alarm and drives the synthesized classification into Investigate/Decide', async () => {
+      const investigateStage = await import('../stages/investigate.js');
+      vi.mocked(investigateStage.run).mockResolvedValue(investigateResult);
+
+      const startRunSpy = vi
+        .spyOn(FileAgentStateRepository.prototype, 'startRun')
+        .mockResolvedValue('alarm-run-1');
+
+      const orchestrator = new Orchestrator(mockConfig);
+      const batch: AlarmTriggerBatch = {
+        triggers: [makeAlarmTriggerRow()],
+        specKeys: ['active-alarm-hokusai-auth-development-task-health'],
+      };
+
+      const result = await orchestrator.runInvestigationFromTrigger(batch);
+
+      expect(result).toEqual({ status: 'launched', runId: 'alarm-run-1' });
+      expect(startRunSpy).toHaveBeenCalledWith(expect.any(String), 'alarm');
+      expect(investigateStage.run).toHaveBeenCalledTimes(1);
+
+      const call = vi.mocked(investigateStage.run).mock.calls[0]!;
+      const classification = call[2] as ClassificationResult;
+      expect(classification.incidents).toHaveLength(1);
+      expect(classification.incidents[0]).toEqual(
+        expect.objectContaining({
+          title: 'Active alarm for hokusai-auth-development: hokusai-auth-development-task-health',
+          classification: 'UNKNOWN',
+          severity: 'CRITICAL',
+          affected_services: ['hokusai-auth-development'],
+        })
+      );
+
+      startRunSpy.mockRestore();
+    });
+
+    it('reconciles an alarm-born incident with a matching report-born incident to one identity', async () => {
+      const classifyStage = await import('../stages/classify.js');
+      const investigateStage = await import('../stages/investigate.js');
+      await mockReport();
+      vi.mocked(investigateStage.run).mockResolvedValue(investigateResult);
+
+      const startRunSpy = vi
+        .spyOn(FileAgentStateRepository.prototype, 'startRun')
+        .mockResolvedValue('run-report-1');
+
+      // Evidence phrasing intentionally differs from the alarm path's exact wording (see
+      // `buildActiveAlarmSpec`'s evidence string) — the report and alarm entry points describe
+      // the same alarm signal differently, which should still reconcile to one incident identity
+      // (title/classification/affected_services match) even though the observation is flagged
+      // "changed" rather than "recurring" and is re-investigated.
+      const reportBornIncident: ClassificationResult['incidents'][number] = {
+        incident_id: 'report-incident-1',
+        title: 'Active alarm for hokusai-auth-development: hokusai-auth-development-task-health',
+        classification: 'UNKNOWN',
+        severity: 'CRITICAL',
+        confidence: 0.95,
+        affected_services: ['hokusai-auth-development'],
+        evidence: ['Health report lists alarm hokusai-auth-development-task-health in ALARM state.'],
+        signals: {
+          alarms: ['hokusai-auth-development-task-health'],
+          metrics: [],
+          logs: [],
+        },
+        suspected_causes: ['CloudWatch alarm threshold is currently breached.'],
+        investigation_plan: {
+          priority: 1,
+          estimated_user_impact: 'COMPLETE',
+          first_actions: ['Inspect CloudWatch alarm history and reason.'],
+          questions_to_answer: ['When did the alarm enter ALARM state?'],
+          suggested_cloudwatch_queries: ['CloudWatch alarm history.'],
+        },
+        recommended_next_stage: 'INVESTIGATE',
+      };
+
+      vi.mocked(classifyStage.runWithReport).mockResolvedValue({
+        stage: 'Classify',
+        status: 'success',
+        timestamp: 't',
+        data: {
+          summary: 'Active alarm detected.',
+          overall_severity: 'CRITICAL',
+          incidents: [reportBornIncident],
+          findings: [],
+        },
+      });
+
+      const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+      const orchestrator = new Orchestrator(config);
+      orchestrator.start();
+
+      await vi.waitFor(() => expect(investigateStage.run).toHaveBeenCalledTimes(1));
+
+      const batch: AlarmTriggerBatch = {
+        triggers: [makeAlarmTriggerRow()],
+        specKeys: ['active-alarm-hokusai-auth-development-task-health'],
+      };
+      const result = await orchestrator.runInvestigationFromTrigger(batch);
+      expect(result.status).toBe('launched');
+      // runInvestigationFromTrigger fully drives Investigate/Decide before resolving, so the
+      // second call is already reflected by the time the await above completes.
+      expect(investigateStage.run).toHaveBeenCalledTimes(2);
+
+      const persisted = JSON.parse(readFileSync(config.state.path, 'utf8')) as {
+        observations: Record<string, { occurrences: number }>;
+      };
+      const observationKeys = Object.keys(persisted.observations);
+
+      expect(observationKeys).toHaveLength(1);
+      expect(persisted.observations[observationKeys[0]!]?.occurrences).toBe(2);
+
+      orchestrator.stop();
+      startRunSpy.mockRestore();
     });
   });
 

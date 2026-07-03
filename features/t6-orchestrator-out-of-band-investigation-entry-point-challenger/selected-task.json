@@ -1,0 +1,10 @@
+{
+  "taskId": "HOK-2440_c",
+  "title": "T6 · Orchestrator out-of-band investigation entry point",
+  "description": "T6 · Orchestrator out-of-band investigation entry point\n\nAdd `runInvestigationFromTrigger(specs)` to `src/orchestrator.ts`. See design doc §5.4.\n\n* Build a `ClassificationResult`-shaped payload from the synthesized specs (bypass the LLM Classify stage) and drive the existing `runInvestigate → runDecide → runSelectedResponseStage` chain.\n* Record a `run` with `trigger_source = 'alarm'` and link back to the originating `alarm_triggers` row(s).\n* Reconcile through **all three** dedupe layers (`reconcileObservations` / `canonicalObservationKey`, mandatory-spec `specDedupeKey`/`incidentCoversSpec`, and read-side) so an alarm-born incident merges with any report-born counterpart.\n* Respect the same `investigateInFlight` guard used by the scheduled tick.\n\n**Done when:** an injected trigger produces an Investigate→Decide→Verify run tagged `alarm`, and a matching report-born incident in the same window dedupes to one incident.",
+  "labels": [],
+  "workflowType": "feature",
+  "featureName": "t6-orchestrator-out-of-band-investigation-entry-point-challenger",
+  "contextPath": "features/t6-orchestrator-out-of-band-investigation-entry-point-challenger/selected-task.json",
+  "selectedAt": "2026-07-03T15:09:16Z"
+}

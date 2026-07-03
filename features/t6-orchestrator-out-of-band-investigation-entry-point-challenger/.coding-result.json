@@ -1,0 +1,9 @@
+{
+  "stage": "coding",
+  "status": "running",
+  "startedAt": "2026-07-03T15:20:04.922Z",
+  "finishedAt": null,
+  "agent": "claude",
+  "model": "claude-sonnet-5",
+  "notes": ""
+}

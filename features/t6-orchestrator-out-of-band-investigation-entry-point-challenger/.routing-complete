@@ -1,0 +1,74 @@
+{
+  "planner": "gpt-5.4",
+  "coder": "claude-sonnet-5",
+  "reviewer": "claude-opus-4-7",
+  "planDepth": "deep",
+  "codeDepth": "deep",
+  "reviewMode": "static+llm",
+  "reviewRecommended": "static+llm",
+  "provenance": {
+    "source": "expanded",
+    "inputKind": "task-packet",
+    "inputPath": "/Users/timothyogilvie/Dropbox/Hokusai/mttr/../worktrees/t6-orchestrator-out-of-band-investigation-entry-point-challenger/features/t6-orchestrator-out-of-band-investigation-entry-point-challenger/task-packet.md",
+    "inputHash": "5eb97680e3cf0c4990251ef82e6444e54fb94c30f94fe76996b08a6620ba6cb3",
+    "routedAt": "2026-07-03T15:20:01.053Z",
+    "routerMode": "normal",
+    "appliedFrom": "/Users/timothyogilvie/Dropbox/Hokusai/mttr/../worktrees/t6-orchestrator-out-of-band-investigation-entry-point-challenger/features/t6-orchestrator-out-of-band-investigation-entry-point-challenger/.post-expansion-route.json",
+    "appliedAt": "2026-07-03T15:20:01Z"
+  },
+  "maxCostUsd": 25,
+  "expectedSuccess": 0.94,
+  "confidence": 0.76,
+  "expectedCostPlan": 0.2,
+  "expectedCostCode": 12.13,
+  "expectedCostReview": 0.87,
+  "expectedCost": 13.2,
+  "reasoning": [
+    "exploration(epsilon, rate=0.2): sampled coder=claude-sonnet-5 (argmax gpt-5.5) [recency-boosted].",
+    "Stage-aware routing used 20 similar historical tasks.",
+    "Similarity range 0.59-0.63 across nearest neighbors.",
+    "Planner=gpt-5.4, coder=claude-sonnet-5, reviewer=claude-opus-4-7 maximize weighted per-stage scores.",
+    "Expected success 94% with estimated workflow cost $13.20."
+  ],
+  "signals": {
+    "taskType": "bugfix",
+    "promptLength": "long",
+    "complexityScore": 0,
+    "fileTypes": [
+      ".ts",
+      ".md"
+    ],
+    "riskScore": 8
+  },
+  "routingMode": "stage-aware",
+  "neighborCount": 20,
+  "neighborSimilarityRange": [
+    0.59,
+    0.63
+  ],
+  "exploration": {
+    "mode": "epsilon",
+    "explored": [
+      {
+        "role": "coder",
+        "sampled": "claude-sonnet-5",
+        "argmax": "gpt-5.5",
+        "recencyBoosted": true
+      }
+    ]
+  },
+  "constraints": {
+    "maxCostUsd": 25
+  },
+  "challengeRecommendation": {
+    "shouldChallenge": true,
+    "reason": "new-model",
+    "defaultModel": "claude-sonnet-4-6",
+    "challengerModel": "claude-opus-4-8",
+    "stage": "implementation",
+    "priority": 300
+  },
+  "cache_hit": false,
+  "route_source": "single",
+  "packet_hash": "bdbcdeaa742a07610abc2c1dd53d087c8731727ab025f658aeac7850f9c4c608"
+}
