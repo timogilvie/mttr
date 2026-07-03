@@ -245,4 +245,147 @@ describe('investigationSchema', () => {
       expect((error as InvestigationValidationError).message).toContain('overall_severity');
     }
   });
+
+  describe('causal_evidence', () => {
+    it('accepts a legacy investigation payload without causal_evidence or mitigation fields', () => {
+      const result = parseInvestigation(validResult());
+
+      expect(result.investigations[0]?.causal_evidence).toBeUndefined();
+      expect(result.investigations[0]?.mitigation_confidence).toBeUndefined();
+      expect(result.investigations[0]?.confidence_justification).toBeUndefined();
+    });
+
+    it('accepts a fully populated causal_evidence section distinct from symptom evidence', () => {
+      const result = parseInvestigation(
+        validResult({
+          investigations: [
+            validInvestigation({
+              original_classification: 'APPLICATION_ERROR',
+              investigation_status: 'CONFIRMED_INCIDENT',
+              causal_evidence: {
+                performed: true,
+                failure_concentration: {
+                  dimension: 'endpoint',
+                  values: [{ value: 'POST /predict', count: 18 }],
+                },
+                first_bad_timestamp: '2026-07-02T10:15:00Z',
+                first_bad_source: 'application logs',
+                change_correlation: [
+                  {
+                    type: 'deploy',
+                    timestamp: '2026-07-02T10:14:30Z',
+                    description: 'ECS deployment registered a new task definition.',
+                  },
+                ],
+                task_health: {
+                  summary: '2 tasks stopped with OOM exit codes.',
+                  stopped_task_count: 2,
+                  details: ['task abc123 exitCode=137 reason="OutOfMemoryError"'],
+                },
+                resource_saturation: [
+                  { resource: 'ECS service', metric: 'MemoryUtilization', summary: 'Peaked at 97%.' },
+                ],
+                dependency_health: [
+                  { dependency: 'postgres-db', status: 'degraded', summary: 'Connection timeouts observed.' },
+                ],
+                found: ['Failures concentrate on POST /predict returning 503.'],
+                missing: [],
+                next_highest_value_query: 'Confirm the deploy is the cause via a canary rollback.',
+              },
+              mitigation_confidence: 'high',
+              confidence_justification:
+                'First-bad timestamp correlates within 30s of an ECS deployment, and memory saturation corroborates task instability.',
+            }),
+          ],
+        })
+      );
+
+      const investigation = result.investigations[0];
+      expect(investigation?.causal_evidence?.performed).toBe(true);
+      expect(investigation?.causal_evidence?.failure_concentration?.dimension).toBe('endpoint');
+      expect(investigation?.causal_evidence?.change_correlation).toHaveLength(1);
+      expect(investigation?.mitigation_confidence).toBe('high');
+      expect(investigation?.confidence_justification).toContain('ECS deployment');
+      // Symptom evidence and causal evidence are separate keys.
+      expect(investigation?.confirmed_facts).not.toEqual(investigation?.causal_evidence?.found);
+    });
+
+    it('accepts a partial causal_evidence section with only performed and missing set', () => {
+      const result = parseInvestigation(
+        validResult({
+          investigations: [
+            validInvestigation({
+              causal_evidence: {
+                performed: true,
+                missing: ['no error logs found', 'change correlation source unavailable'],
+              },
+            }),
+          ],
+        })
+      );
+
+      expect(result.investigations[0]?.causal_evidence?.performed).toBe(true);
+      expect(result.investigations[0]?.causal_evidence?.missing).toEqual([
+        'no error logs found',
+        'change correlation source unavailable',
+      ]);
+      expect(result.investigations[0]?.causal_evidence?.change_correlation).toEqual([]);
+      expect(result.investigations[0]?.causal_evidence?.found).toEqual([]);
+    });
+
+    it('rejects an invalid failure_concentration dimension enum', () => {
+      const result = validResult({
+        investigations: [
+          validInvestigation({
+            causal_evidence: {
+              performed: true,
+              failure_concentration: { dimension: 'foobar', values: [] },
+            },
+          }),
+        ],
+      });
+
+      expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
+    });
+
+    it('rejects an invalid mitigation_confidence enum value', () => {
+      const result = validResult({
+        investigations: [validInvestigation({ mitigation_confidence: 'unknown' })],
+      });
+
+      expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
+    });
+
+    it('rejects an invalid change_correlation event type', () => {
+      const result = validResult({
+        investigations: [
+          validInvestigation({
+            causal_evidence: {
+              performed: true,
+              change_correlation: [
+                { type: 'not-a-real-type', timestamp: '2026-07-02T10:15:00Z', description: 'x' },
+              ],
+            },
+          }),
+        ],
+      });
+
+      expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
+    });
+
+    it('rejects an invalid dependency_health status enum', () => {
+      const result = validResult({
+        investigations: [
+          validInvestigation({
+            causal_evidence: {
+              performed: true,
+              dependency_health: [{ dependency: 'postgres-db', status: 'on-fire', summary: 'x' }],
+            },
+          }),
+        ],
+      });
+
+      expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
+    });
+  });
 });

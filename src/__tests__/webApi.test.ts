@@ -574,6 +574,32 @@ describe('web API', () => {
     expect(subscribeCalls).toEqual([]);
   });
 
+  it('refuses to confirm a subscription whose SubscribeURL is not an SNS host', async () => {
+    const subscribeCalls: string[] = [];
+    const { app } = appFor(configWithWebhook(), new FakeApiDatabase(), {
+      fetchSigningCert: async () => certPem,
+      confirmSubscriptionGet: async (url) => {
+        subscribeCalls.push(url);
+      },
+    });
+    // Correct topic + signature, but SubscribeURL points at an internal host:
+    // confirming it would be an SSRF, so it must be rejected without a fetch.
+    const message = subscriptionConfirmationMessage({
+      SubscribeURL: 'https://169.254.169.254/latest/meta-data/',
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/secret-token',
+      payload: JSON.stringify(message),
+      headers: { 'content-type': 'text/plain' },
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: 'invalid_subscribe_url' });
+    expect(subscribeCalls).toEqual([]);
+  });
+
   it('rejects requests with the wrong path token before enqueueing', async () => {
     const db = new FakeApiDatabase();
     const { app } = appFor(configWithWebhook(), db, {

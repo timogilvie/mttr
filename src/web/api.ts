@@ -12,6 +12,7 @@ import type { Severity } from '../types.js';
 import {
   UnsupportedSnsMessageError,
   confirmSnsSubscription,
+  isAllowedSnsUrl,
   parseCloudWatchAlarmMessage,
   parseSnsMessage,
   verifySnsMessageSignature,
@@ -311,6 +312,16 @@ export function createWebServer(
             config.alarm.webhook.topicArn &&
             message.TopicArn === config.alarm.webhook.topicArn
           ) {
+            // Only GET a SubscribeURL that points at an AWS SNS host, so the
+            // confirmation handshake can never be turned into an SSRF request to
+            // an arbitrary internal endpoint.
+            if (!isAllowedSnsUrl(message.SubscribeURL)) {
+              request.log.warn(
+                { topicArn: message.TopicArn },
+                'Refusing to confirm SNS subscription: SubscribeURL is not an SNS host'
+              );
+              return reply.code(403).send({ error: 'invalid_subscribe_url' });
+            }
             try {
               const confirmationOptions = {};
               if (webhookDependencies.confirmSubscriptionGet) {

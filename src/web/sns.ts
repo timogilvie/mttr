@@ -195,6 +195,21 @@ export function isAllowedSigningCertUrl(value: string): boolean {
   return url.protocol === 'https:' && CERT_HOST_RE.test(url.hostname);
 }
 
+/**
+ * True when `value` is an HTTPS URL whose host is an AWS SNS endpoint. Used to
+ * bound the `SubscribeURL` we GET during the confirmation handshake so a forged
+ * (or unexpected) URL cannot turn the handshake into an SSRF primitive.
+ */
+export function isAllowedSnsUrl(value: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  return url.protocol === 'https:' && CERT_HOST_RE.test(url.hostname);
+}
+
 async function defaultFetchCert(url: string, signal: AbortSignal): Promise<string> {
   const response = await fetch(url, { signal });
   if (!response.ok) {

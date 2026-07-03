@@ -1,0 +1,17 @@
+{
+  "AlarmName": "hokusai-auth-development-task-health",
+  "AlarmArn": "arn:aws:cloudwatch:us-east-1:123456789012:alarm:hokusai-auth-development-task-health",
+  "AWSAccountId": "123456789012",
+  "NewStateValue": "ALARM",
+  "NewStateReason": "Threshold Crossed",
+  "StateChangeTime": "2026-07-01T10:00:00.000+0000",
+  "Region": "US East (N. Virginia)",
+  "Trigger": {
+    "MetricName": "HealthyTaskCount",
+    "Namespace": "ECS/ContainerInsights",
+    "Dimensions": [
+      { "name": "ServiceName", "value": "hokusai-auth-development" },
+      { "name": "ClusterName", "value": "hokusai-development" }
+    ]
+  }
+}

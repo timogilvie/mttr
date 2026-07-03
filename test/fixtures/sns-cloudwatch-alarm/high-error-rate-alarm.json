@@ -1,0 +1,17 @@
+{
+  "AlarmName": "hokusai-auth-development-high-error-rate",
+  "AlarmArn": "arn:aws:cloudwatch:us-east-1:123456789012:alarm:hokusai-auth-development-high-error-rate",
+  "AWSAccountId": "123456789012",
+  "NewStateValue": "ALARM",
+  "NewStateReason": "Threshold Crossed",
+  "StateChangeTime": "2026-07-01T10:05:00.000+0000",
+  "Region": "US East (N. Virginia)",
+  "Trigger": {
+    "MetricName": "HTTPCode_Target_5XX_Count",
+    "Namespace": "AWS/ApplicationELB",
+    "Dimensions": [
+      { "name": "ServiceName", "value": "hokusai-auth-development" },
+      { "name": "LoadBalancer", "value": "app/hokusai-auth-development/abc123" }
+    ]
+  }
+}

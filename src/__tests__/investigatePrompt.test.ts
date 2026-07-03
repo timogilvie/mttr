@@ -120,4 +120,70 @@ describe('investigatePrompt', () => {
     expect(prompt).toContain('Do not fabricate');
     expect(prompt).toContain('Preserve service names exactly');
   });
+
+  it('instructs the causal-evidence pivot for confirmed application errors', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('Causal-Evidence Pivot');
+    expect(prompt).toContain('symptom confirmation');
+    expect(prompt).toContain('CONFIRMED_INCIDENT');
+    expect(prompt).toContain('causal_evidence.performed=true');
+  });
+
+  it('lists all seven causal-evidence categories', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('Failure concentration');
+    expect(prompt).toContain('First-bad timestamp');
+    expect(prompt).toContain('Adjacent error logs');
+    expect(prompt).toContain('Deployment / config / runtime change correlation');
+    expect(prompt).toContain('Task health');
+    expect(prompt).toContain('Resource saturation');
+    expect(prompt).toContain('Dependency health');
+  });
+
+  it('emphasizes generic, non-service-specific target resolution', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('This playbook is generic');
+    expect(prompt).toContain('never only to a specific named service');
+  });
+
+  it('describes graceful degradation for missing or failed causal evidence', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('causal_evidence.missing');
+    expect(prompt).toContain('never a reason to fail the investigation');
+  });
+
+  it('instructs the priority rule for next_highest_value_query', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('next_highest_value_query');
+    expect(prompt).toContain(
+      'dependency health, change/deploy correlation, first-bad timestamp, task health, resource saturation, failure concentration, adjacent logs'
+    );
+    expect(prompt).toContain('still non-empty');
+  });
+
+  it('instructs mitigation_confidence and confidence_justification', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('mitigation_confidence');
+    expect(prompt).toContain('confidence_justification');
+    expect(prompt).toContain('mitigation_confidence=high requires a corroborated causal chain');
+  });
+
+  it('encodes causal_evidence and mitigation fields in the output schema', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('"causal_evidence"');
+    expect(prompt).toContain('"failure_concentration"');
+    expect(prompt).toContain('"change_correlation"');
+    expect(prompt).toContain('"task_health"');
+    expect(prompt).toContain('"resource_saturation"');
+    expect(prompt).toContain('"dependency_health"');
+    expect(prompt).toContain('"next_highest_value_query"');
+    expect(prompt).toContain('"mitigation_confidence": "high | medium | low"');
+  });
 });
