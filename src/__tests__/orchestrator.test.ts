@@ -441,3 +441,149 @@ describe('Orchestrator', () => {
     orchestrator.stop();
   });
 });
+
+describe('Orchestrator alarm trigger consumer seam (T5)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    stateFileCounter += 1;
+    mockConfig.state.path = `/private/tmp/mttr-orchestrator-${process.pid}-${stateFileCounter}.json`;
+    rmSync(mockConfig.state.path, { force: true });
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    rmSync(mockConfig.state.path, { force: true });
+    vi.useRealTimers();
+  });
+
+  async function mockReport(text = '# report'): Promise<void> {
+    const { fetchReport } = await import('../report/fetchReport.js');
+    vi.mocked(fetchReport).mockResolvedValue(text);
+  }
+
+  const actionableClassification: ClassificationResult = {
+    summary: 'A finding to investigate.',
+    overall_severity: 'MEDIUM',
+    incidents: [],
+    findings: [
+      {
+        title: 'High 4xx',
+        classification: 'AUTH_FAILURE',
+        severity: 'MEDIUM',
+        confidence: 0.7,
+        affected_services: ['api'],
+        evidence: ['e'],
+        reason_not_incident: 'r',
+      },
+    ],
+  };
+
+  const actionableClassifyResult: StageResult = {
+    stage: 'Classify',
+    status: 'success',
+    timestamp: 't',
+    data: actionableClassification,
+  };
+
+  const investigateResult: StageResult = {
+    stage: 'Investigate',
+    status: 'success',
+    timestamp: 't',
+    data: {
+      summary: 'done',
+      overall_assessment: 'POSSIBLE_INCIDENT',
+      overall_severity: 'MEDIUM',
+      investigations: [],
+      cross_cutting_observations: [],
+      priority_order: [],
+    },
+  };
+
+  it('investigateBusy reflects the in-flight Investigate stage', async () => {
+    const classifyStage = await import('../stages/classify.js');
+    const investigateStage = await import('../stages/investigate.js');
+    await mockReport();
+
+    vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
+
+    let resolveInvestigate: (() => void) | null = null;
+    const pending = new Promise<StageResult>((resolve) => {
+      resolveInvestigate = () => resolve(investigateResult);
+    });
+    vi.mocked(investigateStage.run).mockReturnValue(pending);
+
+    const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+    const orchestrator = new Orchestrator(config);
+
+    expect(orchestrator.investigateBusy).toBe(false);
+    orchestrator.start();
+
+    await vi.waitFor(() => expect(investigateStage.run).toHaveBeenCalledTimes(1));
+    expect(orchestrator.investigateBusy).toBe(true);
+
+    resolveInvestigate!();
+    await vi.waitFor(() => expect(orchestrator.investigateBusy).toBe(false));
+
+    orchestrator.stop();
+  });
+
+  it('runInvestigationFromTrigger placeholder returns the T6-not-implemented error', async () => {
+    const orchestrator = new Orchestrator(mockConfig);
+
+    const result = await orchestrator.runInvestigationFromTrigger({ triggers: [], specKeys: [] });
+
+    expect(result).toEqual({
+      status: 'error',
+      message: expect.stringContaining('T6'),
+    });
+  });
+
+  it('starts the alarm trigger consumer when the webhook feature is enabled', async () => {
+    const classifyStage = await import('../stages/classify.js');
+    const investigateStage = await import('../stages/investigate.js');
+    await mockReport();
+    vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
+    vi.mocked(investigateStage.run).mockResolvedValue(investigateResult);
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const config = {
+      ...mockConfig,
+      monitoring: { intervalMs: 1_000_000 },
+      alarm: {
+        ...mockConfig.alarm,
+        webhook: { ...mockConfig.alarm.webhook, enabled: true },
+      },
+    };
+    const orchestrator = new Orchestrator(config);
+
+    orchestrator.start();
+
+    expect(
+      logSpy.mock.calls.some((call) => String(call[0]).includes('Alarm trigger consumer started'))
+    ).toBe(true);
+
+    expect(() => orchestrator.stop()).not.toThrow();
+    logSpy.mockRestore();
+  });
+
+  it('does not start the alarm trigger consumer when the webhook feature is disabled', async () => {
+    const classifyStage = await import('../stages/classify.js');
+    const investigateStage = await import('../stages/investigate.js');
+    await mockReport();
+    vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
+    vi.mocked(investigateStage.run).mockResolvedValue(investigateResult);
+
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+    const orchestrator = new Orchestrator(config);
+
+    orchestrator.start();
+
+    expect(
+      logSpy.mock.calls.some((call) => String(call[0]).includes('Alarm trigger consumer started'))
+    ).toBe(false);
+
+    orchestrator.stop();
+    logSpy.mockRestore();
+  });
+});
