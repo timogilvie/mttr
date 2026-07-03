@@ -108,11 +108,22 @@ function formatMetricAlarm(alarm: MetricAlarm): string {
   if (alarm.Namespace || alarm.MetricName) {
     parts.push(`metric=${alarm.Namespace ?? '?'}/${alarm.MetricName ?? '?'}`);
   }
+  if (alarm.Dimensions && alarm.Dimensions.length > 0) {
+    parts.push(
+      `dimensions=[${alarm.Dimensions.map((d) => `${d.Name ?? '?'}=${d.Value ?? '?'}`).join(', ')}]`
+    );
+  }
   if (alarm.Statistic || alarm.ExtendedStatistic) {
     parts.push(`stat=${alarm.Statistic ?? alarm.ExtendedStatistic}`);
   }
   if (alarm.ComparisonOperator !== undefined && alarm.Threshold !== undefined) {
     parts.push(`condition=${alarm.ComparisonOperator} ${alarm.Threshold}`);
+  }
+  if (alarm.Period !== undefined && alarm.EvaluationPeriods !== undefined) {
+    parts.push(`evaluationPeriod=${alarm.Period}s x ${alarm.EvaluationPeriods}`);
+  }
+  if (alarm.DatapointsToAlarm !== undefined) {
+    parts.push(`datapointsToAlarm=${alarm.DatapointsToAlarm}`);
   }
   if (alarm.TreatMissingData) {
     parts.push(`treatMissingData=${alarm.TreatMissingData}`);
@@ -267,7 +278,7 @@ async function handler(args: FindAlarmsArgs, ctx: ToolContext): Promise<string> 
 export const findAlarmsTool: ToolDefinition<FindAlarmsArgs> = {
   name: 'find_alarms',
   description:
-    'Read-only: list CloudWatch alarms with current state, thresholds, and missing-data handling — either the alarms watching an exact metric (namespace + metric_name) or alarms matching a name search/prefix. Use to answer whether alarm coverage exists for a signal or service.',
+    'Read-only: list CloudWatch alarms with current state, exact metric identity (namespace/dimensions), threshold, evaluation period, and missing-data handling — either the alarms watching an exact metric (namespace + metric_name) or alarms matching a name search/prefix. Use to answer whether alarm coverage exists for a signal or service.',
   parametersJsonSchema,
   argsSchema,
   handler,

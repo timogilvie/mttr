@@ -5,6 +5,8 @@ import type {
   ClassificationResult,
   InvestigationResult,
   EvidenceRequirementType,
+  TelemetryFallbackAttempt,
+  TelemetryGap,
 } from '../types.js';
 import { buildInvestigatePrompt } from '../prompts/investigatePrompt.js';
 import { callOpenRouterWithTools, type ToolLoopOptions } from '../llm/toolLoop.js';
@@ -1118,11 +1120,379 @@ async function runRequiredEvidenceTool(
   }
 }
 
+const MAX_RUNTIME_OWNER_LOG_GROUPS = 2;
+
+function isToolErrorText(text: string): boolean {
+  return /\nError: /.test(text);
+}
+
+function hasMetricDatapoints(text: string): boolean {
+  return /Metric datapoints \(\d+\)/.test(text);
+}
+
+function hasNoMetricDatapoints(text: string): boolean {
+  return /No metric datapoints in the requested window/.test(text);
+}
+
+function hasRuntimeRows(text: string): boolean {
+  return /Query returned \d+ row\(s\):/.test(text);
+}
+
+/**
+ * Deterministic signals accumulated across every fallback tool call for one
+ * investigation item, used to classify an unresolved telemetry gap without
+ * relying on the model to self-report why evidence stayed thin.
+ */
+interface TelemetryActivitySignals {
+  metricAttempted: boolean;
+  metricResolved: boolean;
+  metricUnresolved: boolean;
+  logGapAttempted: boolean;
+  logGapResolved: boolean;
+  activityObserved: boolean;
+  ownerFound: boolean;
+  toolError: boolean;
+  nextMetricSource?: string | undefined;
+  nextLogSource?: string | undefined;
+}
+
+function emptyTelemetrySignals(): TelemetryActivitySignals {
+  return {
+    metricAttempted: false,
+    metricResolved: false,
+    metricUnresolved: false,
+    logGapAttempted: false,
+    logGapResolved: false,
+    activityObserved: false,
+    ownerFound: false,
+    toolError: false,
+  };
+}
+
+function mergeTelemetrySignals(
+  current: TelemetryActivitySignals,
+  update: Partial<TelemetryActivitySignals>
+): TelemetryActivitySignals {
+  return {
+    metricAttempted: current.metricAttempted || Boolean(update.metricAttempted),
+    metricResolved: current.metricResolved || Boolean(update.metricResolved),
+    metricUnresolved: current.metricUnresolved || Boolean(update.metricUnresolved),
+    logGapAttempted: current.logGapAttempted || Boolean(update.logGapAttempted),
+    logGapResolved: current.logGapResolved || Boolean(update.logGapResolved),
+    activityObserved: current.activityObserved || Boolean(update.activityObserved),
+    ownerFound: current.ownerFound || Boolean(update.ownerFound),
+    toolError: current.toolError || Boolean(update.toolError),
+    nextMetricSource:
+      update.metricUnresolved && update.nextMetricSource
+        ? update.nextMetricSource
+        : (current.nextMetricSource ?? update.nextMetricSource),
+    nextLogSource: current.nextLogSource ?? update.nextLogSource,
+  };
+}
+
+/**
+ * Deterministically classify an unresolved telemetry gap from the fallback
+ * attempts and activity signals gathered for one investigation item. Returns
+ * undefined when no fallback was attempted, or when every attempted fallback
+ * resolved the original missing-telemetry problem (recorded instead as
+ * telemetry_fallbacks with outcome "resolved").
+ */
+function classifyTelemetryGap(
+  attempts: TelemetryFallbackAttempt[],
+  signals: TelemetryActivitySignals
+): TelemetryGap | undefined {
+  const metricGap = signals.metricUnresolved || (signals.metricAttempted && !signals.metricResolved);
+  const logGap = signals.logGapAttempted && !signals.logGapResolved;
+
+  if (attempts.length === 0 || (!metricGap && !logGap)) {
+    return undefined;
+  }
+
+  if (signals.toolError) {
+    return {
+      kind: 'unknown',
+      next_telemetry_source:
+        signals.nextMetricSource ??
+        signals.nextLogSource ??
+        fallbackNextTelemetrySource(attempts) ??
+        'Retry get_metrics_and_alarms or query_logs for the exact source named in the failed fallback attempt.',
+      fallback_attempts: attempts,
+      reason: 'A telemetry fallback attempt errored, so the gap cannot be classified with confidence.',
+    };
+  }
+
+  if (metricGap && signals.activityObserved) {
+    return {
+      kind: 'instrumentation',
+      next_telemetry_source:
+        signals.nextMetricSource ??
+        fallbackNextTelemetrySource(attempts) ??
+        'Inspect the CloudWatch metric namespace and dimensions captured in the metric_widened_lookback fallback.',
+      fallback_attempts: attempts,
+      reason:
+        'Runtime activity was confirmed but the metric never published datapoints even after widened discovery.',
+    };
+  }
+
+  if (logGap && signals.ownerFound) {
+    return {
+      kind: 'discovery',
+      next_telemetry_source:
+        signals.nextLogSource ??
+        fallbackNextTelemetrySource(attempts) ??
+        'Run discover_log_groups for the resolved ECS service, Lambda function, or EventBridge rule named in runtime_owner_discovery.',
+      fallback_attempts: attempts,
+      reason: 'A runtime owner was identified but no log group or log rows could be located after retry.',
+    };
+  }
+
+  if (!signals.ownerFound && !signals.activityObserved) {
+    return {
+      kind: 'runtime',
+      next_telemetry_source:
+        signals.nextMetricSource ??
+        signals.nextLogSource ??
+        fallbackNextTelemetrySource(attempts) ??
+        'Run get_ecs_service_events, list_metrics, and find_alarms for the exact affected service name from this incident.',
+      fallback_attempts: attempts,
+      reason:
+        'No runtime owner or activity could be found across metrics, logs, or discovery after bounded alternate lookups.',
+    };
+  }
+
+  return {
+    kind: 'unknown',
+    next_telemetry_source:
+      signals.nextMetricSource ??
+      signals.nextLogSource ??
+      fallbackNextTelemetrySource(attempts) ??
+      'Re-run the concrete fallback query recorded in telemetry_fallbacks for this investigation item.',
+    fallback_attempts: attempts,
+    reason: 'Fallback attempts left conflicting or insufficient signal to classify the gap confidently.',
+  };
+}
+
+function fallbackNextTelemetrySource(attempts: TelemetryFallbackAttempt[]): string | undefined {
+  for (const attempt of attempts.slice().reverse()) {
+    if (attempt.next_source) {
+      return attempt.next_source;
+    }
+  }
+  const lastAttempt = attempts[attempts.length - 1];
+  const lastQuery = lastAttempt?.query;
+  return lastQuery ? `Re-run ${lastQuery}` : undefined;
+}
+
+/**
+ * Collects telemetry-gap fallback attempts and activity signals per
+ * investigation item while standard evidence is gathered, so Investigate can
+ * pivot to alternate discovery paths before declaring an item an
+ * observability gap, and can guarantee the attempt is captured even if the
+ * model omits it from its structured output.
+ */
+class TelemetryFallbackCollector {
+  private readonly attempts = new Map<string, TelemetryFallbackAttempt[]>();
+  private readonly signals = new Map<string, TelemetryActivitySignals>();
+
+  record(id: string, attempt: TelemetryFallbackAttempt): void {
+    const list = this.attempts.get(id) ?? [];
+    list.push(attempt);
+    this.attempts.set(id, list);
+  }
+
+  mergeSignals(id: string, update: Partial<TelemetryActivitySignals>): void {
+    const current = this.signals.get(id) ?? emptyTelemetrySignals();
+    this.signals.set(id, mergeTelemetrySignals(current, update));
+  }
+
+  fallbacksById(): Map<string, TelemetryFallbackAttempt[]> {
+    return this.attempts;
+  }
+
+  gapsById(): Map<string, TelemetryGap> {
+    const gaps = new Map<string, TelemetryGap>();
+    for (const [id, attempts] of this.attempts) {
+      const signals = this.signals.get(id) ?? emptyTelemetrySignals();
+      const gap = classifyTelemetryGap(attempts, signals);
+      if (gap) {
+        gaps.set(id, gap);
+      }
+    }
+    return gaps;
+  }
+}
+
+/**
+ * Attempt alternate runtime-owner discovery when a service name resolves no
+ * standard log groups: the service-resource registry (and evidence parsed
+ * from it), Lambda/EventBridge names recovered from metric dimensions, and an
+ * ECS service-events check. Retries log discovery/query against whatever
+ * owner is found so an observability gap is only declared after this bounded
+ * fallback, per the Investigate telemetry-gap recovery requirement.
+ */
+async function attemptRuntimeOwnerDiscovery(
+  id: string,
+  kind: InvestigationItem['kind'],
+  service: string,
+  discoveryText: string,
+  metricDiscoveryText: string,
+  ctx: ToolContext,
+  telemetry: TelemetryFallbackCollector
+): Promise<{ sections: string[]; logGroups: string[] }> {
+  const sections: string[] = [];
+  const resolved = resolveServiceResource(service, `${discoveryText}\n${metricDiscoveryText}`);
+  const lambdaNames = selectLambdaFunctions(metricDiscoveryText);
+  const eventBridgeNames = selectEventBridgeRules(metricDiscoveryText);
+
+  const ecsEvidence = await runEvidenceTool(
+    `### ${id} ${kind}: ECS service check for ${service} (runtime-owner discovery fallback)`,
+    () => ecsServiceEventsTool.handler({ service_name: service }, ctx)
+  );
+  sections.push(ecsEvidence);
+  const ecsActive = /status=ACTIVE/.test(ecsEvidence);
+  const ecsErrored = isToolErrorText(ecsEvidence);
+
+  // resolveServiceResource tags matchedBy=['evidence'] whenever it merely
+  // looked at non-empty evidence text, even if no regex actually matched
+  // anything — so only a known-registry match or a concretely extracted
+  // ECS/log-group/alias/Lambda/EventBridge name counts as a resolved owner.
+  const ownerFound =
+    resolved.matchedBy.includes('known-registry') ||
+    resolved.ecsServices.length > 0 ||
+    resolved.logGroups.length > 0 ||
+    resolved.aliases.length > 0 ||
+    lambdaNames.length > 0 ||
+    eventBridgeNames.length > 0 ||
+    ecsActive;
+
+  telemetry.mergeSignals(id, {
+    logGapAttempted: true,
+    ownerFound,
+    activityObserved: ecsActive,
+    toolError: ecsErrored,
+  });
+
+  telemetry.record(id, {
+    path: 'runtime_owner_discovery',
+    query: `resolve runtime owner for ${service} via the service-resource registry, get_ecs_service_events, and Lambda/EventBridge names from metric dimensions`,
+    outcome: ownerFound ? 'resolved' : 'empty',
+    detail: ownerFound
+      ? `Resolved an alternate runtime owner for ${service}: ${[
+          resolved.matchedBy.includes('known-registry') ? 'known service-resource registry entry' : null,
+          resolved.ecsServices.length > 0
+            ? `ECS service(s) ${resolved.ecsServices.map((s) => s.serviceName).join(', ')}`
+            : null,
+          lambdaNames.length > 0 ? `Lambda function(s) ${lambdaNames.join(', ')}` : null,
+          eventBridgeNames.length > 0 ? `EventBridge rule(s) ${eventBridgeNames.join(', ')}` : null,
+          ecsActive ? 'an active ECS service match' : null,
+        ]
+          .filter(Boolean)
+          .join('; ')}.`
+      : `No alternate runtime owner could be resolved for ${service} via the service-resource registry, ECS service events, or Lambda/EventBridge names from metric dimensions.`,
+    next_source: resolved.logGroups[0] ?? (lambdaNames[0] ? `/aws/lambda/${lambdaNames[0]}` : undefined),
+  });
+
+  const directLogGroups = uniqueValues([
+    ...resolved.logGroups,
+    ...lambdaNames.map((name) => `/aws/lambda/${name}`),
+  ]).slice(0, MAX_RUNTIME_OWNER_LOG_GROUPS);
+
+  const aliasCandidates = uniqueValues([
+    ...resolved.aliases,
+    ...resolved.ecsServices.map((s) => s.serviceName),
+  ]).filter((alias) => alias.toLowerCase() !== service.toLowerCase());
+
+  const candidateLogGroups = [...directLogGroups];
+  let attemptedAlias: string | undefined;
+  if (candidateLogGroups.length === 0 && aliasCandidates.length > 0) {
+    const alias = aliasCandidates[0]!;
+    attemptedAlias = alias;
+    const retryDiscovery = await runEvidenceTool(
+      `### ${id} ${kind}: discover_log_groups(${alias}) (runtime-owner discovery fallback for ${service})`,
+      () => discoverLogGroupsTool.handler({ service_name: alias, limit: 5 }, ctx)
+    );
+    sections.push(retryDiscovery);
+    candidateLogGroups.push(...selectStandardLogGroups(retryDiscovery));
+  }
+
+  if (candidateLogGroups.length === 0 && aliasCandidates.length === 0) {
+    telemetry.mergeSignals(id, {
+      nextLogSource: `discover_log_groups for ${service} using the runtime owner found in runtime_owner_discovery`,
+    });
+    return { sections, logGroups: [] };
+  }
+
+  let runtimeRowsFound = false;
+  let queryErrored = false;
+  for (const logGroup of candidateLogGroups.slice(0, MAX_RUNTIME_OWNER_LOG_GROUPS)) {
+    const activityText = await runEvidenceTool(
+      `### ${id} ${kind}: recent runtime activity sample on ${logGroup} (runtime-owner discovery fallback for ${service})`,
+      () =>
+        queryLogsTool.handler(
+          {
+            log_group: logGroup,
+            filter_or_query: RECENT_ACTIVITY_QUERY,
+            lookback_minutes: ctx.maxLookbackMinutes,
+            limit: 25,
+          },
+          ctx
+        )
+    );
+    sections.push(activityText);
+    if (hasRuntimeRows(activityText)) {
+      runtimeRowsFound = true;
+    }
+    if (isToolErrorText(activityText)) {
+      queryErrored = true;
+    }
+  }
+
+  // A resolved log group name alone is not proof of activity: only recent rows
+  // confirm the workload actually ran, so classification treats "found the
+  // group but zero rows" the same as "no group at all" (still a gap).
+  const logGapResolved = runtimeRowsFound;
+  telemetry.mergeSignals(id, {
+    logGapResolved,
+    activityObserved: runtimeRowsFound,
+    toolError: queryErrored,
+    nextLogSource: candidateLogGroups[0]
+      ? `query_logs against ${candidateLogGroups[0]} with a wider lookback window`
+      : attemptedAlias
+        ? `discover_log_groups for resolved runtime owner ${attemptedAlias}`
+        : `discover_log_groups for ${service} using the runtime owner found in runtime_owner_discovery`,
+  });
+
+  telemetry.record(id, {
+    path: 'log_group_retry',
+    query:
+      candidateLogGroups.length > 0
+        ? `query_logs recent-activity retry on ${candidateLogGroups.join(', ')}`
+        : `discover_log_groups retry using alternate owner name "${aliasCandidates[0]}"`,
+    outcome: queryErrored ? 'error' : logGapResolved ? 'resolved' : 'empty',
+    detail: queryErrored
+      ? 'The log retry against the discovered runtime owner failed.'
+      : runtimeRowsFound
+        ? `Recent runtime log rows were found on ${candidateLogGroups.join(', ')} after retry.`
+        : candidateLogGroups.length > 0
+          ? `Log group(s) ${candidateLogGroups.join(', ')} were found but returned no recent rows.`
+          : `No log group could be found for ${service} even after retrying discovery with alternate owner name "${aliasCandidates[0]}".`,
+    next_source: candidateLogGroups[0],
+  });
+
+  return { sections, logGroups: candidateLogGroups };
+}
+
 async function gatherStandardEvidence(
   classification: ClassificationResult,
   ctx: ToolContext,
   tracker = new EvidenceRequirementTracker()
-): Promise<{ evidence: string; requirements: EvidenceRequirement[] }> {
+): Promise<{
+  evidence: string;
+  requirements: EvidenceRequirement[];
+  telemetryFallbacks: Map<string, TelemetryFallbackAttempt[]>;
+  telemetryGaps: Map<string, TelemetryGap>;
+}> {
+  const telemetry = new TelemetryFallbackCollector();
   const sections: string[] = [];
   const rootCauseFunctionsGathered = new Set<string>();
   const rootCauseRulesGathered = new Set<string>();
@@ -1167,25 +1537,51 @@ async function gatherStandardEvidence(
             `Fetch extended history for ${metric.namespace}/${metric.metric_name} to locate the last datapoint before the report window.`,
             'Use get_metrics_and_alarms with a multi-day window and period_seconds=3600.'
           );
-          sections.push(
-            await runRequiredEvidenceTool(
-              `### ${id} ${kind}: extended 14-day history for ${metric.namespace}/${metric.metric_name} (locates the last datapoint before the report window)`,
-              customMetricHistoryRequirement,
-              tracker,
-              () =>
-                metricsAndAlarmsTool.handler(
-                  {
-                    namespace: metric.namespace,
-                    metric_name: metric.metric_name,
-                    dimensions: metric.dimensions,
-                    stat: metric.stat,
-                    period_seconds: OBSERVABILITY_METRIC_PERIOD_SECONDS,
-                    ...extendedWindow,
-                  },
-                  ctx
-                )
-            )
+          const extendedHistoryText = await runRequiredEvidenceTool(
+            `### ${id} ${kind}: extended 14-day history for ${metric.namespace}/${metric.metric_name} (locates the last datapoint before the report window)`,
+            customMetricHistoryRequirement,
+            tracker,
+            () =>
+              metricsAndAlarmsTool.handler(
+                {
+                  namespace: metric.namespace,
+                  metric_name: metric.metric_name,
+                  dimensions: metric.dimensions,
+                  stat: metric.stat,
+                  period_seconds: OBSERVABILITY_METRIC_PERIOD_SECONDS,
+                  ...extendedWindow,
+                },
+                ctx
+              )
           );
+          sections.push(extendedHistoryText);
+
+          const primaryHasData = hasMetricDatapoints(evidence);
+          const primaryMissingDatapoints = hasNoMetricDatapoints(evidence);
+          const extendedHasData = hasMetricDatapoints(extendedHistoryText);
+          const extendedErrored = isToolErrorText(extendedHistoryText);
+          telemetry.mergeSignals(id, {
+            metricAttempted: true,
+            metricResolved: primaryHasData || extendedHasData,
+            metricUnresolved: primaryMissingDatapoints && !extendedHasData,
+            toolError: extendedErrored,
+            nextMetricSource: `${metric.namespace}/${metric.metric_name} (alarm configuration and log-based runtime activity)`,
+          });
+          if (primaryMissingDatapoints) {
+            telemetry.record(id, {
+              path: 'metric_widened_lookback',
+              query: `get_metrics_and_alarms(${metric.namespace}/${metric.metric_name}, ${extendedWindow.start_time}..${extendedWindow.end_time}, period_seconds=${OBSERVABILITY_METRIC_PERIOD_SECONDS})`,
+              outcome: extendedErrored ? 'error' : extendedHasData ? 'resolved' : 'empty',
+              detail: extendedErrored
+                ? 'The extended metric history query failed.'
+                : extendedHasData
+                  ? 'The widened 14-day lookback located datapoints outside the report window.'
+                  : 'The widened 14-day lookback still returned no datapoints for this metric.',
+              next_source: extendedHasData
+                ? undefined
+                : `${metric.namespace}/${metric.metric_name} alarm configuration and log-based runtime activity`,
+            });
+          }
         }
       }
     }
@@ -1245,9 +1641,13 @@ async function gatherStandardEvidence(
         sections.push(ecsEvidenceText);
       }
 
+      let metricDiscovery = '';
       if (shouldQueryObservability) {
-        const metricDiscovery = await gatherExpandedLivenessMetricDiscovery(id, kind, service, ctx);
+        metricDiscovery = await gatherExpandedLivenessMetricDiscovery(id, kind, service, ctx);
         sections.push(metricDiscovery);
+
+        const discoveredLambdaNames = selectLambdaFunctions(metricDiscovery);
+        const discoveredEventBridgeNames = selectEventBridgeRules(metricDiscovery);
 
         const extendedWindow = extendedMetricWindow(ctx);
         if (extendedWindow) {
@@ -1256,6 +1656,20 @@ async function gatherStandardEvidence(
             service,
             knownMetricKeys
           );
+          telemetry.mergeSignals(id, {
+            metricAttempted: true,
+            ownerFound: discoveredLambdaNames.length > 0 || discoveredEventBridgeNames.length > 0,
+          });
+          telemetry.record(id, {
+            path: 'metric_exact_discovery',
+            query: `list_metrics expanded discovery for ${service} (service/detector search terms plus liveness/heartbeat names)`,
+            outcome: livenessMetricCandidates.length > 0 ? 'resolved' : 'empty',
+            detail:
+              livenessMetricCandidates.length > 0
+                ? `Found ${livenessMetricCandidates.length} candidate liveness/heartbeat metric(s) via expanded discovery: ${livenessMetricCandidates.map(metricKey).join(', ')}.`
+                : `No liveness/heartbeat metric candidates were found via expanded list_metrics discovery for ${service}.`,
+            next_source: livenessMetricCandidates[0] ? metricKey(livenessMetricCandidates[0]) : undefined,
+          });
           if (livenessMetricCandidates.length === 0) {
             const customMetricHistoryRequirement = tracker.require(
               id,
@@ -1283,25 +1697,44 @@ async function gatherStandardEvidence(
               `Fetch extended history for discovered liveness metric ${metric.namespace}/${metric.metric_name}.`,
               'Use get_metrics_and_alarms with a multi-day window and period_seconds=3600.'
             );
-            sections.push(
-              await runRequiredEvidenceTool(
-                `### ${id} ${kind}: discovered liveness metric 14-day history for ${metric.namespace}/${metric.metric_name} (locates the last datapoint before the report window)`,
-                customMetricHistoryRequirement,
-                tracker,
-                () =>
-                  metricsAndAlarmsTool.handler(
-                    {
-                      namespace: metric.namespace,
-                      metric_name: metric.metric_name,
-                      dimensions: metric.dimensions,
-                      stat: metric.stat,
-                      period_seconds: OBSERVABILITY_METRIC_PERIOD_SECONDS,
-                      ...extendedWindow,
-                    },
-                    ctx
-                  )
-              )
+            const discoveredMetricHistoryText = await runRequiredEvidenceTool(
+              `### ${id} ${kind}: discovered liveness metric 14-day history for ${metric.namespace}/${metric.metric_name} (locates the last datapoint before the report window)`,
+              customMetricHistoryRequirement,
+              tracker,
+              () =>
+                metricsAndAlarmsTool.handler(
+                  {
+                    namespace: metric.namespace,
+                    metric_name: metric.metric_name,
+                    dimensions: metric.dimensions,
+                    stat: metric.stat,
+                    period_seconds: OBSERVABILITY_METRIC_PERIOD_SECONDS,
+                    ...extendedWindow,
+                  },
+                  ctx
+                )
             );
+            sections.push(discoveredMetricHistoryText);
+
+            const discoveredMetricResolved = hasMetricDatapoints(discoveredMetricHistoryText);
+            const discoveredMetricErrored = isToolErrorText(discoveredMetricHistoryText);
+            telemetry.mergeSignals(id, {
+              metricResolved: discoveredMetricResolved,
+              metricUnresolved: !discoveredMetricResolved,
+              toolError: discoveredMetricErrored,
+              nextMetricSource: `${metric.namespace}/${metric.metric_name} (discovered liveness metric)`,
+            });
+            telemetry.record(id, {
+              path: 'metric_widened_lookback',
+              query: `get_metrics_and_alarms(${metric.namespace}/${metric.metric_name}, extended window, period_seconds=${OBSERVABILITY_METRIC_PERIOD_SECONDS})`,
+              outcome: discoveredMetricErrored ? 'error' : discoveredMetricResolved ? 'resolved' : 'empty',
+              detail: discoveredMetricErrored
+                ? 'The discovered liveness metric extended history query failed.'
+                : discoveredMetricResolved
+                  ? `Extended history for the discovered liveness metric ${metric.namespace}/${metric.metric_name} located datapoints.`
+                  : `Extended history for the discovered liveness metric ${metric.namespace}/${metric.metric_name} still returned no datapoints.`,
+              next_source: discoveredMetricResolved ? undefined : metricKey(metric),
+            });
           }
         }
 
@@ -1312,14 +1745,27 @@ async function gatherStandardEvidence(
           `Check alarm coverage for ${service}.`,
           'Use find_alarms by service search or exact metric identity.'
         );
-        sections.push(
-          await runRequiredEvidenceTool(
-            `### ${id} ${kind}: alarm coverage for ${service}`,
-            alarmCoverageRequirement,
-            tracker,
-            () => findAlarmsTool.handler({ search: service }, ctx)
-          )
+        const alarmCoverageText = await runRequiredEvidenceTool(
+          `### ${id} ${kind}: alarm coverage for ${service}`,
+          alarmCoverageRequirement,
+          tracker,
+          () => findAlarmsTool.handler({ search: service }, ctx)
         );
+        sections.push(alarmCoverageText);
+
+        const alarmsFound = /Found \d+ alarm/.test(alarmCoverageText);
+        const alarmErrored = isToolErrorText(alarmCoverageText);
+        telemetry.mergeSignals(id, { toolError: alarmErrored });
+        telemetry.record(id, {
+          path: 'alarm_configuration',
+          query: `find_alarms(search=${service})`,
+          outcome: alarmErrored ? 'error' : alarmsFound ? 'resolved' : 'empty',
+          detail: alarmErrored
+            ? 'The alarm-configuration lookup failed.'
+            : alarmsFound
+              ? `Alarm configuration (state, threshold, evaluation period, missing-data handling) found for ${service}.`
+              : `No alarm coverage was found for ${service} by name search.`,
+        });
 
         for (const functionName of selectLambdaFunctions(metricDiscovery)) {
           if (rootCauseFunctionsGathered.has(functionName)) {
@@ -1371,7 +1817,22 @@ async function gatherStandardEvidence(
         );
       }
 
-      const logGroups = selectStandardLogGroups(discovery);
+      let logGroups = selectStandardLogGroups(discovery);
+      if (logGroups.length === 0 && shouldQueryObservability) {
+        const runtimeOwnerFallback = await attemptRuntimeOwnerDiscovery(
+          id,
+          kind,
+          service,
+          discovery,
+          metricDiscovery,
+          ctx,
+          telemetry
+        );
+        sections.push(...runtimeOwnerFallback.sections);
+        if (runtimeOwnerFallback.logGroups.length > 0) {
+          logGroups = runtimeOwnerFallback.logGroups;
+        }
+      }
       if (logGroups.length === 0) {
         continue;
       }
@@ -1471,27 +1932,85 @@ async function gatherStandardEvidence(
         }
 
         if (shouldQueryObservability) {
-          sections.push(
-            await runEvidenceTool(
-              `### ${id} ${kind}: recent runtime activity sample on ${logGroup} (${windowLabel})`,
-              () =>
-                queryLogsTool.handler(
-                  {
-                    log_group: logGroup,
-                    filter_or_query: RECENT_ACTIVITY_QUERY,
-                    ...windowArgs,
-                    limit: 25,
-                  },
-                  ctx
-                )
-            )
+          const activityText = await runEvidenceTool(
+            `### ${id} ${kind}: recent runtime activity sample on ${logGroup} (${windowLabel})`,
+            () =>
+              queryLogsTool.handler(
+                {
+                  log_group: logGroup,
+                  filter_or_query: RECENT_ACTIVITY_QUERY,
+                  ...windowArgs,
+                  limit: 25,
+                },
+                ctx
+              )
           );
+          sections.push(activityText);
+          telemetry.mergeSignals(id, {
+            activityObserved: hasRuntimeRows(activityText),
+            ownerFound: true,
+            toolError: isToolErrorText(activityText),
+          });
         }
       }
     }
   }
 
-  return { evidence: sections.join('\n\n'), requirements: tracker.all() };
+  return {
+    evidence: sections.join('\n\n'),
+    requirements: tracker.all(),
+    telemetryFallbacks: telemetry.fallbacksById(),
+    telemetryGaps: telemetry.gapsById(),
+  };
+}
+
+/**
+ * Guarantee telemetry-gap fallback attempts and unresolved-gap classification
+ * survive even if the model omits them from its structured output: attach the
+ * deterministic pre-gather results whenever the model didn't already report
+ * its own, then re-validate so downstream consumers always see the schema's
+ * shape.
+ */
+function mergeTelemetryData(
+  result: InvestigationResult,
+  fallbacksById: Map<string, TelemetryFallbackAttempt[]>,
+  gapsById: Map<string, TelemetryGap>
+): InvestigationResult {
+  if (fallbacksById.size === 0 && gapsById.size === 0) {
+    return result;
+  }
+
+  const merged: InvestigationResult = {
+    ...result,
+    investigations: result.investigations.map((investigation) => {
+      const deterministicFallbacks = fallbacksById.get(investigation.incident_id);
+      const deterministicGap = gapsById.get(investigation.incident_id);
+      const telemetry_fallbacks =
+        investigation.telemetry_fallbacks && investigation.telemetry_fallbacks.length > 0
+          ? investigation.telemetry_fallbacks
+          : deterministicFallbacks;
+      const telemetry_gap = investigation.telemetry_gap ?? deterministicGap;
+
+      if (!telemetry_fallbacks && !telemetry_gap) {
+        return investigation;
+      }
+      return {
+        ...investigation,
+        ...(telemetry_fallbacks ? { telemetry_fallbacks } : {}),
+        ...(telemetry_gap ? { telemetry_gap } : {}),
+      };
+    }),
+  };
+
+  try {
+    return parseInvestigation(merged);
+  } catch (error) {
+    console.warn(
+      '[Investigate] Deterministic telemetry-gap merge failed re-validation; keeping model output',
+      error
+    );
+    return result;
+  }
 }
 
 export async function run(
@@ -1546,14 +2065,16 @@ export async function run(
 
     const parsed = tryParse(first.content);
     if (parsed) {
+      const merged = mergeTelemetryData(parsed, preGathered.telemetryFallbacks, preGathered.telemetryGaps);
       const closed = await maybeRunRootCauseClosure(
-        parsed,
-        closureRequirementsForDraft(parsed, preGathered.requirements),
+        merged,
+        closureRequirementsForDraft(merged, preGathered.requirements),
         loopOptions,
         prompt,
         config
       );
-      return { stage: 'Investigate', status: 'success', timestamp, data: closed };
+      const closedMerged = mergeTelemetryData(closed, preGathered.telemetryFallbacks, preGathered.telemetryGaps);
+      return { stage: 'Investigate', status: 'success', timestamp, data: closedMerged };
     }
 
     // One repair retry: ask for valid JSON only, with no tools (we already have
@@ -1572,14 +2093,16 @@ export async function run(
 
     const repaired = tryParse(repair.content);
     if (repaired) {
+      const merged = mergeTelemetryData(repaired, preGathered.telemetryFallbacks, preGathered.telemetryGaps);
       const closed = await maybeRunRootCauseClosure(
-        repaired,
-        closureRequirementsForDraft(repaired, preGathered.requirements),
+        merged,
+        closureRequirementsForDraft(merged, preGathered.requirements),
         loopOptions,
         prompt,
         config
       );
-      return { stage: 'Investigate', status: 'success', timestamp, data: closed };
+      const closedMerged = mergeTelemetryData(closed, preGathered.telemetryFallbacks, preGathered.telemetryGaps);
+      return { stage: 'Investigate', status: 'success', timestamp, data: closedMerged };
     }
 
     console.error('[Investigate] Repair retry also failed to parse/validate');

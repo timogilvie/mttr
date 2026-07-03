@@ -1516,4 +1516,432 @@ describe('investigate stage', () => {
     expect(result.status).toBe('error');
     expect(result.error).toContain('tool loop timed out');
   });
+
+  describe('telemetry gap recovery', () => {
+    function telemetryGapClassification(
+      incidentId: string,
+      opts: {
+        affectedServices?: string[];
+        cloudwatchMetrics?: ClassificationResult['incidents'][number]['signals']['cloudwatch_metrics'];
+      } = {}
+    ): ClassificationResult {
+      const affectedServices = opts.affectedServices ?? ['deltaone-anomaly-detection'];
+      return {
+        summary: 'Telemetry gap scenario.',
+        overall_severity: 'HIGH',
+        report_context: {
+          window_start: '2026-06-05T11:35:04.881Z',
+          window_end: '2026-06-06T11:35:04.881Z',
+        },
+        incidents: [
+          {
+            incident_id: incidentId,
+            title: `No detector liveness datapoints for ${affectedServices[0]}`,
+            classification: 'OBSERVABILITY_FAILURE',
+            severity: 'HIGH',
+            confidence: 0.9,
+            affected_services: affectedServices,
+            evidence: ['No datapoints received from the detector liveness metric in this window.'],
+            signals: {
+              alarms: [],
+              metrics: ['Detector liveness metric has zero datapoints.'],
+              logs: [],
+              cloudwatch_metrics: opts.cloudwatchMetrics ?? [
+                {
+                  namespace: 'Hokusai/Detectors',
+                  metric_name: 'DetectorLiveness',
+                  stat: 'Sum',
+                  dimensions: [{ name: 'Detector', value: affectedServices[0]! }],
+                },
+              ],
+            },
+            suspected_causes: ['Detector runtime or metric publication path broken.'],
+            investigation_plan: {
+              priority: 1,
+              estimated_user_impact: 'SIGNIFICANT',
+              first_actions: [],
+              questions_to_answer: [],
+              suggested_cloudwatch_queries: [],
+            },
+            recommended_next_stage: 'INVESTIGATE',
+          },
+        ],
+        findings: [],
+      };
+    }
+
+    function investigationDraft(
+      incidentId: string,
+      overrides: Record<string, unknown> = {}
+    ): Record<string, unknown> {
+      return {
+        incident_id: incidentId,
+        title: 'Detector observability investigation',
+        original_classification: 'OBSERVABILITY_FAILURE',
+        investigation_status: 'OBSERVABILITY_GAP',
+        severity: 'HIGH',
+        confidence: 0.7,
+        affected_services: ['deltaone-anomaly-detection'],
+        confirmed_facts: [],
+        supporting_evidence: [],
+        contradicting_evidence: [],
+        likely_causes: [],
+        unknowns: [],
+        additional_data_needed: [],
+        unresolved_evidence_requirements: [],
+        recommended_next_investigation_steps: [],
+        requires_more_evidence_before_mitigation: false,
+        possible_future_remediation: [],
+        ...overrides,
+      };
+    }
+
+    function investigationResultJson(incidentId: string, overrides: Record<string, unknown> = {}): string {
+      return JSON.stringify({
+        summary: 'Investigated the observability gap.',
+        overall_assessment: 'OBSERVABILITY_ISSUE',
+        overall_severity: 'HIGH',
+        investigations: [investigationDraft(incidentId, overrides)],
+        cross_cutting_observations: [],
+        priority_order: [],
+      });
+    }
+
+    it('resolves a missing metric via widened lookback and records a resolved fallback with no unresolved gap', async () => {
+      mockMetricsAndAlarms.mockImplementation(async (args) => {
+        if (args.period_seconds === 3600) {
+          return 'Metric datapoints (1):\n2026-05-25T10:00:00.000Z: Sum=5 Count';
+        }
+        return 'No metric datapoints in the requested window.';
+      });
+      mockLoop.mockResolvedValue(loopResult(investigationResultJson('telemetry-gap-metric-resolved')));
+
+      const result = await investigateStage.run(
+        mockInput,
+        mockConfig,
+        telemetryGapClassification('telemetry-gap-metric-resolved')
+      );
+
+      expect(result.status).toBe('success');
+      expect(mockFindAlarms).toHaveBeenCalledWith(
+        { search: 'deltaone-anomaly-detection' },
+        expect.anything()
+      );
+      const investigation = (result.data as InvestigationResult).investigations[0]!;
+      expect(investigation.telemetry_gap).toBeUndefined();
+      expect(investigation.telemetry_fallbacks).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ path: 'metric_widened_lookback', outcome: 'resolved' }),
+        ])
+      );
+    });
+
+    it('keeps a telemetry gap when one of multiple metrics remains empty after widened lookback', async () => {
+      mockMetricsAndAlarms.mockImplementation(async (args) => {
+        if (args.period_seconds === 3600 && args.metric_name === 'DetectorLiveness') {
+          return 'Metric datapoints (1):\n2026-05-25T10:00:00.000Z: Sum=5 Count';
+        }
+        return 'No metric datapoints in the requested window.';
+      });
+      mockLoop.mockResolvedValue(loopResult(investigationResultJson('telemetry-gap-one-metric-empty')));
+
+      const result = await investigateStage.run(
+        mockInput,
+        mockConfig,
+        telemetryGapClassification('telemetry-gap-one-metric-empty', {
+          cloudwatchMetrics: [
+            {
+              namespace: 'Hokusai/Detectors',
+              metric_name: 'DetectorLiveness',
+              stat: 'Sum',
+              dimensions: [{ name: 'Detector', value: 'deltaone-anomaly-detection' }],
+            },
+            {
+              namespace: 'Hokusai/Detectors',
+              metric_name: 'DetectorHeartbeat',
+              stat: 'Sum',
+              dimensions: [{ name: 'Detector', value: 'deltaone-anomaly-detection' }],
+            },
+          ],
+        })
+      );
+
+      expect(result.status).toBe('success');
+      const investigation = (result.data as InvestigationResult).investigations[0]!;
+      expect(investigation.telemetry_gap?.kind).toBe('instrumentation');
+      expect(investigation.telemetry_gap?.next_telemetry_source).toContain(
+        'Hokusai/Detectors/DetectorHeartbeat'
+      );
+      expect(investigation.telemetry_gap?.fallback_attempts).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ path: 'metric_widened_lookback', outcome: 'resolved' }),
+          expect.objectContaining({ path: 'metric_widened_lookback', outcome: 'empty' }),
+        ])
+      );
+    });
+
+    it('classifies an unresolved metric gap as instrumentation when runtime activity is confirmed', async () => {
+      mockMetricsAndAlarms.mockResolvedValue('No metric datapoints in the requested window.');
+      mockLoop.mockResolvedValue(loopResult(investigationResultJson('telemetry-gap-instrumentation')));
+
+      const result = await investigateStage.run(
+        mockInput,
+        mockConfig,
+        telemetryGapClassification('telemetry-gap-instrumentation')
+      );
+
+      expect(result.status).toBe('success');
+      const investigation = (result.data as InvestigationResult).investigations[0]!;
+      expect(investigation.telemetry_gap?.kind).toBe('instrumentation');
+      expect(investigation.telemetry_gap?.next_telemetry_source).toContain(
+        'Hokusai/Detectors/DetectorLiveness'
+      );
+      expect(investigation.telemetry_gap?.fallback_attempts.length).toBeGreaterThan(0);
+    });
+
+    it('resolves missing log groups via the service-resource registry and records a resolved fallback', async () => {
+      mockDiscoverLogGroups.mockResolvedValue(
+        'No CloudWatch log groups found for "data-pipeline-api" using terms: data-pipeline-api, ' +
+          'and no matching ECS service declares an awslogs log group.'
+      );
+
+      mockLoop.mockResolvedValue(
+        loopResult(
+          investigationResultJson('telemetry-gap-log-resolved-registry', {
+            affected_services: ['data-pipeline-api'],
+          })
+        )
+      );
+
+      const result = await investigateStage.run(
+        mockInput,
+        mockConfig,
+        telemetryGapClassification('telemetry-gap-log-resolved-registry', {
+          affectedServices: ['data-pipeline-api'],
+        })
+      );
+
+      expect(result.status).toBe('success');
+      expect(mockQueryLogs).toHaveBeenCalledWith(
+        expect.objectContaining({ log_group: '/ecs/hokusai-api-development' }),
+        expect.anything()
+      );
+      const investigation = (result.data as InvestigationResult).investigations[0]!;
+      expect(investigation.telemetry_gap).toBeUndefined();
+      expect(investigation.telemetry_fallbacks).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ path: 'runtime_owner_discovery', outcome: 'resolved' }),
+          expect.objectContaining({ path: 'log_group_retry', outcome: 'resolved' }),
+        ])
+      );
+    });
+
+    it('resolves missing log groups via a Lambda name recovered from metric dimensions', async () => {
+      mockDiscoverLogGroups.mockResolvedValue(
+        'No CloudWatch log groups found for "checkout-service" using terms: checkout-service, ' +
+          'and no matching ECS service declares an awslogs log group.'
+      );
+      mockListMetrics.mockResolvedValue(
+        'Found 1 metric(s):\n' +
+          'namespace=AWS/Lambda, metric=Invocations, dimensions=[FunctionName=hokusai-checkout-worker-development]'
+      );
+
+      mockLoop.mockResolvedValue(
+        loopResult(
+          investigationResultJson('telemetry-gap-log-resolved-lambda', {
+            affected_services: ['checkout-service'],
+          })
+        )
+      );
+
+      const result = await investigateStage.run(
+        mockInput,
+        mockConfig,
+        telemetryGapClassification('telemetry-gap-log-resolved-lambda', {
+          affectedServices: ['checkout-service'],
+        })
+      );
+
+      expect(result.status).toBe('success');
+      expect(mockQueryLogs).toHaveBeenCalledWith(
+        expect.objectContaining({ log_group: '/aws/lambda/hokusai-checkout-worker-development' }),
+        expect.anything()
+      );
+      const investigation = (result.data as InvestigationResult).investigations[0]!;
+      expect(investigation.telemetry_gap).toBeUndefined();
+      expect(investigation.telemetry_fallbacks).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ path: 'runtime_owner_discovery', outcome: 'resolved' }),
+        ])
+      );
+    });
+
+    it('classifies a discovered runtime owner with no confirmed log rows as discovery', async () => {
+      mockDiscoverLogGroups.mockResolvedValue(
+        'No CloudWatch log groups found for "auth-service" using terms: auth-service, ' +
+          'and no matching ECS service declares an awslogs log group.'
+      );
+      mockQueryLogs.mockImplementation(async (args) => {
+        if (args.log_group === '/ecs/hokusai-auth/development') {
+          return 'Query completed with 0 matching rows.';
+        }
+        return 'Query returned 1 row(s):\nstatus=401, path=/api/probe, requests=12';
+      });
+
+      mockLoop.mockResolvedValue(
+        loopResult(
+          investigationResultJson('telemetry-gap-discovery', {
+            affected_services: ['auth-service'],
+          })
+        )
+      );
+
+      const result = await investigateStage.run(
+        mockInput,
+        mockConfig,
+        telemetryGapClassification('telemetry-gap-discovery', { affectedServices: ['auth-service'] })
+      );
+
+      expect(result.status).toBe('success');
+      const investigation = (result.data as InvestigationResult).investigations[0]!;
+      expect(investigation.telemetry_gap?.kind).toBe('discovery');
+      expect(investigation.telemetry_gap?.next_telemetry_source).toContain(
+        '/ecs/hokusai-auth/development'
+      );
+    });
+
+    it('names the concrete runtime-owner retry when owner discovery finds no log group', async () => {
+      mockDiscoverLogGroups.mockImplementation(async (args) => {
+        if (args.service_name === 'billing-service') {
+          return (
+            'No CloudWatch log groups found for "billing-service".\n' +
+            'ECS service: billing-worker-development'
+          );
+        }
+        if (args.service_name === 'billing-worker-development') {
+          return 'No CloudWatch log groups found for "billing-worker-development".';
+        }
+        return 'No CloudWatch log groups found.';
+      });
+      mockEcsServiceEvents.mockResolvedValue('No ECS services found matching "billing-service".');
+
+      mockLoop.mockResolvedValue(
+        loopResult(
+          investigationResultJson('telemetry-gap-discovery-no-log-group', {
+            affected_services: ['billing-service'],
+          })
+        )
+      );
+
+      const result = await investigateStage.run(
+        mockInput,
+        mockConfig,
+        telemetryGapClassification('telemetry-gap-discovery-no-log-group', {
+          affectedServices: ['billing-service'],
+        })
+      );
+
+      expect(result.status).toBe('success');
+      const investigation = (result.data as InvestigationResult).investigations[0]!;
+      expect(investigation.telemetry_gap?.kind).toBe('discovery');
+      expect(investigation.telemetry_gap?.next_telemetry_source).toContain(
+        'discover_log_groups for resolved runtime owner billing-worker-development'
+      );
+    });
+
+    it('classifies no owner and no activity across metrics, logs, and runtime evidence as runtime', async () => {
+      mockDiscoverLogGroups.mockResolvedValue(
+        'No CloudWatch log groups found for "orphan-service" using terms: orphan-service, ' +
+          'and no matching ECS service declares an awslogs log group.'
+      );
+      mockEcsServiceEvents.mockResolvedValue('No ECS services found matching "orphan-service".');
+      mockQueryLogs.mockResolvedValue('Query completed with 0 matching rows.');
+      mockFindAlarms.mockResolvedValue('No alarms found for search "orphan-service".');
+
+      mockLoop.mockResolvedValue(
+        loopResult(
+          investigationResultJson('telemetry-gap-runtime', {
+            affected_services: ['orphan-service'],
+          })
+        )
+      );
+
+      const result = await investigateStage.run(
+        mockInput,
+        mockConfig,
+        telemetryGapClassification('telemetry-gap-runtime', { affectedServices: ['orphan-service'] })
+      );
+
+      expect(result.status).toBe('success');
+      const investigation = (result.data as InvestigationResult).investigations[0]!;
+      expect(investigation.telemetry_gap?.kind).toBe('runtime');
+      expect(investigation.telemetry_gap?.next_telemetry_source).not.toBe('');
+    });
+
+    it('classifies a fallback tool error as unknown rather than over-classifying', async () => {
+      mockMetricsAndAlarms.mockImplementation(async (args) => {
+        if (args.period_seconds === 3600) {
+          throw new Error('CloudWatch Rate exceeded');
+        }
+        return 'No metric datapoints in the requested window.';
+      });
+
+      mockLoop.mockResolvedValue(loopResult(investigationResultJson('telemetry-gap-unknown')));
+
+      const result = await investigateStage.run(
+        mockInput,
+        mockConfig,
+        telemetryGapClassification('telemetry-gap-unknown')
+      );
+
+      expect(result.status).toBe('success');
+      const investigation = (result.data as InvestigationResult).investigations[0]!;
+      expect(investigation.telemetry_gap?.kind).toBe('unknown');
+      expect(
+        investigation.telemetry_gap?.fallback_attempts.some((attempt) => attempt.outcome === 'error')
+      ).toBe(true);
+    });
+
+    it('restores deterministic telemetry fallback data after a root-cause closure pass omits it', async () => {
+      mockDiscoverLogGroups.mockResolvedValue(
+        'No CloudWatch log groups found for "orphan-service" using terms: orphan-service, ' +
+          'and no matching ECS service declares an awslogs log group.'
+      );
+      mockEcsServiceEvents.mockResolvedValue('No ECS services found matching "orphan-service".');
+      mockQueryLogs.mockResolvedValue('Query completed with 0 matching rows.');
+      mockFindAlarms.mockResolvedValue('No alarms found for search "orphan-service".');
+
+      const draftNeedingClosure = investigationResultJson('telemetry-gap-closure', {
+        affected_services: ['orphan-service'],
+        unresolved_evidence_requirements: [
+          {
+            type: 'CHANGE_EVENT_DETAILS',
+            description: 'Inspect CloudTrail change events around the gap onset.',
+            tool_hint: 'Use lookup_cloudtrail_events.',
+          },
+        ],
+        requires_more_evidence_before_mitigation: true,
+      });
+      const closedDraftWithoutTelemetry = investigationResultJson('telemetry-gap-closure', {
+        affected_services: ['orphan-service'],
+        requires_more_evidence_before_mitigation: true,
+      });
+
+      mockLoop
+        .mockResolvedValueOnce(loopResult(draftNeedingClosure))
+        .mockResolvedValueOnce(loopResult(closedDraftWithoutTelemetry));
+
+      const result = await investigateStage.run(
+        mockInput,
+        mockConfig,
+        telemetryGapClassification('telemetry-gap-closure', { affectedServices: ['orphan-service'] })
+      );
+
+      expect(result.status).toBe('success');
+      expect(mockLoop).toHaveBeenCalledTimes(2);
+      const investigation = (result.data as InvestigationResult).investigations[0]!;
+      expect(investigation.telemetry_gap?.kind).toBe('runtime');
+      expect(investigation.telemetry_fallbacks?.length).toBeGreaterThan(0);
+    });
+  });
 });

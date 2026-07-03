@@ -137,6 +137,48 @@ const CausalEvidenceSchema = z.object({
 
 const MitigationConfidenceSchema = z.enum(['high', 'medium', 'low']);
 
+const TelemetryGapKindSchema = z.enum(['instrumentation', 'discovery', 'runtime', 'unknown']);
+
+const TelemetryFallbackOutcomeSchema = z.enum(['resolved', 'empty', 'error']);
+
+const TelemetryFallbackPathSchema = z.enum([
+  'metric_exact_discovery',
+  'metric_widened_lookback',
+  'alarm_configuration',
+  'runtime_owner_discovery',
+  'log_group_retry',
+]);
+
+const TelemetryFallbackAttemptSchema = z.object({
+  path: TelemetryFallbackPathSchema,
+  query: z.string(),
+  outcome: TelemetryFallbackOutcomeSchema,
+  detail: z.string(),
+  next_source: z.string().optional(),
+});
+
+const GENERIC_NEXT_TELEMETRY_SOURCE_VALUES = new Set([
+  'more data is needed',
+  'more data needed',
+  'additional data is needed',
+  'need more evidence',
+]);
+
+const TelemetryGapSchema = z
+  .object({
+    kind: TelemetryGapKindSchema,
+    next_telemetry_source: z.string().min(1),
+    fallback_attempts: z.array(TelemetryFallbackAttemptSchema).default([]),
+    reason: z.string().optional(),
+  })
+  .refine(
+    (gap) => !GENERIC_NEXT_TELEMETRY_SOURCE_VALUES.has(gap.next_telemetry_source.trim().toLowerCase()),
+    {
+      message: 'next_telemetry_source must name a concrete telemetry source, not a generic statement',
+      path: ['next_telemetry_source'],
+    }
+  );
+
 const InvestigationSchema = z.object({
   incident_id: z.string(),
   title: z.string(),
@@ -159,6 +201,8 @@ const InvestigationSchema = z.object({
   causal_evidence: CausalEvidenceSchema.optional(),
   mitigation_confidence: MitigationConfidenceSchema.optional(),
   confidence_justification: z.string().optional(),
+  telemetry_fallbacks: z.array(TelemetryFallbackAttemptSchema).optional(),
+  telemetry_gap: TelemetryGapSchema.optional(),
 });
 
 const InvestigationResultSchema = z.object({

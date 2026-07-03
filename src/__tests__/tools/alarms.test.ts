@@ -47,9 +47,13 @@ describe('alarms find_alarms', () => {
           StateUpdatedTimestamp: new Date('2026-06-06T10:00:00Z'),
           Namespace: 'Hokusai/Detectors',
           MetricName: 'DetectorLiveness',
+          Dimensions: [{ Name: 'Detector', Value: 'deltaone-anomaly-detection' }],
           Statistic: 'Sum',
           ComparisonOperator: 'LessThanThreshold',
           Threshold: 1,
+          Period: 300,
+          EvaluationPeriods: 3,
+          DatapointsToAlarm: 2,
           TreatMissingData: 'breaching',
           ActionsEnabled: true,
         },
@@ -69,7 +73,10 @@ describe('alarms find_alarms', () => {
     expect(result).toContain('Found 1 alarm(s) watching metric Hokusai/Detectors/DetectorLiveness');
     expect(result).toContain('alarm=detector-liveness-missing');
     expect(result).toContain('state=ALARM');
+    expect(result).toContain('dimensions=[Detector=deltaone-anomaly-detection]');
     expect(result).toContain('condition=LessThanThreshold 1');
+    expect(result).toContain('evaluationPeriod=300s x 3');
+    expect(result).toContain('datapointsToAlarm=2');
     expect(result).toContain('treatMissingData=breaching');
     expect(send.mock.calls[0]?.[0]).toBeInstanceOf(DescribeAlarmsForMetricCommand);
   });
