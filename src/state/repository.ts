@@ -50,6 +50,23 @@ export interface ProcessedSnsMessageRow {
   received_at: Date | string;
 }
 
+export interface AlarmTriggerEnqueueInput {
+  snsMessageId: string;
+  alarmArn: string;
+  alarmName: string;
+  newState: 'ALARM' | 'OK' | 'INSUFFICIENT_DATA';
+  stateChangeTime: string;
+  severity?: string | null;
+  specKey?: string | null;
+  payload: unknown;
+}
+
+export interface AlarmTriggerEnqueueResult {
+  duplicate: boolean;
+  enqueued: boolean;
+  id?: string;
+}
+
 export interface RunRecordUpdate {
   status: Exclude<RunStatus, 'running'>;
   finishedAt: string;
@@ -346,6 +363,101 @@ function transitionEvents(
     service: item.service,
     evidence: item.evidence,
   }));
+}
+
+export async function markSnsMessageProcessed(
+  client: DatabaseClient,
+  snsMessageId: string
+): Promise<boolean> {
+  const result = await client.query<{ sns_message_id: string }>(
+    `INSERT INTO processed_sns_messages (sns_message_id)
+     VALUES ($1)
+     ON CONFLICT (sns_message_id) DO NOTHING
+     RETURNING sns_message_id`,
+    [snsMessageId]
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+/**
+ * A pooled connection pinned for the lifetime of a transaction. `pg.Pool`
+ * exposes `connect()`; test fakes and already-pinned clients do not.
+ */
+interface PinnedClient extends DatabaseClient {
+  release(): void;
+}
+
+interface ConnectablePool extends DatabaseClient {
+  connect(): Promise<PinnedClient>;
+}
+
+function canConnect(client: DatabaseClient): client is ConnectablePool {
+  return typeof (client as Partial<ConnectablePool>).connect === 'function';
+}
+
+export async function enqueueAlarmTriggerOnce(
+  client: DatabaseClient,
+  input: AlarmTriggerEnqueueInput
+): Promise<AlarmTriggerEnqueueResult> {
+  // A multi-statement transaction must run on a single connection. When given a
+  // pool, check out one dedicated connection for the whole BEGIN..COMMIT so the
+  // statements are actually atomic and the connection is not returned to the
+  // pool mid-transaction. Fakes/single connections fall back to direct use.
+  const pinned = canConnect(client) ? await client.connect() : null;
+  const tx: DatabaseClient = pinned ?? client;
+  try {
+    await tx.query('BEGIN');
+    try {
+      const inserted = await tx.query<{ sns_message_id: string }>(
+        `INSERT INTO processed_sns_messages (sns_message_id)
+         VALUES ($1)
+         ON CONFLICT (sns_message_id) DO NOTHING
+         RETURNING sns_message_id`,
+        [input.snsMessageId]
+      );
+
+      if ((inserted.rowCount ?? 0) === 0) {
+        await tx.query('COMMIT');
+        return { duplicate: true, enqueued: false };
+      }
+
+      if (input.newState !== 'ALARM') {
+        await tx.query('COMMIT');
+        return { duplicate: false, enqueued: false };
+      }
+
+      const result = await tx.query<{ id: string }>(
+        `INSERT INTO alarm_triggers (
+           sns_message_id, alarm_arn, alarm_name, new_state, state_change_time,
+           severity, spec_key, payload, status
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'pending')
+         RETURNING id`,
+        [
+          input.snsMessageId,
+          input.alarmArn,
+          input.alarmName,
+          input.newState,
+          input.stateChangeTime,
+          input.severity ?? null,
+          input.specKey ?? null,
+          JSON.stringify(sanitizeForStorage(input.payload)),
+        ]
+      );
+      const id = result.rows[0]?.id;
+      if (!id) {
+        throw new Error('Postgres did not return an alarm trigger id');
+      }
+
+      await tx.query('COMMIT');
+      return { duplicate: false, enqueued: true, id };
+    } catch (error) {
+      await tx.query('ROLLBACK');
+      throw error;
+    }
+  } finally {
+    pinned?.release();
+  }
 }
 
 export class PostgresAgentStateRepository implements AgentStateRepository {
@@ -867,71 +979,6 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
 
   async close(): Promise<void> {
     await this.ownedPool?.end();
-  }
-}
-
-export interface EnqueueAlarmTriggerInput {
-  messageId: string;
-  alarmArn: string;
-  alarmName: string;
-  newState: 'ALARM' | 'OK' | 'INSUFFICIENT_DATA';
-  stateChangeTime: string;
-  payload: unknown;
-}
-
-export interface EnqueueAlarmTriggerResult {
-  enqueued: boolean;
-  triggerId?: string;
-}
-
-/**
- * Idempotently enqueues a CloudWatch alarm trigger. Dedupes on SNS
- * `MessageId` via `processed_sns_messages`; only when that insert wins the
- * race (`ON CONFLICT DO NOTHING` affects a row) does it insert the
- * corresponding `alarm_triggers` row, in the same transaction. This
- * guarantees exactly-once enqueue under concurrent duplicate SNS deliveries.
- */
-export async function enqueueAlarmTriggerIfNew(
-  client: DatabaseClient,
-  input: EnqueueAlarmTriggerInput
-): Promise<EnqueueAlarmTriggerResult> {
-  await client.query('BEGIN');
-  try {
-    const dedupe = await client.query<{ sns_message_id: string }>(
-      `INSERT INTO processed_sns_messages (sns_message_id)
-       VALUES ($1)
-       ON CONFLICT (sns_message_id) DO NOTHING
-       RETURNING sns_message_id`,
-      [input.messageId]
-    );
-
-    if (dedupe.rows.length === 0) {
-      await client.query('COMMIT');
-      return { enqueued: false };
-    }
-
-    const inserted = await client.query<{ id: string }>(
-      `INSERT INTO alarm_triggers (
-         sns_message_id, alarm_arn, alarm_name, new_state, state_change_time, payload, status
-       )
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'pending')
-       RETURNING id`,
-      [
-        input.messageId,
-        input.alarmArn,
-        input.alarmName,
-        input.newState,
-        input.stateChangeTime,
-        JSON.stringify(input.payload),
-      ]
-    );
-
-    await client.query('COMMIT');
-    const triggerId = inserted.rows[0]?.id;
-    return triggerId ? { enqueued: true, triggerId } : { enqueued: true };
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
   }
 }
 

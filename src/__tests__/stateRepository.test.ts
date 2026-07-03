@@ -3,7 +3,11 @@ import type { QueryResult, QueryResultRow } from 'pg';
 import type { ClassificationResult, DecisionResult, VerificationResult } from '../types.js';
 import type { DatabaseClient } from '../db/postgres.js';
 import { MIGRATIONS, runMigrations } from '../db/migrations.js';
-import { PostgresAgentStateRepository } from '../state/repository.js';
+import {
+  enqueueAlarmTriggerOnce,
+  markSnsMessageProcessed,
+  PostgresAgentStateRepository,
+} from '../state/repository.js';
 import {
   hashReportContent,
   hasProcessedReport,
@@ -51,9 +55,16 @@ class FakeStateDatabase implements DatabaseClient {
   alerts = new Map<string, Record<string, unknown>>();
   workerHeartbeats = new Map<string, Record<string, unknown>>();
   incidentEvents: Array<Record<string, unknown>> = [];
-  alarmTriggers = new Map<string, Record<string, unknown>>();
+  processedSnsMessages = new Set<string>();
+  alarmTriggers: Array<Record<string, unknown>> = [];
   queries: string[] = [];
   private runCounter = 0;
+  private snapshot?:
+    | {
+        processedSnsMessages: Set<string>;
+        alarmTriggers: Array<Record<string, unknown>>;
+      }
+    | undefined;
 
   async query<T extends QueryResultRow = QueryResultRow>(
     text: string,
@@ -63,7 +74,47 @@ class FakeStateDatabase implements DatabaseClient {
     const normalized = text.replace(/\s+/g, ' ').trim();
 
     if (normalized === 'BEGIN' || normalized === 'COMMIT' || normalized === 'ROLLBACK') {
+      if (normalized === 'BEGIN') {
+        this.snapshot = {
+          processedSnsMessages: new Set(this.processedSnsMessages),
+          alarmTriggers: this.alarmTriggers.map((row) => ({ ...row })),
+        };
+      }
+      if (normalized === 'COMMIT') {
+        this.snapshot = undefined;
+      }
+      if (normalized === 'ROLLBACK' && this.snapshot) {
+        this.processedSnsMessages = this.snapshot.processedSnsMessages;
+        this.alarmTriggers = this.snapshot.alarmTriggers;
+        this.snapshot = undefined;
+      }
       return result<T>([]);
+    }
+
+    if (normalized.startsWith('INSERT INTO processed_sns_messages')) {
+      const snsMessageId = String(params[0]);
+      if (this.processedSnsMessages.has(snsMessageId)) {
+        return result<T>([]);
+      }
+      this.processedSnsMessages.add(snsMessageId);
+      return result<T>([{ sns_message_id: snsMessageId } as unknown as T]);
+    }
+
+    if (normalized.startsWith('INSERT INTO alarm_triggers')) {
+      const id = `trigger-${this.alarmTriggers.length + 1}`;
+      this.alarmTriggers.push({
+        id,
+        sns_message_id: params[0],
+        alarm_arn: params[1],
+        alarm_name: params[2],
+        new_state: params[3],
+        state_change_time: params[4],
+        severity: params[5],
+        spec_key: params[6],
+        payload: JSON.parse(String(params[7])),
+        status: 'pending',
+      });
+      return result<T>([{ id } as unknown as T]);
     }
 
     if (normalized.startsWith('SELECT health_report_s3_uri')) {
@@ -274,176 +325,109 @@ class FakeStateDatabase implements DatabaseClient {
       return result<T>([]);
     }
 
-    if (normalized.startsWith('SELECT count(*)::text AS count FROM alarm_triggers')) {
-      const count = [...this.alarmTriggers.values()].filter(
-        (row) =>
-          row['status'] === 'pending' &&
-          ['ALARM', 'INSUFFICIENT_DATA'].includes(String(row['new_state']))
-      ).length;
-      return result<T>([{ count: String(count) } as unknown as T]);
-    }
-
-    if (
-      normalized.startsWith('SELECT id FROM alarm_triggers') &&
-      normalized.includes('FOR UPDATE SKIP LOCKED')
-    ) {
-      const rows = [...this.alarmTriggers.values()]
-        .filter(
-          (row) =>
-            row['status'] === 'pending' &&
-            ['ALARM', 'INSUFFICIENT_DATA'].includes(String(row['new_state']))
-        )
-        .sort(
-          (a, b) =>
-            new Date(String(a['received_at'])).getTime() -
-            new Date(String(b['received_at'])).getTime()
-        );
-      return result<T>(rows.map((row) => ({ id: row['id'] }) as unknown as T));
-    }
-
-    if (
-      normalized.startsWith('UPDATE alarm_triggers') &&
-      normalized.includes("WHERE status = 'claimed'")
-    ) {
-      const olderThanMs = Number(params[0]);
-      const cutoff = Date.now() - olderThanMs;
-      const affected: Record<string, unknown>[] = [];
-      for (const row of this.alarmTriggers.values()) {
-        if (row['status'] !== 'claimed') {
-          continue;
-        }
-        const claimedAt = row['claimed_at'];
-        const claimedTime = claimedAt ? new Date(String(claimedAt)).getTime() : 0;
-        if (claimedTime < cutoff) {
-          row['status'] = 'pending';
-          row['claimed_at'] = null;
-          affected.push(row);
-        }
-      }
-      return result<T>(affected as unknown as T[]);
-    }
-
-    if (
-      normalized.startsWith('UPDATE alarm_triggers') &&
-      normalized.includes("status = 'claimed'")
-    ) {
-      const ids = params[0] as string[];
-      const claimedRows: Record<string, unknown>[] = [];
-      for (const id of ids) {
-        const row = this.alarmTriggers.get(id);
-        if (row) {
-          row['status'] = 'claimed';
-          row['claimed_at'] = new Date().toISOString();
-          claimedRows.push(row);
-        }
-      }
-      return result<T>(claimedRows as unknown as T[]);
-    }
-
-    if (
-      normalized.startsWith('UPDATE alarm_triggers') &&
-      normalized.includes("status = 'deferred'")
-    ) {
-      const ids = params[0] as string[];
-      for (const id of ids) {
-        const row = this.alarmTriggers.get(id);
-        if (row) {
-          row['status'] = 'deferred';
-          row['processed_at'] = new Date().toISOString();
-        }
-      }
-      return result<T>([]);
-    }
-
-    if (normalized.startsWith('UPDATE alarm_triggers') && normalized.includes("status = 'done'")) {
-      const ids = params[0] as string[];
-      const runId = params[1] as string | null;
-      for (const id of ids) {
-        const row = this.alarmTriggers.get(id);
-        if (row) {
-          row['status'] = 'done';
-          row['run_id'] = runId;
-          row['processed_at'] = new Date().toISOString();
-        }
-      }
-      return result<T>([]);
-    }
-
-    if (
-      normalized.startsWith('UPDATE alarm_triggers') &&
-      normalized.includes('WHERE id = ANY($1)') &&
-      normalized.includes("status = 'pending'")
-    ) {
-      const ids = params[0] as string[];
-      for (const id of ids) {
-        const row = this.alarmTriggers.get(id);
-        if (row) {
-          row['status'] = 'pending';
-          row['claimed_at'] = null;
-        }
-      }
-      return result<T>([]);
-    }
-
-    if (
-      normalized.startsWith('UPDATE alarm_triggers') &&
-      normalized.includes("status = 'error'")
-    ) {
-      const ids = params[0] as string[];
-      for (const id of ids) {
-        const row = this.alarmTriggers.get(id);
-        if (row) {
-          row['status'] = 'error';
-          row['processed_at'] = new Date().toISOString();
-        }
-      }
-      return result<T>([]);
-    }
-
-    if (normalized.startsWith('SELECT run_id FROM alarm_triggers')) {
-      const specKey = String(params[0]);
-      const withinMs = Number(params[1]);
-      const cutoff = Date.now() - withinMs;
-      const rows = [...this.alarmTriggers.values()]
-        .filter(
-          (row) =>
-            row['spec_key'] === specKey && row['status'] === 'done' && row['run_id'] != null
-        )
-        .filter((row) => new Date(String(row['processed_at'])).getTime() > cutoff)
-        .sort(
-          (a, b) =>
-            new Date(String(b['processed_at'])).getTime() -
-            new Date(String(a['processed_at'])).getTime()
-        );
-      const top = rows[0];
-      return result<T>(top ? [{ run_id: top['run_id'] } as unknown as T] : []);
-    }
-
     throw new Error(`Unexpected query: ${text}`);
   }
 }
 
-function alarmTriggerRow(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
-  return {
-    id: `trigger-${Math.random().toString(36).slice(2)}`,
-    sns_message_id: 'sns-1',
-    alarm_arn: 'arn:aws:cloudwatch:us-east-1:123:alarm:test',
-    alarm_name: 'test-alarm',
-    new_state: 'ALARM',
-    state_change_time: new Date().toISOString(),
-    severity: 'CRITICAL',
-    spec_key: 'svc-a',
-    payload: {},
-    status: 'pending',
-    received_at: new Date().toISOString(),
-    claimed_at: null,
-    processed_at: null,
-    run_id: null,
-    ...overrides,
-  };
-}
-
 describe('Postgres state repository', () => {
+  it('marks SNS messages processed once', async () => {
+    const db = new FakeStateDatabase();
+
+    await expect(markSnsMessageProcessed(db, 'sns-1')).resolves.toBe(true);
+    await expect(markSnsMessageProcessed(db, 'sns-1')).resolves.toBe(false);
+    expect(db.processedSnsMessages.has('sns-1')).toBe(true);
+  });
+
+  it('atomically enqueues an ALARM trigger once per SNS message id', async () => {
+    const db = new FakeStateDatabase();
+
+    await expect(
+      enqueueAlarmTriggerOnce(db, {
+        snsMessageId: 'sns-1',
+        alarmArn: 'arn:aws:cloudwatch:us-east-1:123456789012:alarm:CPUHigh',
+        alarmName: 'CPUHigh',
+        newState: 'ALARM',
+        stateChangeTime: '2026-07-01T12:34:56.000+0000',
+        payload: { AlarmName: 'CPUHigh', NewStateValue: 'ALARM' },
+      })
+    ).resolves.toMatchObject({ duplicate: false, enqueued: true, id: 'trigger-1' });
+
+    await expect(
+      enqueueAlarmTriggerOnce(db, {
+        snsMessageId: 'sns-1',
+        alarmArn: 'arn:aws:cloudwatch:us-east-1:123456789012:alarm:CPUHigh',
+        alarmName: 'CPUHigh',
+        newState: 'ALARM',
+        stateChangeTime: '2026-07-01T12:34:56.000+0000',
+        payload: { AlarmName: 'CPUHigh', NewStateValue: 'ALARM' },
+      })
+    ).resolves.toMatchObject({ duplicate: true, enqueued: false });
+
+    expect(db.processedSnsMessages.size).toBe(1);
+    expect(db.alarmTriggers).toHaveLength(1);
+  });
+
+  it('records non-ALARM messages without enqueueing a trigger row', async () => {
+    const db = new FakeStateDatabase();
+
+    await expect(
+      enqueueAlarmTriggerOnce(db, {
+        snsMessageId: 'sns-2',
+        alarmArn: 'arn:aws:cloudwatch:us-east-1:123456789012:alarm:CPUHigh',
+        alarmName: 'CPUHigh',
+        newState: 'OK',
+        stateChangeTime: '2026-07-01T12:34:56.000+0000',
+        payload: { AlarmName: 'CPUHigh', NewStateValue: 'OK' },
+      })
+    ).resolves.toMatchObject({ duplicate: false, enqueued: false });
+
+    expect(db.processedSnsMessages.has('sns-2')).toBe(true);
+    expect(db.alarmTriggers).toHaveLength(0);
+  });
+
+  it('runs the enqueue transaction on a single pinned pool connection and releases it', async () => {
+    const pinned = new FakeStateDatabase();
+    const poolQueries: string[] = [];
+    let released = 0;
+    // A pool-like client: query() would check out a fresh connection per call,
+    // so a real transaction must go through connect() to pin one connection.
+    const pool = {
+      async query<T extends QueryResultRow = QueryResultRow>(
+        text: string,
+        params: readonly unknown[] = []
+      ): Promise<QueryResult<T>> {
+        poolQueries.push(text.replace(/\s+/g, ' ').trim());
+        return pinned.query<T>(text, params);
+      },
+      async connect() {
+        return {
+          query: pinned.query.bind(pinned),
+          release: () => {
+            released += 1;
+          },
+        };
+      },
+    };
+
+    await expect(
+      enqueueAlarmTriggerOnce(pool as unknown as DatabaseClient, {
+        snsMessageId: 'sns-pinned',
+        alarmArn: 'arn:aws:cloudwatch:us-east-1:123456789012:alarm:CPUHigh',
+        alarmName: 'CPUHigh',
+        newState: 'ALARM',
+        stateChangeTime: '2026-07-01T12:34:56.000+0000',
+        payload: { AlarmName: 'CPUHigh', NewStateValue: 'ALARM' },
+      })
+    ).resolves.toMatchObject({ duplicate: false, enqueued: true });
+
+    // Every statement ran on the pinned connection; the pool was never queried
+    // directly, so BEGIN..COMMIT could not be split across connections.
+    expect(poolQueries).toHaveLength(0);
+    expect(pinned.queries[0]?.trim()).toBe('BEGIN');
+    expect(pinned.queries.at(-1)?.trim()).toBe('COMMIT');
+    expect(released).toBe(1);
+  });
+
   it('persists worker run lifecycle fields', async () => {
     const db = new FakeStateDatabase();
     const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
@@ -852,154 +836,6 @@ describe('Postgres state repository', () => {
         webhookUrl: '[REDACTED]',
       },
     });
-  });
-});
-
-describe('Alarm trigger queue (Postgres repository)', () => {
-  it('claims all pending ALARM/INSUFFICIENT_DATA rows using FOR UPDATE SKIP LOCKED', async () => {
-    const db = new FakeStateDatabase();
-    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
-    const pending = alarmTriggerRow({ id: 't1', new_state: 'ALARM' });
-    const insufficient = alarmTriggerRow({ id: 't2', new_state: 'INSUFFICIENT_DATA' });
-    const ok = alarmTriggerRow({ id: 't3', new_state: 'OK' });
-    const done = alarmTriggerRow({ id: 't4', new_state: 'ALARM', status: 'done' });
-    db.alarmTriggers.set('t1', pending);
-    db.alarmTriggers.set('t2', insufficient);
-    db.alarmTriggers.set('t3', ok);
-    db.alarmTriggers.set('t4', done);
-
-    const claimed = await repository.claimPendingAlarmTriggers();
-
-    expect(claimed.map((row) => row.id).sort()).toEqual(['t1', 't2']);
-    expect(db.alarmTriggers.get('t1')?.['status']).toBe('claimed');
-    expect(db.alarmTriggers.get('t2')?.['status']).toBe('claimed');
-    expect(db.alarmTriggers.get('t3')?.['status']).toBe('pending');
-    expect(db.alarmTriggers.get('t4')?.['status']).toBe('done');
-    expect(db.queries.some((q) => q.includes('FOR UPDATE SKIP LOCKED'))).toBe(true);
-    expect(db.queries).toContain('BEGIN');
-    expect(db.queries).toContain('COMMIT');
-  });
-
-  it('rolls back the claim transaction on error and leaves rows pending', async () => {
-    const db = new FakeStateDatabase();
-    const failingClient: DatabaseClient = {
-      query: async (text: string, params: readonly unknown[] = []) => {
-        const normalized = text.replace(/\s+/g, ' ').trim();
-        if (normalized.startsWith('SELECT id FROM alarm_triggers')) {
-          throw new Error('connection reset');
-        }
-        return db.query(text, params);
-      },
-    };
-    const repository = new PostgresAgentStateRepository(failingClient, 's3://bucket/report.md');
-
-    await expect(repository.claimPendingAlarmTriggers()).rejects.toThrow('connection reset');
-  });
-
-  it('returns count of pending eligible rows', async () => {
-    const db = new FakeStateDatabase();
-    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
-    db.alarmTriggers.set('t1', alarmTriggerRow({ id: 't1', new_state: 'ALARM' }));
-    db.alarmTriggers.set('t2', alarmTriggerRow({ id: 't2', new_state: 'OK' }));
-
-    expect(await repository.countPendingAlarmTriggers()).toBe(1);
-  });
-
-  it('defers rows to the deferred status', async () => {
-    const db = new FakeStateDatabase();
-    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
-    db.alarmTriggers.set('t1', alarmTriggerRow({ id: 't1', status: 'claimed' }));
-
-    await repository.deferAlarmTriggers(['t1']);
-
-    expect(db.alarmTriggers.get('t1')).toMatchObject({ status: 'deferred' });
-    expect(db.alarmTriggers.get('t1')?.['processed_at']).not.toBeNull();
-  });
-
-  it('completes rows with a run id (launch or cooldown attach)', async () => {
-    const db = new FakeStateDatabase();
-    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
-    db.alarmTriggers.set('t1', alarmTriggerRow({ id: 't1', status: 'claimed' }));
-
-    await repository.completeAlarmTriggers(['t1'], 'run-42');
-
-    expect(db.alarmTriggers.get('t1')).toMatchObject({ status: 'done', run_id: 'run-42' });
-  });
-
-  it('releases rows back to pending (in-flight busy)', async () => {
-    const db = new FakeStateDatabase();
-    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
-    db.alarmTriggers.set('t1', alarmTriggerRow({ id: 't1', status: 'claimed', claimed_at: new Date().toISOString() }));
-
-    await repository.releaseAlarmTriggers(['t1']);
-
-    expect(db.alarmTriggers.get('t1')).toMatchObject({ status: 'pending', claimed_at: null });
-  });
-
-  it('marks rows as error on launch failure', async () => {
-    const db = new FakeStateDatabase();
-    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
-    db.alarmTriggers.set('t1', alarmTriggerRow({ id: 't1', status: 'claimed' }));
-
-    await repository.failAlarmTriggers(['t1']);
-
-    expect(db.alarmTriggers.get('t1')).toMatchObject({ status: 'error' });
-  });
-
-  it('reclaims stale claimed rows past the safety timeout', async () => {
-    const db = new FakeStateDatabase();
-    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
-    const stale = new Date(Date.now() - 60_000).toISOString();
-    const fresh = new Date().toISOString();
-    db.alarmTriggers.set('t1', alarmTriggerRow({ id: 't1', status: 'claimed', claimed_at: stale }));
-    db.alarmTriggers.set('t2', alarmTriggerRow({ id: 't2', status: 'claimed', claimed_at: fresh }));
-
-    const count = await repository.reclaimStaleClaimedTriggers(15_000);
-
-    expect(count).toBe(1);
-    expect(db.alarmTriggers.get('t1')).toMatchObject({ status: 'pending', claimed_at: null });
-    expect(db.alarmTriggers.get('t2')?.['status']).toBe('claimed');
-  });
-
-  it('finds a recent launch for a spec_key within the cooldown window', async () => {
-    const db = new FakeStateDatabase();
-    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
-    const recent = new Date(Date.now() - 1_000).toISOString();
-    db.alarmTriggers.set(
-      't1',
-      alarmTriggerRow({
-        id: 't1',
-        spec_key: 'svc-d',
-        status: 'done',
-        run_id: 'run-1',
-        processed_at: recent,
-      })
-    );
-
-    const hit = await repository.findRecentLaunchForSpecKey('svc-d', 600_000);
-    expect(hit).toEqual({ runId: 'run-1' });
-
-    const miss = await repository.findRecentLaunchForSpecKey('svc-e', 600_000);
-    expect(miss).toBeNull();
-  });
-
-  it('does not match a launch outside the cooldown window', async () => {
-    const db = new FakeStateDatabase();
-    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
-    const old = new Date(Date.now() - 700_000).toISOString();
-    db.alarmTriggers.set(
-      't1',
-      alarmTriggerRow({
-        id: 't1',
-        spec_key: 'svc-d',
-        status: 'done',
-        run_id: 'run-1',
-        processed_at: old,
-      })
-    );
-
-    const hit = await repository.findRecentLaunchForSpecKey('svc-d', 600_000);
-    expect(hit).toBeNull();
   });
 });
 

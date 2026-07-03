@@ -63,9 +63,9 @@ export interface Config {
     webhook: {
       enabled: boolean;
       pathToken?: string;
+      topicArn?: string;
       verifySignature: boolean;
       autoconfirm: boolean;
-      topicArn?: string;
     };
     trigger: {
       minSeverity: Severity;
@@ -168,10 +168,16 @@ export function loadConfig(): Config {
   }
   const alarmWebhookEnabled = getEnvBoolean('ALARM_WEBHOOK_ENABLED', false);
   const alarmWebhookPathToken = getEnvOptional('ALARM_WEBHOOK_PATH_TOKEN');
+  const alarmWebhookTopicArn = getEnvOptional('ALARM_WEBHOOK_TOPIC_ARN');
   if (alarmWebhookEnabled && !alarmWebhookPathToken) {
     throw new Error('ALARM_WEBHOOK_PATH_TOKEN is required when ALARM_WEBHOOK_ENABLED=true');
   }
-  const alarmWebhookTopicArn = getEnvOptional('ALARM_WEBHOOK_TOPIC_ARN');
+  // Bind the ingress to a single expected topic. Without it the Notification
+  // handler would fail open, accepting any validly-signed SNS message from any
+  // AWS account/topic, so require it rather than let it default to unset.
+  if (alarmWebhookEnabled && !alarmWebhookTopicArn) {
+    throw new Error('ALARM_WEBHOOK_TOPIC_ARN is required when ALARM_WEBHOOK_ENABLED=true');
+  }
 
   return {
     openrouter: {
@@ -239,9 +245,9 @@ export function loadConfig(): Config {
       webhook: {
         enabled: alarmWebhookEnabled,
         ...(alarmWebhookPathToken ? { pathToken: alarmWebhookPathToken } : {}),
+        ...(alarmWebhookTopicArn ? { topicArn: alarmWebhookTopicArn } : {}),
         verifySignature: getEnvBoolean('ALARM_WEBHOOK_VERIFY_SIGNATURE', true),
         autoconfirm: getEnvBoolean('ALARM_WEBHOOK_AUTOCONFIRM', true),
-        ...(alarmWebhookTopicArn ? { topicArn: alarmWebhookTopicArn } : {}),
       },
       trigger: {
         minSeverity: getEnvSeverity('ALARM_TRIGGER_MIN_SEVERITY', 'CRITICAL'),

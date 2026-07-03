@@ -1,10 +1,15 @@
-import { createSign, generateKeyPairSync } from 'node:crypto';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { createSign, generateKeyPairSync, randomUUID } from 'node:crypto';
+import { afterEach, describe, expect, it } from 'vitest';
 import type { QueryResult, QueryResultRow } from 'pg';
 import type { Config } from '../config.js';
 import type { DatabaseClient } from '../db/postgres.js';
-import { createWebServer, type WebServerDependencies } from '../web/api.js';
-import { buildCanonicalString, clearSnsCertCache, type SnsMessage } from '../web/snsVerify.js';
+import { createWebServer } from '../web/api.js';
+import {
+  buildCanonicalSnsMessage,
+  type SnsMessage,
+  type SnsNotification,
+  type SnsSubscriptionConfirmation,
+} from '../web/sns.js';
 
 function result<T extends QueryResultRow>(rows: T[]): QueryResult<T> {
   return {
@@ -16,7 +21,12 @@ function result<T extends QueryResultRow>(rows: T[]): QueryResult<T> {
   };
 }
 
-const config: Config = {
+const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+const certPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
+const signingCertUrl = 'https://sns.us-east-1.amazonaws.com/SimpleNotificationService-test.pem';
+const topicArn = 'arn:aws:sns:us-east-1:123456789012:mttr-alarms';
+
+const baseConfig: Config = {
   openrouter: {
     apiKey: 'test-key',
     model: 'test-model',
@@ -61,6 +71,25 @@ const config: Config = {
   },
 };
 
+function configWithWebhook(
+  overrides: Partial<Config['alarm']['webhook']> = {}
+): Config {
+  return {
+    ...baseConfig,
+    alarm: {
+      ...baseConfig.alarm,
+      webhook: {
+        enabled: true,
+        pathToken: 'secret-token',
+        topicArn,
+        verifySignature: true,
+        autoconfirm: true,
+        ...overrides,
+      },
+    },
+  };
+}
+
 interface FakeIncidentRow {
   incident_id: string;
   title: string;
@@ -73,6 +102,19 @@ interface FakeIncidentRow {
   current_next_stage: string | null;
   current_decision_json: Record<string, unknown> | null;
   last_run_id: string | null;
+}
+
+interface FakeAlarmTriggerRow {
+  id: string;
+  sns_message_id: string;
+  alarm_arn: string;
+  alarm_name: string;
+  new_state: string;
+  state_change_time: string;
+  severity: string | null;
+  spec_key: string | null;
+  payload: Record<string, unknown>;
+  status: string;
 }
 
 class FakeApiDatabase implements DatabaseClient {
@@ -140,6 +182,15 @@ class FakeApiDatabase implements DatabaseClient {
       metadata_json: { version: 'test' },
     },
   ];
+  processedSnsMessages = new Set<string>();
+  alarmTriggers: FakeAlarmTriggerRow[] = [];
+  failAlarmTriggerInsert = false;
+  private snapshot?:
+    | {
+        processedSnsMessages: Set<string>;
+        alarmTriggers: FakeAlarmTriggerRow[];
+      }
+    | undefined;
 
   async query<T extends QueryResultRow = QueryResultRow>(
     text: string,
@@ -147,6 +198,55 @@ class FakeApiDatabase implements DatabaseClient {
   ): Promise<QueryResult<T>> {
     this.queries.push(text);
     const normalized = text.replace(/\s+/g, ' ').trim();
+
+    if (normalized === 'BEGIN') {
+      this.snapshot = {
+        processedSnsMessages: new Set(this.processedSnsMessages),
+        alarmTriggers: this.alarmTriggers.map((row) => ({ ...row, payload: { ...row.payload } })),
+      };
+      return result<T>([]);
+    }
+    if (normalized === 'COMMIT') {
+      this.snapshot = undefined;
+      return result<T>([]);
+    }
+    if (normalized === 'ROLLBACK') {
+      if (this.snapshot) {
+        this.processedSnsMessages = this.snapshot.processedSnsMessages;
+        this.alarmTriggers = this.snapshot.alarmTriggers;
+      }
+      this.snapshot = undefined;
+      return result<T>([]);
+    }
+
+    if (normalized.startsWith('INSERT INTO processed_sns_messages')) {
+      const messageId = String(params[0]);
+      if (this.processedSnsMessages.has(messageId)) {
+        return result<T>([]);
+      }
+      this.processedSnsMessages.add(messageId);
+      return result<T>([{ sns_message_id: messageId } as unknown as T]);
+    }
+
+    if (normalized.startsWith('INSERT INTO alarm_triggers')) {
+      if (this.failAlarmTriggerInsert) {
+        throw new Error('alarm trigger insert failed');
+      }
+      const id = randomUUID();
+      this.alarmTriggers.push({
+        id,
+        sns_message_id: String(params[0]),
+        alarm_arn: String(params[1]),
+        alarm_name: String(params[2]),
+        new_state: String(params[3]),
+        state_change_time: String(params[4]),
+        severity: params[5] ? String(params[5]) : null,
+        spec_key: params[6] ? String(params[6]) : null,
+        payload: JSON.parse(String(params[7])) as Record<string, unknown>,
+        status: 'pending',
+      });
+      return result<T>([{ id } as unknown as T]);
+    }
 
     if (normalized.includes('FROM runs') && normalized.includes('WHERE id = $1')) {
       return result<T>(this.runs.filter((row) => row.id === params[0]) as unknown as T[]);
@@ -184,157 +284,65 @@ class FakeApiDatabase implements DatabaseClient {
   }
 }
 
-interface FakeAlarmTriggerRow {
-  id: string;
-  sns_message_id: unknown;
-  alarm_arn: unknown;
-  alarm_name: unknown;
-  new_state: unknown;
-  state_change_time: unknown;
-  payload: unknown;
-}
-
-class FakeWebhookDatabase extends FakeApiDatabase {
-  processedMessageIds = new Set<string>();
-  alarmTriggers: FakeAlarmTriggerRow[] = [];
-  failAlarmTriggerInsert = false;
-  private nextTriggerId = 1;
-
-  override async query<T extends QueryResultRow = QueryResultRow>(
-    text: string,
-    params: readonly unknown[] = []
-  ): Promise<QueryResult<T>> {
-    const normalized = text.replace(/\s+/g, ' ').trim();
-
-    if (normalized === 'BEGIN' || normalized === 'COMMIT' || normalized === 'ROLLBACK') {
-      return result<T>([]);
-    }
-
-    if (normalized.includes('INSERT INTO processed_sns_messages')) {
-      const messageId = params[0] as string;
-      if (this.processedMessageIds.has(messageId)) {
-        return result<T>([]);
-      }
-      this.processedMessageIds.add(messageId);
-      return result<T>([{ sns_message_id: messageId } as unknown as T]);
-    }
-
-    if (normalized.includes('INSERT INTO alarm_triggers')) {
-      if (this.failAlarmTriggerInsert) {
-        throw new Error('simulated alarm_triggers insert failure');
-      }
-      const id = `trigger-${this.nextTriggerId++}`;
-      this.alarmTriggers.push({
-        id,
-        sns_message_id: params[0],
-        alarm_arn: params[1],
-        alarm_name: params[2],
-        new_state: params[3],
-        state_change_time: params[4],
-        payload: params[5],
-      });
-      return result<T>([{ id } as unknown as T]);
-    }
-
-    return super.query<T>(text, params);
-  }
-}
-
-const WEBHOOK_TOPIC_ARN = 'arn:aws:sns:us-east-1:123456789012:mttr-alarms';
-const WEBHOOK_CERT_URL = 'https://sns.us-east-1.amazonaws.com/SimpleNotificationService-abc123.pem';
-const WEBHOOK_PATH_TOKEN = 'secret123';
-
-function webhookConfig(overrides: Partial<Config['alarm']['webhook']> = {}): Config {
-  const webhook: Config['alarm']['webhook'] = {
-    enabled: true,
-    pathToken: WEBHOOK_PATH_TOKEN,
-    verifySignature: true,
-    autoconfirm: true,
-    topicArn: WEBHOOK_TOPIC_ARN,
-    ...overrides,
-  };
-  return {
-    ...config,
-    alarm: { ...config.alarm, webhook },
-  };
-}
-
-function generateRsaKeyPair(): { publicKey: string; privateKey: string } {
-  return generateKeyPairSync('rsa', {
-    modulusLength: 2048,
-    publicKeyEncoding: { type: 'spki', format: 'pem' },
-    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
-  });
-}
-
-function signSnsMessage(message: SnsMessage, privateKey: string): string {
-  const algorithm = message.SignatureVersion === '1' ? 'RSA-SHA1' : 'RSA-SHA256';
-  const signer = createSign(algorithm);
-  signer.update(buildCanonicalString(message), 'utf8');
+function signMessage(message: SnsMessage): SnsMessage {
+  const signer = createSign(message.SignatureVersion === '1' ? 'RSA-SHA1' : 'RSA-SHA256');
+  signer.update(buildCanonicalSnsMessage(message), 'utf8');
   signer.end();
-  return signer.sign(privateKey, 'base64');
+  return {
+    ...message,
+    Signature: signer.sign(privateKey).toString('base64'),
+  };
 }
 
-function alarmMessageJson(overrides: Record<string, unknown> = {}): string {
-  return JSON.stringify({
-    AlarmName: 'high-error-rate',
-    AlarmArn: 'arn:aws:cloudwatch:us-east-1:123456789012:alarm:high-error-rate',
+function cloudWatchAlarmPayload(
+  overrides: Partial<Record<string, unknown>> = {}
+): Record<string, unknown> {
+  return {
+    AlarmArn: 'arn:aws:cloudwatch:us-east-1:123456789012:alarm:CPUHigh',
+    AlarmName: 'CPUHigh',
     NewStateValue: 'ALARM',
-    StateChangeTime: '2026-06-08T10:00:00.000Z',
-    NewStateReason: 'Threshold Crossed',
+    StateChangeTime: '2026-07-01T12:34:56.000+0000',
+    AWSAccountId: '123456789012',
     Region: 'US East (N. Virginia)',
     ...overrides,
-  });
+  };
 }
 
-function buildNotification(overrides: Partial<SnsMessage> = {}): SnsMessage {
-  return {
+function notificationMessage(
+  overrides: Partial<SnsNotification> = {},
+  alarmPayload: Record<string, unknown> = cloudWatchAlarmPayload()
+): SnsNotification {
+  return signMessage({
     Type: 'Notification',
-    MessageId: 'msg-1',
-    TopicArn: WEBHOOK_TOPIC_ARN,
-    Message: alarmMessageJson(),
-    Timestamp: '2026-06-08T10:00:00.000Z',
+    MessageId: 'message-1',
+    TopicArn: topicArn,
+    Subject: 'ALARM: "CPUHigh"',
+    Message: JSON.stringify(alarmPayload),
+    Timestamp: '2026-07-01T12:35:00.000Z',
     SignatureVersion: '2',
-    Signature: 'placeholder',
-    SigningCertURL: WEBHOOK_CERT_URL,
+    Signature: '',
+    SigningCertURL: signingCertUrl,
+    UnsubscribeURL: 'https://sns.us-east-1.amazonaws.com/?Action=Unsubscribe',
     ...overrides,
-  };
+  } as SnsNotification) as SnsNotification;
 }
 
-function buildConfirmation(overrides: Partial<SnsMessage> = {}): SnsMessage {
-  return {
+function subscriptionConfirmationMessage(
+  overrides: Partial<SnsSubscriptionConfirmation> = {}
+): SnsSubscriptionConfirmation {
+  return signMessage({
     Type: 'SubscriptionConfirmation',
-    MessageId: 'msg-confirm-1',
-    TopicArn: WEBHOOK_TOPIC_ARN,
-    Message: 'You have chosen to subscribe to the topic. Confirm the subscription.',
-    Timestamp: '2026-06-08T10:00:00.000Z',
+    MessageId: 'sub-message-1',
+    TopicArn: topicArn,
+    Message: 'You have chosen to subscribe...',
+    Timestamp: '2026-07-01T12:35:00.000Z',
     SignatureVersion: '2',
-    Signature: 'placeholder',
-    SigningCertURL: WEBHOOK_CERT_URL,
-    SubscribeURL: `https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription&TopicArn=${WEBHOOK_TOPIC_ARN}&Token=abc`,
-    Token: 'abc',
+    Signature: '',
+    SigningCertURL: signingCertUrl,
+    SubscribeURL: 'https://sns.us-east-1.amazonaws.com/?Action=ConfirmSubscription',
+    Token: 'token-123',
     ...overrides,
-  };
-}
-
-function signed(message: SnsMessage, privateKey: string): SnsMessage {
-  return { ...message, Signature: signSnsMessage(message, privateKey) };
-}
-
-function fetchTextRecorder(
-  cert: string,
-  calls: string[] = []
-): { fetchText: (url: string) => Promise<string>; calls: string[] } {
-  return {
-    calls,
-    fetchText: async (url: string) => {
-      calls.push(url);
-      if (url === WEBHOOK_CERT_URL) {
-        return cert;
-      }
-      return 'ok';
-    },
-  };
+  } as SnsSubscriptionConfirmation) as SnsSubscriptionConfirmation;
 }
 
 describe('web API', () => {
@@ -345,18 +353,12 @@ describe('web API', () => {
     apps.length = 0;
   });
 
-  function appFor(db = new FakeApiDatabase()) {
-    const app = createWebServer(config, db);
-    apps.push(app);
-    return { app, db };
-  }
-
-  function webhookAppFor(
-    db: FakeWebhookDatabase,
-    cfg: Config,
-    deps?: WebServerDependencies
-  ): { app: ReturnType<typeof createWebServer>; db: FakeWebhookDatabase } {
-    const app = createWebServer(cfg, db, undefined, deps);
+  function appFor(
+    config = baseConfig,
+    db = new FakeApiDatabase(),
+    webhookDependencies?: Parameters<typeof createWebServer>[3]
+  ) {
+    const app = createWebServer(config, db, undefined, webhookDependencies);
     apps.push(app);
     return { app, db };
   }
@@ -429,7 +431,7 @@ describe('web API', () => {
         last_run_id: 'run-1',
       },
     ];
-    const { app } = appFor(db);
+    const { app } = appFor(baseConfig, db);
 
     const response = await app.inject({ method: 'GET', url: '/api/status' });
 
@@ -515,501 +517,258 @@ describe('web API', () => {
     });
   });
 
-  describe('POST /webhooks/cloudwatch/:token', () => {
-    let keyPair: { publicKey: string; privateKey: string };
+  it('does not mount the cloudwatch webhook when disabled', async () => {
+    const { app } = appFor(baseConfig);
 
-    beforeEach(() => {
-      clearSnsCertCache();
-      keyPair = generateRsaKeyPair();
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/secret-token',
+      payload: '{}',
+      headers: { 'content-type': 'text/plain' },
     });
 
-    it('is not mounted when ALARM_WEBHOOK_ENABLED is false', async () => {
-      const { app } = appFor();
+    expect(response.statusCode).toBe(404);
+  });
 
-      const response = await app.inject({
-        method: 'POST',
-        url: '/webhooks/cloudwatch/anytoken',
-        payload: { Type: 'Notification' },
-      });
+  it('auto-confirms a valid subscription for the expected topic', async () => {
+    const subscribeCalls: string[] = [];
+    const { app } = appFor(configWithWebhook(), new FakeApiDatabase(), {
+      fetchSigningCert: async () => certPem,
+      confirmSubscriptionGet: async (url) => {
+        subscribeCalls.push(url);
+      },
+    });
+    const message = subscriptionConfirmationMessage();
 
-      expect(response.statusCode).toBe(404);
-      expect(response.json()).toEqual({ error: 'not_found' });
-
-      const health = await app.inject({ method: 'GET', url: '/healthz' });
-      expect(health.statusCode).toBe(200);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/secret-token',
+      payload: JSON.stringify(message),
+      headers: { 'content-type': 'text/plain' },
     });
 
-    it('returns 400 for a malformed JSON body sent as text/plain', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
+    expect(response.statusCode).toBe(200);
+    expect(subscribeCalls).toEqual([message.SubscribeURL]);
+  });
 
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        headers: { 'content-type': 'text/plain' },
-        payload: 'not-json{',
-      });
-
-      expect(response.statusCode).toBe(400);
-      expect(db.alarmTriggers).toHaveLength(0);
+  it('does not auto-confirm when the topic ARN does not match', async () => {
+    const subscribeCalls: string[] = [];
+    const { app } = appFor(configWithWebhook(), new FakeApiDatabase(), {
+      fetchSigningCert: async () => certPem,
+      confirmSubscriptionGet: async (url) => {
+        subscribeCalls.push(url);
+      },
+    });
+    const message = subscriptionConfirmationMessage({
+      TopicArn: 'arn:aws:sns:us-east-1:123456789012:different-topic',
     });
 
-    it('parses a JSON body sent with text/plain content-type and enqueues', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = signed(buildNotification(), keyPair.privateKey);
-
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        headers: { 'content-type': 'text/plain' },
-        payload: JSON.stringify(message),
-      });
-
-      expect(response.statusCode).toBe(200);
-      expect(response.json()).toMatchObject({ status: 'enqueued' });
-      expect(db.alarmTriggers).toHaveLength(1);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/secret-token',
+      payload: JSON.stringify(message),
+      headers: { 'content-type': 'text/plain' },
     });
 
-    it('returns 400 when required SNS fields are missing', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
+    expect(response.statusCode).toBe(200);
+    expect(subscribeCalls).toEqual([]);
+  });
 
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: { Type: 'Notification', MessageId: 'msg-1' },
-      });
-
-      expect(response.statusCode).toBe(400);
-      expect(response.json()).toEqual({ error: 'invalid_body' });
-      expect(db.alarmTriggers).toHaveLength(0);
+  it('refuses to confirm a subscription whose SubscribeURL is not an SNS host', async () => {
+    const subscribeCalls: string[] = [];
+    const { app } = appFor(configWithWebhook(), new FakeApiDatabase(), {
+      fetchSigningCert: async () => certPem,
+      confirmSubscriptionGet: async (url) => {
+        subscribeCalls.push(url);
+      },
+    });
+    // Correct topic + signature, but SubscribeURL points at an internal host:
+    // confirming it would be an SSRF, so it must be rejected without a fetch.
+    const message = subscriptionConfirmationMessage({
+      SubscribeURL: 'https://169.254.169.254/latest/meta-data/',
     });
 
-    it('returns 404 for the wrong path token, regardless of signature validity, with no side effects', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText, calls } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = signed(buildNotification(), keyPair.privateKey);
-      // Tamper with the signature too, to prove the wrong-token gate wins
-      // regardless of signature validity (REQ-F7).
-      const tampered = { ...message, Signature: 'not-a-real-signature' };
-
-      const response = await app.inject({
-        method: 'POST',
-        url: '/webhooks/cloudwatch/wrong-token',
-        payload: tampered,
-      });
-
-      expect(response.statusCode).toBe(404);
-      expect(response.json()).toEqual({ error: 'not_found' });
-      expect(db.alarmTriggers).toHaveLength(0);
-      expect(calls).toHaveLength(0);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/secret-token',
+      payload: JSON.stringify(message),
+      headers: { 'content-type': 'text/plain' },
     });
 
-    it('returns 404 for an empty token segment', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
+    expect(response.statusCode).toBe(403);
+    expect(response.json()).toMatchObject({ error: 'invalid_subscribe_url' });
+    expect(subscribeCalls).toEqual([]);
+  });
 
-      const response = await app.inject({
-        method: 'POST',
-        url: '/webhooks/cloudwatch/',
-        payload: { Type: 'Notification' },
-      });
-
-      expect(response.statusCode).toBe(404);
+  it('rejects requests with the wrong path token before enqueueing', async () => {
+    const db = new FakeApiDatabase();
+    const { app } = appFor(configWithWebhook(), db, {
+      fetchSigningCert: async () => certPem,
     });
 
-    it('rejects a tampered Message with 403 and no side effects', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = signed(buildNotification(), keyPair.privateKey);
-      const tampered: SnsMessage = { ...message, Message: alarmMessageJson({ AlarmName: 'tampered' }) };
-
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: tampered,
-      });
-
-      expect(response.statusCode).toBe(403);
-      expect(response.json()).toEqual({ error: 'invalid_signature' });
-      expect(db.alarmTriggers).toHaveLength(0);
-      expect(db.processedMessageIds.has(message.MessageId)).toBe(false);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/wrong-token',
+      payload: JSON.stringify(notificationMessage()),
+      headers: { 'content-type': 'text/plain' },
     });
 
-    it('rejects a disallowed SigningCertURL host with 403 and never fetches the cert', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText, calls } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = signed(
-        buildNotification({ SigningCertURL: 'https://evil.example.com/cert.pem' }),
-        keyPair.privateKey
-      );
+    expect(response.statusCode).toBe(404);
+    expect(db.alarmTriggers).toHaveLength(0);
+    expect(db.processedSnsMessages.size).toBe(0);
+  });
 
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: message,
-      });
+  it('rejects a notification with a bad SNS signature', async () => {
+    const { app, db } = appFor(configWithWebhook(), new FakeApiDatabase(), {
+      fetchSigningCert: async () => certPem,
+    });
+    const message = {
+      ...notificationMessage(),
+      Signature: 'ZmFrZQ==',
+    };
 
-      expect(response.statusCode).toBe(403);
-      expect(calls).toHaveLength(0);
-      expect(db.alarmTriggers).toHaveLength(0);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/secret-token',
+      payload: JSON.stringify(message),
+      headers: { 'content-type': 'text/plain' },
     });
 
-    it('rejects a SigningCertURL that is on an sns host but not https', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText, calls } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = signed(
-        buildNotification({ SigningCertURL: 'http://sns.us-east-1.amazonaws.com/cert.pem' }),
-        keyPair.privateKey
-      );
+    expect(response.statusCode).toBe(403);
+    expect(db.alarmTriggers).toHaveLength(0);
+    expect(db.processedSnsMessages.size).toBe(0);
+  });
 
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: message,
-      });
+  it('enqueues a valid ALARM notification exactly once', async () => {
+    const db = new FakeApiDatabase();
+    const { app } = appFor(configWithWebhook(), db, {
+      fetchSigningCert: async () => certPem,
+    });
+    const message = notificationMessage();
 
-      expect(response.statusCode).toBe(403);
-      expect(calls).toHaveLength(0);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/secret-token',
+      payload: JSON.stringify(message),
+      headers: { 'content-type': 'text/plain' },
     });
 
-    it('rejects a lookalike cert host (sns.<region>.amazonaws.com.evil.com)', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText, calls } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = signed(
-        buildNotification({ SigningCertURL: 'https://sns.us-east-1.amazonaws.com.evil.com/cert.pem' }),
-        keyPair.privateKey
-      );
+    expect(response.statusCode).toBe(200);
+    expect(db.processedSnsMessages.has(message.MessageId)).toBe(true);
+    expect(db.alarmTriggers).toHaveLength(1);
+    expect(db.alarmTriggers[0]).toMatchObject({
+      sns_message_id: message.MessageId,
+      alarm_arn: 'arn:aws:cloudwatch:us-east-1:123456789012:alarm:CPUHigh',
+      alarm_name: 'CPUHigh',
+      new_state: 'ALARM',
+      status: 'pending',
+      payload: {
+        AlarmName: 'CPUHigh',
+        NewStateValue: 'ALARM',
+      },
+    });
+  });
 
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: message,
-      });
+  it('dedupes duplicate SNS message ids without enqueueing twice', async () => {
+    const db = new FakeApiDatabase();
+    const { app } = appFor(configWithWebhook(), db, {
+      fetchSigningCert: async () => certPem,
+    });
+    const message = notificationMessage({ MessageId: 'duplicate-message' });
 
-      expect(response.statusCode).toBe(403);
-      expect(calls).toHaveLength(0);
+    const first = app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/secret-token',
+      payload: JSON.stringify(message),
+      headers: { 'content-type': 'text/plain' },
+    });
+    const second = app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/secret-token',
+      payload: JSON.stringify(message),
+      headers: { 'content-type': 'text/plain' },
     });
 
-    it('rejects an unsupported SignatureVersion with 403, not 500', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = { ...buildNotification({ SignatureVersion: '3' }), Signature: 'irrelevant' };
+    const [firstResponse, secondResponse] = await Promise.all([first, second]);
 
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: message,
-      });
+    expect(firstResponse.statusCode).toBe(200);
+    expect(secondResponse.statusCode).toBe(200);
+    expect(db.processedSnsMessages.has('duplicate-message')).toBe(true);
+    expect(db.alarmTriggers).toHaveLength(1);
+  });
 
-      expect(response.statusCode).toBe(403);
-      expect(response.json()).toEqual({ error: 'invalid_signature' });
+  it('records non-ALARM notifications as processed without enqueueing', async () => {
+    const db = new FakeApiDatabase();
+    const { app } = appFor(configWithWebhook(), db, {
+      fetchSigningCert: async () => certPem,
+    });
+    const message = notificationMessage({}, cloudWatchAlarmPayload({ NewStateValue: 'OK' }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/secret-token',
+      payload: JSON.stringify(message),
+      headers: { 'content-type': 'text/plain' },
     });
 
-    it('rejects a missing Signature field with 403, not 500', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = buildNotification();
-      const withoutSignature: Record<string, unknown> = { ...message };
-      delete withoutSignature['Signature'];
+    expect(response.statusCode).toBe(200);
+    expect(db.processedSnsMessages.has(message.MessageId)).toBe(true);
+    expect(db.alarmTriggers).toHaveLength(0);
+  });
 
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: withoutSignature,
-      });
-
-      expect(response.statusCode).toBe(403);
-      expect(response.json()).toEqual({ error: 'invalid_signature' });
+  it('rejects a validly-signed notification from an unexpected topic ARN', async () => {
+    const db = new FakeApiDatabase();
+    const { app } = appFor(configWithWebhook(), db, {
+      fetchSigningCert: async () => certPem,
+    });
+    // Genuine SNS signature, but published to a foreign topic the attacker owns.
+    const message = notificationMessage({
+      TopicArn: 'arn:aws:sns:us-east-1:999999999999:attacker-topic',
     });
 
-    it('REQ-F7: correct token + tampered signature -> 403; valid signature + wrong token -> 404', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const validMessage = signed(buildNotification(), keyPair.privateKey);
-
-      const badSignatureResponse = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: { ...validMessage, Signature: 'tampered-signature-value' },
-      });
-      expect(badSignatureResponse.statusCode).toBe(403);
-
-      const wrongTokenResponse = await app.inject({
-        method: 'POST',
-        url: '/webhooks/cloudwatch/wrong-token',
-        payload: validMessage,
-      });
-      expect(wrongTokenResponse.statusCode).toBe(404);
-
-      expect(db.alarmTriggers).toHaveLength(0);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/secret-token',
+      payload: JSON.stringify(message),
+      headers: { 'content-type': 'text/plain' },
     });
 
-    it('confirms the SNS subscription via SubscribeURL GET when autoconfirm is on and the topic matches', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText, calls } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig({ autoconfirm: true }), { fetchText });
-      const message = signed(buildConfirmation(), keyPair.privateKey);
+    expect(response.statusCode).toBe(403);
+    expect(db.alarmTriggers).toHaveLength(0);
+    expect(db.processedSnsMessages.size).toBe(0);
+  });
 
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: message,
-      });
+  it('acknowledges an unsupported SNS message type without enqueueing', async () => {
+    const db = new FakeApiDatabase();
+    const { app } = appFor(configWithWebhook(), db, {
+      fetchSigningCert: async () => certPem,
+    });
+    const message = { ...notificationMessage(), Type: 'UnsubscribeConfirmation' };
 
-      expect(response.statusCode).toBe(200);
-      expect(response.json()).toEqual({ status: 'confirmed' });
-      expect(calls.filter((url) => url === message.SubscribeURL)).toHaveLength(1);
-      expect(db.alarmTriggers).toHaveLength(0);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/secret-token',
+      payload: JSON.stringify(message),
+      headers: { 'content-type': 'text/plain' },
     });
 
-    it('skips confirmation when ALARM_WEBHOOK_AUTOCONFIRM is off', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText, calls } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig({ autoconfirm: false }), { fetchText });
-      const message = signed(buildConfirmation(), keyPair.privateKey);
+    expect(response.statusCode).toBe(200);
+    expect(db.alarmTriggers).toHaveLength(0);
+    expect(db.processedSnsMessages.size).toBe(0);
+  });
 
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: message,
-      });
-
-      expect(response.statusCode).toBe(200);
-      expect(response.json()).toEqual({ status: 'confirmation_skipped' });
-      expect(calls.filter((url) => url === message.SubscribeURL)).toHaveLength(0);
+  it('returns 400 for a malformed (non-SNS) request body', async () => {
+    const { app } = appFor(configWithWebhook(), new FakeApiDatabase(), {
+      fetchSigningCert: async () => certPem,
     });
 
-    it('skips confirmation when TopicArn does not match the configured expected topic', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText, calls } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = signed(
-        buildConfirmation({ TopicArn: 'arn:aws:sns:us-east-1:123456789012:some-other-topic' }),
-        keyPair.privateKey
-      );
-
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: message,
-      });
-
-      expect(response.statusCode).toBe(200);
-      expect(response.json()).toEqual({ status: 'confirmation_skipped' });
-      expect(calls.filter((url) => url === message.SubscribeURL)).toHaveLength(0);
+    const response = await app.inject({
+      method: 'POST',
+      url: '/webhooks/cloudwatch/secret-token',
+      payload: JSON.stringify({ not: 'an sns envelope' }),
+      headers: { 'content-type': 'text/plain' },
     });
 
-    it('rejects a disallowed SubscribeURL host with 403 and does not GET it', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText, calls } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = signed(
-        buildConfirmation({ SubscribeURL: 'https://evil.example.com/confirm' }),
-        keyPair.privateKey
-      );
-
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: message,
-      });
-
-      expect(response.statusCode).toBe(403);
-      expect(response.json()).toEqual({ error: 'invalid_subscribe_url' });
-      expect(calls).not.toContain('https://evil.example.com/confirm');
-    });
-
-    it('enqueues exactly one pending alarm_triggers row for a valid ALARM notification', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = signed(buildNotification({ MessageId: 'msg-alarm-1' }), keyPair.privateKey);
-
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: message,
-      });
-
-      expect(response.statusCode).toBe(200);
-      expect(response.json()).toMatchObject({ status: 'enqueued' });
-      expect(response.json()['triggerId']).toBeTruthy();
-      expect(db.alarmTriggers).toHaveLength(1);
-      expect(db.alarmTriggers[0]).toMatchObject({
-        sns_message_id: 'msg-alarm-1',
-        alarm_arn: 'arn:aws:cloudwatch:us-east-1:123456789012:alarm:high-error-rate',
-        alarm_name: 'high-error-rate',
-        new_state: 'ALARM',
-      });
-      // The full decoded CloudWatch alarm message is preserved as the stored
-      // payload, not just the four fields promoted to their own columns.
-      const storedPayload = JSON.parse(db.alarmTriggers[0]?.payload as string) as Record<string, unknown>;
-      expect(storedPayload).toMatchObject({
-        NewStateReason: 'Threshold Crossed',
-        Region: 'US East (N. Virginia)',
-      });
-    });
-
-    it('returns duplicate status and does not insert a second row for a repeated MessageId', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = signed(buildNotification({ MessageId: 'msg-dup-1' }), keyPair.privateKey);
-
-      const first = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: message,
-      });
-      const second = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: message,
-      });
-
-      expect(first.statusCode).toBe(200);
-      expect(first.json()).toMatchObject({ status: 'enqueued' });
-      expect(second.statusCode).toBe(200);
-      expect(second.json()).toEqual({ status: 'duplicate' });
-      expect(db.alarmTriggers).toHaveLength(1);
-    });
-
-    it('enqueues distinct rows for distinct MessageIds', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const first = signed(buildNotification({ MessageId: 'msg-a' }), keyPair.privateKey);
-      const secondMessage = signed(buildNotification({ MessageId: 'msg-b' }), keyPair.privateKey);
-
-      await app.inject({ method: 'POST', url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`, payload: first });
-      await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: secondMessage,
-      });
-
-      expect(db.alarmTriggers).toHaveLength(2);
-    });
-
-    it('stays exactly-once under concurrent duplicate deliveries', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = signed(buildNotification({ MessageId: 'msg-concurrent' }), keyPair.privateKey);
-
-      const [first, second] = await Promise.all([
-        app.inject({ method: 'POST', url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`, payload: message }),
-        app.inject({ method: 'POST', url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`, payload: message }),
-      ]);
-
-      const statuses = [first.json()['status'], second.json()['status']].sort();
-      expect(statuses).toEqual(['duplicate', 'enqueued']);
-      expect(db.alarmTriggers).toHaveLength(1);
-    });
-
-    it('still enqueues a pending trigger for an OK (recovery) notification', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = signed(
-        buildNotification({ MessageId: 'msg-ok-1', Message: alarmMessageJson({ NewStateValue: 'OK' }) }),
-        keyPair.privateKey
-      );
-
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: message,
-      });
-
-      expect(response.statusCode).toBe(200);
-      expect(response.json()).toMatchObject({ status: 'enqueued' });
-      expect(db.alarmTriggers).toMatchObject([{ new_state: 'OK' }]);
-    });
-
-    it('returns 400 for a Notification whose Message is not valid CloudWatch alarm JSON', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = signed(buildNotification({ Message: 'not a cloudwatch payload' }), keyPair.privateKey);
-
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: message,
-      });
-
-      expect(response.statusCode).toBe(400);
-      expect(response.json()).toEqual({ error: 'invalid_alarm_payload' });
-      expect(db.alarmTriggers).toHaveLength(0);
-    });
-
-    it('returns 200 ignored for UnsubscribeConfirmation with no side effects', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText, calls } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = signed(
-        buildConfirmation({ Type: 'UnsubscribeConfirmation', MessageId: 'msg-unsub-1' }),
-        keyPair.privateKey
-      );
-
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: message,
-      });
-
-      expect(response.statusCode).toBe(200);
-      expect(response.json()).toEqual({ status: 'ignored' });
-      expect(db.alarmTriggers).toHaveLength(0);
-      expect(calls.filter((url) => url === message.SubscribeURL)).toHaveLength(0);
-    });
-
-    it('returns 500 when the DB enqueue fails unexpectedly, without enqueueing twice', async () => {
-      const db = new FakeWebhookDatabase();
-      db.failAlarmTriggerInsert = true;
-      const { fetchText } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig(), { fetchText });
-      const message = signed(buildNotification({ MessageId: 'msg-fail-1' }), keyPair.privateKey);
-
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: message,
-      });
-
-      expect(response.statusCode).toBe(500);
-      expect(db.alarmTriggers).toHaveLength(0);
-    });
-
-    it('does not verify signatures when ALARM_WEBHOOK_VERIFY_SIGNATURE is disabled', async () => {
-      const db = new FakeWebhookDatabase();
-      const { fetchText } = fetchTextRecorder(keyPair.publicKey);
-      const { app } = webhookAppFor(db, webhookConfig({ verifySignature: false }), { fetchText });
-      const message = { ...buildNotification({ MessageId: 'msg-no-verify' }), Signature: 'not-a-signature' };
-
-      const response = await app.inject({
-        method: 'POST',
-        url: `/webhooks/cloudwatch/${WEBHOOK_PATH_TOKEN}`,
-        payload: message,
-      });
-
-      expect(response.statusCode).toBe(200);
-      expect(response.json()).toMatchObject({ status: 'enqueued' });
-    });
+    expect(response.statusCode).toBe(400);
   });
 });

@@ -237,6 +237,7 @@ describe('config', () => {
       for (const key of [
         'ALARM_WEBHOOK_ENABLED',
         'ALARM_WEBHOOK_PATH_TOKEN',
+        'ALARM_WEBHOOK_TOPIC_ARN',
         'ALARM_WEBHOOK_VERIFY_SIGNATURE',
         'ALARM_WEBHOOK_AUTOCONFIRM',
         'ALARM_TRIGGER_MIN_SEVERITY',
@@ -253,6 +254,7 @@ describe('config', () => {
 
       expect(config.alarm.webhook.enabled).toBe(false);
       expect(config.alarm.webhook.pathToken).toBeUndefined();
+      expect(config.alarm.webhook.topicArn).toBeUndefined();
       expect(config.alarm.webhook.verifySignature).toBe(true);
       expect(config.alarm.webhook.autoconfirm).toBe(true);
       expect(config.alarm.trigger.minSeverity).toBe('CRITICAL');
@@ -264,6 +266,7 @@ describe('config', () => {
     it('reads explicit overrides for all alarm vars', () => {
       process.env['ALARM_WEBHOOK_ENABLED'] = 'true';
       process.env['ALARM_WEBHOOK_PATH_TOKEN'] = 'super-secret-token';
+      process.env['ALARM_WEBHOOK_TOPIC_ARN'] = 'arn:aws:sns:us-east-1:123456789012:mttr-alarms';
       process.env['ALARM_WEBHOOK_VERIFY_SIGNATURE'] = 'false';
       process.env['ALARM_WEBHOOK_AUTOCONFIRM'] = 'false';
       process.env['ALARM_TRIGGER_MIN_SEVERITY'] = 'HIGH';
@@ -275,6 +278,9 @@ describe('config', () => {
 
       expect(config.alarm.webhook.enabled).toBe(true);
       expect(config.alarm.webhook.pathToken).toBe('super-secret-token');
+      expect(config.alarm.webhook.topicArn).toBe(
+        'arn:aws:sns:us-east-1:123456789012:mttr-alarms'
+      );
       expect(config.alarm.webhook.verifySignature).toBe(false);
       expect(config.alarm.webhook.autoconfirm).toBe(false);
       expect(config.alarm.trigger.minSeverity).toBe('HIGH');
@@ -333,6 +339,16 @@ describe('config', () => {
 
       expect(() => loadConfig()).toThrow(
         'ALARM_WEBHOOK_PATH_TOKEN is required when ALARM_WEBHOOK_ENABLED=true'
+      );
+    });
+
+    it('requires a topic ARN when the webhook is enabled so ingress cannot fail open', () => {
+      process.env['ALARM_WEBHOOK_ENABLED'] = 'true';
+      process.env['ALARM_WEBHOOK_PATH_TOKEN'] = 'super-secret-token';
+      delete process.env['ALARM_WEBHOOK_TOPIC_ARN'];
+
+      expect(() => loadConfig()).toThrow(
+        'ALARM_WEBHOOK_TOPIC_ARN is required when ALARM_WEBHOOK_ENABLED=true'
       );
     });
   });

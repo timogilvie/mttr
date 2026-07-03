@@ -1,3 +1,4 @@
+import { timingSafeEqual } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
@@ -6,109 +7,30 @@ import fastifyStatic from '@fastify/static';
 import type { Config } from '../config.js';
 import type { DatabaseClient, DatabasePool } from '../db/postgres.js';
 import { createPostgresPool } from '../db/postgres.js';
-import { enqueueAlarmTriggerIfNew } from '../state/repository.js';
-import { isAllowedSnsUrl, verifySnsSignature, type SnsMessage } from './snsVerify.js';
+import { enqueueAlarmTriggerOnce, markSnsMessageProcessed } from '../state/repository.js';
 import type { Severity } from '../types.js';
+import {
+  UnsupportedSnsMessageError,
+  confirmSnsSubscription,
+  isAllowedSnsUrl,
+  parseCloudWatchAlarmMessage,
+  parseSnsMessage,
+  verifySnsMessageSignature,
+} from './sns.js';
 
 type JsonRecord = Record<string, unknown>;
 
-export interface WebServerDependencies {
-  /** Fetches a URL as text. Injectable so tests never hit the network. */
-  fetchText?: (url: string) => Promise<string>;
-}
-
-interface CloudWatchAlarmMessage {
-  AlarmName: string;
-  AlarmArn: string;
-  NewStateValue: 'ALARM' | 'OK' | 'INSUFFICIENT_DATA';
-  StateChangeTime: string;
-}
-
-const SNS_REQUIRED_STRING_FIELDS = ['Type', 'MessageId', 'TopicArn', 'Message', 'Timestamp'] as const;
-const SNS_OPTIONAL_STRING_FIELDS = [
-  'SignatureVersion',
-  'Signature',
-  'SigningCertURL',
-  'Subject',
-  'SubscribeURL',
-  'Token',
-  'UnsubscribeURL',
-] as const;
-
-// Only the envelope fields needed to route the message are required for a
-// 400 vs. not; a missing/malformed signature is a *verification* failure
-// (403), handled by `verifySnsSignature`, not a body-shape failure.
-function isSnsMessage(body: unknown): body is SnsMessage {
-  if (!body || typeof body !== 'object') {
+/**
+ * Constant-time comparison of the path token so a `!==` short-circuit cannot
+ * leak the matching-prefix length to a timing attacker.
+ */
+function tokensMatch(provided: string, expected: string): boolean {
+  const providedBuf = Buffer.from(provided);
+  const expectedBuf = Buffer.from(expected);
+  if (providedBuf.length !== expectedBuf.length) {
     return false;
   }
-  const candidate = body as Record<string, unknown>;
-  for (const key of SNS_REQUIRED_STRING_FIELDS) {
-    if (typeof candidate[key] !== 'string') {
-      return false;
-    }
-  }
-  for (const key of SNS_OPTIONAL_STRING_FIELDS) {
-    if (candidate[key] !== undefined && typeof candidate[key] !== 'string') {
-      return false;
-    }
-  }
-  return true;
-}
-
-interface ParsedCloudWatchAlarm {
-  alarm: CloudWatchAlarmMessage;
-  // Full decoded `Message` payload (superset of `alarm`), stored as-is on the
-  // `alarm_triggers` row so the downstream worker (out of scope here) has
-  // everything CloudWatch sent - e.g. `Trigger`, `NewStateReason`, `Region`.
-  raw: Record<string, unknown>;
-}
-
-// SNS `Message` is always a JSON-encoded string for CloudWatch alarm
-// notifications. We require it to parse into the fields the durable enqueue
-// needs (alarm_triggers has NOT NULL/CHECK constraints on all of them); a
-// payload that doesn't parse can't produce a valid row, so it's rejected with
-// 400 rather than enqueued with placeholder data.
-function parseCloudWatchAlarmMessage(raw: string): ParsedCloudWatchAlarm | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return null;
-  }
-  if (!parsed || typeof parsed !== 'object') {
-    return null;
-  }
-  const candidate = parsed as Record<string, unknown>;
-  const alarmName = candidate['AlarmName'];
-  const alarmArn = candidate['AlarmArn'];
-  const newStateValue = candidate['NewStateValue'];
-  const stateChangeTime = candidate['StateChangeTime'];
-  if (
-    typeof alarmName !== 'string' ||
-    typeof alarmArn !== 'string' ||
-    typeof stateChangeTime !== 'string' ||
-    (newStateValue !== 'ALARM' && newStateValue !== 'OK' && newStateValue !== 'INSUFFICIENT_DATA')
-  ) {
-    return null;
-  }
-  return {
-    alarm: {
-      AlarmName: alarmName,
-      AlarmArn: alarmArn,
-      NewStateValue: newStateValue,
-      StateChangeTime: stateChangeTime,
-    },
-    raw: candidate,
-  };
-}
-
-async function defaultFetchText(url: string): Promise<string> {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Unexpected response ${response.status} fetching ${url}`);
-  }
-  return response.text();
+  return timingSafeEqual(providedBuf, expectedBuf);
 }
 
 interface RunRow {
@@ -167,6 +89,11 @@ interface WorkerHeartbeatRow {
   process_name: string;
   last_seen_at: Date | string;
   metadata_json: unknown;
+}
+
+interface WebhookDependencies {
+  fetchSigningCert?: (url: string, signal: AbortSignal) => Promise<string>;
+  confirmSubscriptionGet?: (url: string, signal: AbortSignal) => Promise<void>;
 }
 
 function toIso(value: Date | string | null): string | null {
@@ -319,13 +246,13 @@ export function createWebServer(
   config: Config,
   client?: DatabaseClient,
   ownedPool?: DatabasePool,
-  deps?: WebServerDependencies
+  webhookDependencies: WebhookDependencies = {}
 ): FastifyInstance {
   const db = client ?? createPostgresPool(config);
   const poolToClose = ownedPool ?? (client ? undefined : (db as DatabasePool));
   const app = Fastify({ logger: false });
   const staticRoot = resolve(process.cwd(), 'dist/web');
-  const fetchText = deps?.fetchText ?? defaultFetchText;
+  const snsCertCache = new Map<string, string>();
 
   app.addHook('onClose', async () => {
     await poolToClose?.end();
@@ -335,6 +262,108 @@ export function createWebServer(
     void app.register(fastifyStatic, {
       root: staticRoot,
       prefix: '/',
+    });
+  }
+
+  if (config.alarm.webhook.enabled) {
+    void app.register(async (webhookApp) => {
+      webhookApp.addContentTypeParser(
+        'text/plain',
+        { parseAs: 'string' },
+        (_request, body, done) => done(null, body)
+      );
+
+      webhookApp.post('/webhooks/cloudwatch/:token', async (request, reply) => {
+        const { token } = request.params as { token: string };
+        const expectedToken = config.alarm.webhook.pathToken;
+        if (!expectedToken || !tokensMatch(token, expectedToken)) {
+          return reply.code(404).send({ error: 'not_found' });
+        }
+
+        let message;
+        try {
+          message = parseSnsMessage(request.body);
+        } catch (error) {
+          if (error instanceof UnsupportedSnsMessageError) {
+            // Structurally valid SNS envelope we don't act on (e.g.
+            // UnsubscribeConfirmation): ack so SNS does not retry.
+            request.log.info({ messageType: error.messageType }, 'Ignoring unsupported SNS message type');
+            return reply.code(200).send({ ok: true });
+          }
+          return reply.code(400).send({ error: 'invalid_sns_message' });
+        }
+
+        if (config.alarm.webhook.verifySignature) {
+          const verificationOptions = { cache: snsCertCache };
+          if (webhookDependencies.fetchSigningCert) {
+            Object.assign(verificationOptions, {
+              fetchCert: webhookDependencies.fetchSigningCert,
+            });
+          }
+          const verified = await verifySnsMessageSignature(message, verificationOptions);
+          if (!verified) {
+            return reply.code(403).send({ error: 'invalid_sns_signature' });
+          }
+        }
+
+        if (message.Type === 'SubscriptionConfirmation') {
+          if (
+            config.alarm.webhook.autoconfirm &&
+            config.alarm.webhook.topicArn &&
+            message.TopicArn === config.alarm.webhook.topicArn
+          ) {
+            // Only GET a SubscribeURL that points at an AWS SNS host, so the
+            // confirmation handshake can never be turned into an SSRF request to
+            // an arbitrary internal endpoint.
+            if (!isAllowedSnsUrl(message.SubscribeURL)) {
+              request.log.warn(
+                { topicArn: message.TopicArn },
+                'Refusing to confirm SNS subscription: SubscribeURL is not an SNS host'
+              );
+              return reply.code(403).send({ error: 'invalid_subscribe_url' });
+            }
+            try {
+              const confirmationOptions = {};
+              if (webhookDependencies.confirmSubscriptionGet) {
+                Object.assign(confirmationOptions, {
+                  confirmGet: webhookDependencies.confirmSubscriptionGet,
+                });
+              }
+              await confirmSnsSubscription(message.SubscribeURL, confirmationOptions);
+            } catch {
+              request.log.warn({ topicArn: message.TopicArn }, 'SNS subscription confirmation failed');
+            }
+          }
+          return reply.code(200).send({ ok: true });
+        }
+
+        // A valid SNS signature only proves the message came from SNS, not that
+        // it came from *our* topic. Any account can publish a CloudWatch-shaped
+        // alarm to their own topic and replay the signed envelope here, so bind
+        // notifications to the expected topic ARN before enqueueing.
+        if (
+          config.alarm.webhook.topicArn &&
+          message.TopicArn !== config.alarm.webhook.topicArn
+        ) {
+          return reply.code(403).send({ error: 'unexpected_topic_arn' });
+        }
+
+        const alarmMessage = parseCloudWatchAlarmMessage(message.Message);
+        if (!alarmMessage) {
+          await markSnsMessageProcessed(db, message.MessageId);
+          return reply.code(200).send({ ok: true });
+        }
+
+        await enqueueAlarmTriggerOnce(db, {
+          snsMessageId: message.MessageId,
+          alarmArn: alarmMessage.AlarmArn,
+          alarmName: alarmMessage.AlarmName,
+          newState: alarmMessage.NewStateValue,
+          stateChangeTime: alarmMessage.StateChangeTime,
+          payload: alarmMessage,
+        });
+        return reply.code(200).send({ ok: true });
+      });
     });
   }
 
@@ -514,97 +543,6 @@ export function createWebServer(
   }));
 
   app.get('/healthz', async () => ({ ok: true }));
-
-  if (config.alarm.webhook.enabled) {
-    // SNS posts `Content-Type: text/plain` even though the body is JSON; Fastify's
-    // built-in text/plain parser returns the raw string, so we override it to parse
-    // JSON here. Only registered when the webhook is enabled, so disabled deployments
-    // see no change to how other routes handle text/plain bodies.
-    app.addContentTypeParser('text/plain', { parseAs: 'string' }, (_req, body, done) => {
-      try {
-        const text = body as string;
-        done(null, text.length > 0 ? JSON.parse(text) : {});
-      } catch (error) {
-        const parseError = error as Error & { statusCode?: number };
-        parseError.statusCode = 400;
-        done(parseError, undefined);
-      }
-    });
-
-    app.post('/webhooks/cloudwatch/:token', async (request, reply) => {
-      const { token } = request.params as { token: string };
-
-      // Cheap first gate: wrong token -> bare 404, no side effects, no hint
-      // that the route exists. Signature verification below still runs for
-      // every request that reaches it - a correct token never substitutes
-      // for a valid signature (see REQ-F7 / design doc §9).
-      if (token !== config.alarm.webhook.pathToken) {
-        return reply.code(404).send({ error: 'not_found' });
-      }
-
-      if (!isSnsMessage(request.body)) {
-        return reply.code(400).send({ error: 'invalid_body' });
-      }
-      const message = request.body;
-
-      if (config.alarm.webhook.verifySignature) {
-        const validSignature = await verifySnsSignature(message, { fetchCert: fetchText });
-        if (!validSignature) {
-          return reply.code(403).send({ error: 'invalid_signature' });
-        }
-      }
-
-      switch (message.Type) {
-        case 'SubscriptionConfirmation': {
-          const expectedTopicArn = config.alarm.webhook.topicArn;
-          const shouldConfirm =
-            config.alarm.webhook.autoconfirm &&
-            expectedTopicArn !== undefined &&
-            message.TopicArn === expectedTopicArn;
-          if (!shouldConfirm) {
-            return reply.code(200).send({ status: 'confirmation_skipped' });
-          }
-          if (!message.SubscribeURL || !isAllowedSnsUrl(message.SubscribeURL)) {
-            return reply.code(403).send({ error: 'invalid_subscribe_url' });
-          }
-          try {
-            await fetchText(message.SubscribeURL);
-          } catch (error) {
-            request.log.error(error, 'Failed to confirm SNS subscription');
-            return reply.code(502).send({ error: 'subscribe_confirm_failed' });
-          }
-          return reply.code(200).send({ status: 'confirmed' });
-        }
-        case 'Notification': {
-          const parsedAlarm = parseCloudWatchAlarmMessage(message.Message);
-          if (!parsedAlarm) {
-            return reply.code(400).send({ error: 'invalid_alarm_payload' });
-          }
-          const { alarm, raw } = parsedAlarm;
-          try {
-            const result = await enqueueAlarmTriggerIfNew(db, {
-              messageId: message.MessageId,
-              alarmArn: alarm.AlarmArn,
-              alarmName: alarm.AlarmName,
-              newState: alarm.NewStateValue,
-              stateChangeTime: alarm.StateChangeTime,
-              payload: raw,
-            });
-            if (!result.enqueued) {
-              return reply.code(200).send({ status: 'duplicate' });
-            }
-            return reply.code(200).send({ status: 'enqueued', triggerId: result.triggerId });
-          } catch (error) {
-            request.log.error(error, 'Failed to enqueue alarm trigger');
-            return reply.code(500).send({ error: 'enqueue_failed' });
-          }
-        }
-        case 'UnsubscribeConfirmation':
-        default:
-          return reply.code(200).send({ status: 'ignored' });
-      }
-    });
-  }
 
   app.setNotFoundHandler(async (request, reply) => {
     if (request.method === 'GET' && !request.url.startsWith('/api/') && existsSync(staticRoot)) {
