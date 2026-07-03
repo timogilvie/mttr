@@ -109,17 +109,20 @@ export class Orchestrator {
    * the returned `runId` itself (via `completeAlarmTriggers`) once this resolves `launched`.
    */
   async runInvestigationFromTrigger(batch: AlarmTriggerBatch): Promise<TriggerLaunchResult> {
-    // Fast-path only: the authoritative single-flight guard lives inside runInvestigate(), which
-    // checks-and-flips `investigateInFlight` synchronously right before launching. This check just
-    // avoids doing synthesis/persistence work we'd have to throw away if another investigation is
-    // already running.
+    // Claim `investigateInFlight` synchronously (no await between the check and the flip) so a
+    // concurrent scheduled tick's `runInvestigate` will see it busy and skip cleanly. Releasing
+    // this only after the alarm run's Investigate/Decide finish means a scheduled tick that
+    // collides with an alarm run yields to the alarm (rather than the alarm getting `false` back
+    // from runInvestigate and being terminally failed by failAlarmTriggers).
     if (this.investigateInFlight) {
       console.log('[Orchestrator] Investigate stage already in flight, deferring alarm trigger batch');
       return { status: 'busy' };
     }
+    this.investigateInFlight = true;
 
     const specs = this.buildAlarmSpecs(batch.triggers);
     if (specs.length === 0) {
+      this.investigateInFlight = false;
       return {
         status: 'error',
         message: 'No alarm trigger in the batch produced a valid incident spec',
@@ -167,7 +170,7 @@ export class Orchestrator {
         classification: canonical,
         reconciliation,
         actionable,
-      } = await this.persistClassification(runId, state, classification, now);
+      } = await this.persistClassification(runId, state, classification, now, { partial: true });
 
       if (!actionable || !reconciliation.shouldInvestigate) {
         console.log(
@@ -181,7 +184,9 @@ export class Orchestrator {
         return { status: 'launched', runId };
       }
 
-      const downstreamSucceeded = await this.runInvestigate(canonical, runId);
+      const downstreamSucceeded = await this.runInvestigate(canonical, runId, {
+        guardAlreadyHeld: true,
+      });
       if (!downstreamSucceeded) {
         const message = 'Investigate or Decide stage failed for alarm-triggered run';
         await finishRun({
@@ -204,6 +209,8 @@ export class Orchestrator {
       console.error('[Orchestrator] Unhandled error in alarm-triggered investigation:', error);
       await finishRun({ status: 'error', errorMessage: message });
       return { status: 'error', message };
+    } finally {
+      this.investigateInFlight = false;
     }
   }
 
@@ -243,14 +250,21 @@ export class Orchestrator {
     runId: string | undefined,
     state: AgentState,
     classificationInput: ClassificationResult,
-    now: string
+    now: string,
+    options: { partial?: boolean } = {}
   ): Promise<{
     classification: ClassificationResult;
     reconciliation: ObservationReconciliation;
     actionable: boolean;
   }> {
     const classification = canonicalizeClassificationIncidents(classificationInput);
-    const reconciliation = reconcileObservations(state, classification, now);
+    // Only the complete-report path may pass `partial: false` (default). Partial classifications
+    // (e.g. the alarm-triggered batch, which only synthesizes incidents for the alarms in flight)
+    // must NOT auto-resolve unrelated active observations that happen to be absent from this
+    // batch — see `reconcileObservations`.
+    const reconciliation = reconcileObservations(state, classification, now, {
+      partial: options.partial ?? false,
+    });
     await this.stateRepository.save(state);
     await this.stateRepository.recordReconciliation?.(runId, reconciliation);
     await this.stateRepository.recordStageOutput?.(runId, {
@@ -584,14 +598,17 @@ export class Orchestrator {
 
   private async runInvestigate(
     classification: ClassificationResult,
-    runId: string | undefined
+    runId: string | undefined,
+    options: { guardAlreadyHeld?: boolean } = {}
   ): Promise<boolean> {
-    if (this.investigateInFlight) {
-      console.log('[Orchestrator] Investigate stage still in flight, skipping');
-      return false;
+    const guardAlreadyHeld = options.guardAlreadyHeld ?? false;
+    if (!guardAlreadyHeld) {
+      if (this.investigateInFlight) {
+        console.log('[Orchestrator] Investigate stage still in flight, skipping');
+        return false;
+      }
+      this.investigateInFlight = true;
     }
-
-    this.investigateInFlight = true;
 
     try {
       console.log('[Orchestrator] Starting Investigate stage');
@@ -626,7 +643,9 @@ export class Orchestrator {
       console.error('[Orchestrator] Unhandled error in Investigate stage:', error);
       return false;
     } finally {
-      this.investigateInFlight = false;
+      if (!guardAlreadyHeld) {
+        this.investigateInFlight = false;
+      }
     }
 
     return false;

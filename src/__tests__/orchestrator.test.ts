@@ -714,6 +714,58 @@ describe('Orchestrator alarm trigger consumer seam (T5)', () => {
       orchestrator.stop();
       startRunSpy.mockRestore();
     });
+
+    it('does not resolve unrelated active observations left by prior report runs', async () => {
+      const classifyStage = await import('../stages/classify.js');
+      const investigateStage = await import('../stages/investigate.js');
+      await mockReport();
+      vi.mocked(investigateStage.run).mockResolvedValue(investigateResult);
+
+      // Seed state via a scheduled report run that creates a completely unrelated active
+      // observation (a finding on `api`, nothing to do with the alarm's service).
+      vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
+
+      let runCounter = 0;
+      const startRunSpy = vi
+        .spyOn(FileAgentStateRepository.prototype, 'startRun')
+        .mockImplementation(async () => {
+          runCounter += 1;
+          return `run-${runCounter}`;
+        });
+
+      const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+      const orchestrator = new Orchestrator(config);
+      orchestrator.start();
+
+      await vi.waitFor(() => expect(investigateStage.run).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(orchestrator.investigateBusy).toBe(false));
+
+      const persistedBefore = JSON.parse(readFileSync(config.state.path, 'utf8')) as {
+        observations: Record<string, { status: string }>;
+      };
+      const preexistingKeys = Object.keys(persistedBefore.observations);
+      expect(preexistingKeys).toHaveLength(1);
+      expect(persistedBefore.observations[preexistingKeys[0]!]?.status).toBe('active');
+
+      // Fire an alarm for a totally unrelated service. Before this fix, the alarm's partial
+      // classification would sweep the pre-existing active observation into 'resolved'.
+      const batch: AlarmTriggerBatch = {
+        triggers: [makeAlarmTriggerRow()],
+        specKeys: ['active-alarm-hokusai-auth-development-task-health'],
+      };
+      const result = await orchestrator.runInvestigationFromTrigger(batch);
+      expect(result.status).toBe('launched');
+
+      const persistedAfter = JSON.parse(readFileSync(config.state.path, 'utf8')) as {
+        observations: Record<string, { status: string }>;
+      };
+      // The alarm-born observation is added; the pre-existing one stays active.
+      expect(Object.keys(persistedAfter.observations)).toHaveLength(2);
+      expect(persistedAfter.observations[preexistingKeys[0]!]?.status).toBe('active');
+
+      orchestrator.stop();
+      startRunSpy.mockRestore();
+    });
   });
 
   it('starts the alarm trigger consumer when the webhook feature is enabled', async () => {
