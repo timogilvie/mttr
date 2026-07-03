@@ -9,6 +9,7 @@ import type { DatabaseClient, DatabasePool } from '../db/postgres.js';
 import { createPostgresPool } from '../db/postgres.js';
 import { enqueueAlarmTriggerOnce, markSnsMessageProcessed } from '../state/repository.js';
 import type { Severity } from '../types.js';
+import { ALARM_PIPELINE_COUNTER_METRICS, emitCounter } from '../util/metrics.js';
 import {
   UnsupportedSnsMessageError,
   confirmSnsSubscription,
@@ -302,6 +303,9 @@ export function createWebServer(
           }
           const verified = await verifySnsMessageSignature(message, verificationOptions);
           if (!verified) {
+            emitCounter(request.log, ALARM_PIPELINE_COUNTER_METRICS.SIGNATURE_REJECTED, {
+              sns_message_id: message.MessageId,
+            });
             return reply.code(403).send({ error: 'invalid_sns_signature' });
           }
         }
@@ -354,7 +358,7 @@ export function createWebServer(
           return reply.code(200).send({ ok: true });
         }
 
-        await enqueueAlarmTriggerOnce(db, {
+        const enqueueResult = await enqueueAlarmTriggerOnce(db, {
           snsMessageId: message.MessageId,
           alarmArn: alarmMessage.AlarmArn,
           alarmName: alarmMessage.AlarmName,
@@ -362,6 +366,20 @@ export function createWebServer(
           stateChangeTime: alarmMessage.StateChangeTime,
           payload: alarmMessage,
         });
+        if (enqueueResult.duplicate) {
+          // Idempotent replay of an SNS message we already processed (any new_state) — not a
+          // fresh alarm, so it must not also be counted as `alarms_received`.
+          emitCounter(request.log, ALARM_PIPELINE_COUNTER_METRICS.IDEMPOTENT_DROPPED, {
+            alarm_name: alarmMessage.AlarmName,
+            sns_message_id: message.MessageId,
+          });
+        } else if (enqueueResult.enqueued) {
+          emitCounter(request.log, ALARM_PIPELINE_COUNTER_METRICS.ALARMS_RECEIVED, {
+            alarm_name: alarmMessage.AlarmName,
+            sns_message_id: message.MessageId,
+            trigger_id: enqueueResult.id,
+          });
+        }
         return reply.code(200).send({ ok: true });
       });
     });

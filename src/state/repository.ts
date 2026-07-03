@@ -67,6 +67,17 @@ export interface AlarmTriggerEnqueueResult {
   id?: string;
 }
 
+/**
+ * Stuck-consumer signal (design doc §10): if `count` grows and `oldestAgeMs` keeps climbing,
+ * the trigger consumer has stopped draining `alarm_triggers` and the scheduled loop / SNS
+ * redelivery is the only thing still moving alarms toward an investigation.
+ */
+export interface AgingPendingTriggersSummary {
+  count: number;
+  oldestAgeMs: number | null;
+  oldestReceivedAt: string | null;
+}
+
 export interface RunRecordUpdate {
   status: Exclude<RunStatus, 'running'>;
   finishedAt: string;
@@ -138,6 +149,8 @@ export interface AgentStateRepository {
     specKey: string,
     withinMs: number
   ): Promise<{ runId: string } | null>;
+  /** Stuck-consumer detection (design doc §10) — read-only, no schema change required. */
+  getAgingPendingAlarmTriggers?(olderThanMs: number): Promise<AgingPendingTriggersSummary>;
 }
 
 export class FileAgentStateRepository implements AgentStateRepository {
@@ -241,6 +254,10 @@ export class FileAgentStateRepository implements AgentStateRepository {
     _withinMs: number
   ): Promise<{ runId: string } | null> {
     return null;
+  }
+
+  async getAgingPendingAlarmTriggers(_olderThanMs: number): Promise<AgingPendingTriggersSummary> {
+    return { count: 0, oldestAgeMs: null, oldestReceivedAt: null };
   }
 }
 
@@ -957,6 +974,29 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
     );
     const row = result.rows[0];
     return row ? { runId: row.run_id } : null;
+  }
+
+  async getAgingPendingAlarmTriggers(olderThanMs: number): Promise<AgingPendingTriggersSummary> {
+    // Scoped to the same `new_state` filter the claim query uses: `OK` rows are intentionally
+    // left `pending` forever pending T7 and are not backlog, so they must not count as "stuck".
+    const result = await this.client.query<{
+      count: string;
+      oldest_received_at: Date | string | null;
+    }>(
+      `SELECT count(*)::text AS count, min(received_at) AS oldest_received_at
+       FROM alarm_triggers
+       WHERE status = 'pending'
+         AND new_state IN ('ALARM', 'INSUFFICIENT_DATA')
+         AND received_at < now() - make_interval(secs => $1::double precision / 1000)`,
+      [olderThanMs]
+    );
+    const row = result.rows[0];
+    const count = Number(row?.count ?? 0);
+    const oldestReceivedAt = row?.oldest_received_at ? toIso(row.oldest_received_at) : null;
+    const oldestAgeMs = oldestReceivedAt
+      ? Date.now() - new Date(oldestReceivedAt).getTime()
+      : null;
+    return { count, oldestAgeMs, oldestReceivedAt };
   }
 
   private async loadIncidentSnapshots(

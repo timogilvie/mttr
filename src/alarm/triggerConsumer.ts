@@ -1,6 +1,12 @@
 import type { Config } from '../config.js';
 import type { AgentStateRepository, AlarmTriggerRow } from '../state/repository.js';
 import type { Severity } from '../types.js';
+import {
+  ALARM_PIPELINE_COUNTER_METRICS,
+  ALARM_PIPELINE_LATENCY_METRIC,
+  emitCounter,
+  emitTiming,
+} from '../util/metrics.js';
 
 /**
  * T6 seam (design doc §5.4). The consumer depends only on this interface — never on the
@@ -108,6 +114,7 @@ export async function runAlarmTriggerConsumerOnce(
   const { config, repository, launcher } = deps;
   const logger = deps.logger ?? console;
   const sleep = deps.sleep ?? defaultSleep;
+  const now = deps.now ?? Date.now;
   const trigger = config.alarm.trigger;
 
   if (!config.alarm.webhook.enabled) {
@@ -179,10 +186,19 @@ export async function runAlarmTriggerConsumerOnce(
     if (row.severity === null) {
       deferIds.push(row.id);
       logger.warn(`[AlarmTriggerConsumer] Trigger ${row.id} has no severity; deferring (fail-safe)`);
+      emitCounter(logger, ALARM_PIPELINE_COUNTER_METRICS.SEVERITY_DEFERRED, {
+        trigger_id: row.id,
+        alarm_name: row.alarm_name,
+      });
       continue;
     }
     if (severityRank(row.severity) < severityRank(trigger.minSeverity)) {
       deferIds.push(row.id);
+      emitCounter(logger, ALARM_PIPELINE_COUNTER_METRICS.SEVERITY_DEFERRED, {
+        trigger_id: row.id,
+        alarm_name: row.alarm_name,
+        spec_key: row.spec_key,
+      });
       continue;
     }
     if (!row.spec_key) {
@@ -190,6 +206,10 @@ export async function runAlarmTriggerConsumerOnce(
       logger.warn(
         `[AlarmTriggerConsumer] Trigger ${row.id} missing spec_key; deferring (fail-safe, cannot coalesce/cooldown)`
       );
+      emitCounter(logger, ALARM_PIPELINE_COUNTER_METRICS.SEVERITY_DEFERRED, {
+        trigger_id: row.id,
+        alarm_name: row.alarm_name,
+      });
       continue;
     }
     eligible.push(row);
@@ -212,6 +232,19 @@ export async function runAlarmTriggerConsumerOnce(
     }
   }
 
+  // A group of >1 rows is a storm collapsing into a single downstream action (launch or
+  // cooldown-attach) — count the collapse itself, separately from what that action turns out
+  // to be. `coalesced_count` is the number of *extra* rows folded into the first.
+  for (const [specKey, rows] of groups) {
+    if (rows.length > 1) {
+      emitCounter(logger, ALARM_PIPELINE_COUNTER_METRICS.COALESCED, {
+        spec_key: specKey,
+        alarm_name: rows[0]?.alarm_name,
+        coalesced_count: rows.length - 1,
+      });
+    }
+  }
+
   const launchRows: AlarmTriggerRow[] = [];
   const specKeys: string[] = [];
 
@@ -229,6 +262,13 @@ export async function runAlarmTriggerConsumerOnce(
       logger.log(
         `[AlarmTriggerConsumer] Attached ${ids.length} trigger(s) for spec_key=${specKey} to run ${cooldownHit.runId} (cooldown)`
       );
+      for (const row of rows) {
+        emitCounter(logger, ALARM_PIPELINE_COUNTER_METRICS.COOLDOWN_ATTACHED, {
+          trigger_id: row.id,
+          alarm_name: row.alarm_name,
+          spec_key: specKey,
+        });
+      }
       continue;
     }
     launchRows.push(...rows);
@@ -262,6 +302,20 @@ export async function runAlarmTriggerConsumerOnce(
       logger.log(
         `[AlarmTriggerConsumer] Launched investigation ${result.runId ?? '<no-run-id>'} for ${specKeys.length} spec_key(s), ${batchIds.length} trigger(s)`
       );
+      const launchedAt = now();
+      for (const row of launchRows) {
+        emitCounter(logger, ALARM_PIPELINE_COUNTER_METRICS.INVESTIGATIONS_LAUNCHED, {
+          trigger_id: row.id,
+          alarm_name: row.alarm_name,
+          spec_key: row.spec_key,
+        });
+        emitTiming(
+          logger,
+          ALARM_PIPELINE_LATENCY_METRIC,
+          launchedAt - new Date(row.received_at).getTime(),
+          { trigger_id: row.id, alarm_name: row.alarm_name, spec_key: row.spec_key }
+        );
+      }
     } else if (result.status === 'busy') {
       await repository.releaseAlarmTriggers?.(batchIds);
       outcome.released = batchIds.length;

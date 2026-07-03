@@ -1,5 +1,5 @@
 import { createSign, generateKeyPairSync, randomUUID } from 'node:crypto';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { QueryResult, QueryResultRow } from 'pg';
 import type { Config } from '../config.js';
 import type { DatabaseClient } from '../db/postgres.js';
@@ -770,5 +770,132 @@ describe('web API', () => {
     });
 
     expect(response.statusCode).toBe(400);
+  });
+
+  describe('alarm pipeline instrumentation', () => {
+    // Fastify's `logger: false` uses a null logger whose `.child()` returns the same instance
+    // (see fastify/lib/logger-factory.js), so `request.log` === `app.log` here — spying on
+    // `app.log.info` observes every metric emitted through `request.log` during the request.
+    // Fastify itself also calls `childLogger.info({ req }, 'incoming request')` on every request
+    // regardless of logger config, so filter down to payloads that carry our `metric` field.
+    function metricPayloads(infoSpy: ReturnType<typeof vi.spyOn>): Array<Record<string, unknown>> {
+      return infoSpy.mock.calls
+        .map((call) => call[0] as Record<string, unknown>)
+        .filter((payload) => typeof payload['metric'] === 'string');
+    }
+
+    it('emits signature_rejected on a bad SNS signature, and nothing else', async () => {
+      const { app, db } = appFor(configWithWebhook(), new FakeApiDatabase(), {
+        fetchSigningCert: async () => certPem,
+      });
+      const infoSpy = vi.spyOn(app.log, 'info');
+      const message = { ...notificationMessage(), Signature: 'ZmFrZQ==' };
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/webhooks/cloudwatch/secret-token',
+        payload: JSON.stringify(message),
+        headers: { 'content-type': 'text/plain' },
+      });
+
+      expect(response.statusCode).toBe(403);
+      const metrics = metricPayloads(infoSpy);
+      expect(metrics).toEqual([
+        expect.objectContaining({
+          metric: 'alarm_pipeline.signature_rejected',
+          sns_message_id: message.MessageId,
+        }),
+      ]);
+      expect(db.alarmTriggers).toHaveLength(0);
+    });
+
+    it('emits alarms_received with the trigger id on a valid ALARM enqueue', async () => {
+      const db = new FakeApiDatabase();
+      const { app } = appFor(configWithWebhook(), db, {
+        fetchSigningCert: async () => certPem,
+      });
+      const infoSpy = vi.spyOn(app.log, 'info');
+      const message = notificationMessage();
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/webhooks/cloudwatch/secret-token',
+        payload: JSON.stringify(message),
+        headers: { 'content-type': 'text/plain' },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const metrics = metricPayloads(infoSpy);
+      expect(metrics).toEqual([
+        expect.objectContaining({
+          metric: 'alarm_pipeline.alarms_received',
+          alarm_name: 'CPUHigh',
+          sns_message_id: message.MessageId,
+          trigger_id: db.alarmTriggers[0]?.id,
+        }),
+      ]);
+    });
+
+    it('emits idempotent_dropped (not alarms_received) on a duplicate SNS message id', async () => {
+      const db = new FakeApiDatabase();
+      const { app } = appFor(configWithWebhook(), db, {
+        fetchSigningCert: async () => certPem,
+      });
+      const message = notificationMessage({ MessageId: 'duplicate-message' });
+
+      await app.inject({
+        method: 'POST',
+        url: '/webhooks/cloudwatch/secret-token',
+        payload: JSON.stringify(message),
+        headers: { 'content-type': 'text/plain' },
+      });
+
+      const infoSpy = vi.spyOn(app.log, 'info');
+      const response = await app.inject({
+        method: 'POST',
+        url: '/webhooks/cloudwatch/secret-token',
+        payload: JSON.stringify(message),
+        headers: { 'content-type': 'text/plain' },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const metrics = metricPayloads(infoSpy);
+      expect(metrics).toEqual([
+        expect.objectContaining({
+          metric: 'alarm_pipeline.idempotent_dropped',
+          alarm_name: 'CPUHigh',
+          sns_message_id: 'duplicate-message',
+        }),
+      ]);
+      expect(metrics.some((metric) => metric['metric'] === 'alarm_pipeline.alarms_received')).toBe(
+        false
+      );
+    });
+
+    it('does not emit alarms_received or idempotent_dropped for a non-ALARM notification', async () => {
+      const db = new FakeApiDatabase();
+      const { app } = appFor(configWithWebhook(), db, {
+        fetchSigningCert: async () => certPem,
+      });
+      const infoSpy = vi.spyOn(app.log, 'info');
+      const message = notificationMessage({}, cloudWatchAlarmPayload({ NewStateValue: 'OK' }));
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/webhooks/cloudwatch/secret-token',
+        payload: JSON.stringify(message),
+        headers: { 'content-type': 'text/plain' },
+      });
+
+      expect(response.statusCode).toBe(200);
+      const metrics = metricPayloads(infoSpy);
+      expect(
+        metrics.some((metric) =>
+          ['alarm_pipeline.alarms_received', 'alarm_pipeline.idempotent_dropped'].includes(
+            metric['metric'] as string
+          )
+        )
+      ).toBe(false);
+    });
   });
 });

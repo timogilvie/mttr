@@ -5,6 +5,7 @@ import type { DatabaseClient } from '../db/postgres.js';
 import { MIGRATIONS, runMigrations } from '../db/migrations.js';
 import {
   enqueueAlarmTriggerOnce,
+  FileAgentStateRepository,
   markSnsMessageProcessed,
   PostgresAgentStateRepository,
 } from '../state/repository.js';
@@ -854,6 +855,152 @@ describe('Postgres state repository', () => {
         text: 'High 4xx',
         webhookUrl: '[REDACTED]',
       },
+    });
+  });
+});
+
+interface FakeAgingRow {
+  status: string;
+  new_state: string;
+  received_at: Date;
+}
+
+class FakeAgingTriggerDatabase implements DatabaseClient {
+  rows: FakeAgingRow[] = [];
+
+  seed(...rows: FakeAgingRow[]): this {
+    this.rows.push(...rows);
+    return this;
+  }
+
+  async query<T extends QueryResultRow = QueryResultRow>(
+    text: string,
+    params: readonly unknown[] = []
+  ): Promise<QueryResult<T>> {
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    if (normalized.startsWith('SELECT count(*)::text AS count, min(received_at)')) {
+      const olderThanMs = Number(params[0]);
+      const threshold = Date.now() - olderThanMs;
+      const eligible = this.rows.filter(
+        (row) =>
+          row.status === 'pending' &&
+          (row.new_state === 'ALARM' || row.new_state === 'INSUFFICIENT_DATA') &&
+          row.received_at.getTime() < threshold
+      );
+      const oldest = eligible.reduce<Date | null>(
+        (min, row) => (!min || row.received_at < min ? row.received_at : min),
+        null
+      );
+      return {
+        rows: [
+          {
+            count: String(eligible.length),
+            oldest_received_at: oldest,
+          } as unknown as T,
+        ],
+        rowCount: 1,
+        command: '',
+        oid: 0,
+        fields: [],
+      };
+    }
+    throw new Error(`Unexpected query: ${text}`);
+  }
+}
+
+describe('getAgingPendingAlarmTriggers', () => {
+  it('excludes fresh pending rows under the age threshold', async () => {
+    const db = new FakeAgingTriggerDatabase().seed({
+      status: 'pending',
+      new_state: 'ALARM',
+      received_at: new Date(Date.now() - 1000),
+    });
+    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
+
+    const summary = await repository.getAgingPendingAlarmTriggers(60_000);
+
+    expect(summary).toEqual({ count: 0, oldestAgeMs: null, oldestReceivedAt: null });
+  });
+
+  it('includes old pending ALARM/INSUFFICIENT_DATA rows past the threshold', async () => {
+    const oldReceivedAt = new Date(Date.now() - 120_000);
+    const db = new FakeAgingTriggerDatabase().seed({
+      status: 'pending',
+      new_state: 'ALARM',
+      received_at: oldReceivedAt,
+    });
+    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
+
+    const summary = await repository.getAgingPendingAlarmTriggers(60_000);
+
+    expect(summary.count).toBe(1);
+    expect(summary.oldestReceivedAt).toBe(oldReceivedAt.toISOString());
+    expect(summary.oldestAgeMs).not.toBeNull();
+    expect(summary.oldestAgeMs as number).toBeGreaterThanOrEqual(120_000 - 1000);
+  });
+
+  it('excludes non-pending rows (done/claimed/deferred/error) even if old', async () => {
+    const oldReceivedAt = new Date(Date.now() - 120_000);
+    const db = new FakeAgingTriggerDatabase().seed(
+      { status: 'done', new_state: 'ALARM', received_at: oldReceivedAt },
+      { status: 'claimed', new_state: 'ALARM', received_at: oldReceivedAt },
+      { status: 'deferred', new_state: 'ALARM', received_at: oldReceivedAt },
+      { status: 'error', new_state: 'ALARM', received_at: oldReceivedAt }
+    );
+    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
+
+    const summary = await repository.getAgingPendingAlarmTriggers(60_000);
+
+    expect(summary).toEqual({ count: 0, oldestAgeMs: null, oldestReceivedAt: null });
+  });
+
+  it('excludes pending OK rows left for T7 — they are not consumer backlog', async () => {
+    const oldReceivedAt = new Date(Date.now() - 120_000);
+    const db = new FakeAgingTriggerDatabase().seed({
+      status: 'pending',
+      new_state: 'OK',
+      received_at: oldReceivedAt,
+    });
+    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
+
+    const summary = await repository.getAgingPendingAlarmTriggers(60_000);
+
+    expect(summary).toEqual({ count: 0, oldestAgeMs: null, oldestReceivedAt: null });
+  });
+
+  it('returns the oldest received_at across multiple aging rows', async () => {
+    const oldest = new Date(Date.now() - 300_000);
+    const newer = new Date(Date.now() - 90_000);
+    const db = new FakeAgingTriggerDatabase().seed(
+      { status: 'pending', new_state: 'ALARM', received_at: newer },
+      { status: 'pending', new_state: 'INSUFFICIENT_DATA', received_at: oldest }
+    );
+    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
+
+    const summary = await repository.getAgingPendingAlarmTriggers(60_000);
+
+    expect(summary.count).toBe(2);
+    expect(summary.oldestReceivedAt).toBe(oldest.toISOString());
+  });
+
+  it('returns a zero/null summary for an empty table', async () => {
+    const db = new FakeAgingTriggerDatabase();
+    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
+
+    const summary = await repository.getAgingPendingAlarmTriggers(60_000);
+
+    expect(summary).toEqual({ count: 0, oldestAgeMs: null, oldestReceivedAt: null });
+  });
+});
+
+describe('FileAgentStateRepository.getAgingPendingAlarmTriggers', () => {
+  it('returns a harmless zero/null default', async () => {
+    const repository = new FileAgentStateRepository('/tmp/does-not-matter.json');
+
+    await expect(repository.getAgingPendingAlarmTriggers(60_000)).resolves.toEqual({
+      count: 0,
+      oldestAgeMs: null,
+      oldestReceivedAt: null,
     });
   });
 });
