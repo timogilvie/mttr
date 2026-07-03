@@ -1636,6 +1636,50 @@ describe('investigate stage', () => {
       );
     });
 
+    it('keeps a telemetry gap when one of multiple metrics remains empty after widened lookback', async () => {
+      mockMetricsAndAlarms.mockImplementation(async (args) => {
+        if (args.period_seconds === 3600 && args.metric_name === 'DetectorLiveness') {
+          return 'Metric datapoints (1):\n2026-05-25T10:00:00.000Z: Sum=5 Count';
+        }
+        return 'No metric datapoints in the requested window.';
+      });
+      mockLoop.mockResolvedValue(loopResult(investigationResultJson('telemetry-gap-one-metric-empty')));
+
+      const result = await investigateStage.run(
+        mockInput,
+        mockConfig,
+        telemetryGapClassification('telemetry-gap-one-metric-empty', {
+          cloudwatchMetrics: [
+            {
+              namespace: 'Hokusai/Detectors',
+              metric_name: 'DetectorLiveness',
+              stat: 'Sum',
+              dimensions: [{ name: 'Detector', value: 'deltaone-anomaly-detection' }],
+            },
+            {
+              namespace: 'Hokusai/Detectors',
+              metric_name: 'DetectorHeartbeat',
+              stat: 'Sum',
+              dimensions: [{ name: 'Detector', value: 'deltaone-anomaly-detection' }],
+            },
+          ],
+        })
+      );
+
+      expect(result.status).toBe('success');
+      const investigation = (result.data as InvestigationResult).investigations[0]!;
+      expect(investigation.telemetry_gap?.kind).toBe('instrumentation');
+      expect(investigation.telemetry_gap?.next_telemetry_source).toContain(
+        'Hokusai/Detectors/DetectorHeartbeat'
+      );
+      expect(investigation.telemetry_gap?.fallback_attempts).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ path: 'metric_widened_lookback', outcome: 'resolved' }),
+          expect.objectContaining({ path: 'metric_widened_lookback', outcome: 'empty' }),
+        ])
+      );
+    });
+
     it('classifies an unresolved metric gap as instrumentation when runtime activity is confirmed', async () => {
       mockMetricsAndAlarms.mockResolvedValue('No metric datapoints in the requested window.');
       mockLoop.mockResolvedValue(loopResult(investigationResultJson('telemetry-gap-instrumentation')));
@@ -1763,6 +1807,45 @@ describe('investigate stage', () => {
       expect(investigation.telemetry_gap?.kind).toBe('discovery');
       expect(investigation.telemetry_gap?.next_telemetry_source).toContain(
         '/ecs/hokusai-auth/development'
+      );
+    });
+
+    it('names the concrete runtime-owner retry when owner discovery finds no log group', async () => {
+      mockDiscoverLogGroups.mockImplementation(async (args) => {
+        if (args.service_name === 'billing-service') {
+          return (
+            'No CloudWatch log groups found for "billing-service".\n' +
+            'ECS service: billing-worker-development'
+          );
+        }
+        if (args.service_name === 'billing-worker-development') {
+          return 'No CloudWatch log groups found for "billing-worker-development".';
+        }
+        return 'No CloudWatch log groups found.';
+      });
+      mockEcsServiceEvents.mockResolvedValue('No ECS services found matching "billing-service".');
+
+      mockLoop.mockResolvedValue(
+        loopResult(
+          investigationResultJson('telemetry-gap-discovery-no-log-group', {
+            affected_services: ['billing-service'],
+          })
+        )
+      );
+
+      const result = await investigateStage.run(
+        mockInput,
+        mockConfig,
+        telemetryGapClassification('telemetry-gap-discovery-no-log-group', {
+          affectedServices: ['billing-service'],
+        })
+      );
+
+      expect(result.status).toBe('success');
+      const investigation = (result.data as InvestigationResult).investigations[0]!;
+      expect(investigation.telemetry_gap?.kind).toBe('discovery');
+      expect(investigation.telemetry_gap?.next_telemetry_source).toContain(
+        'discover_log_groups for resolved runtime owner billing-worker-development'
       );
     });
 

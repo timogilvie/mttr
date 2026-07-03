@@ -1146,6 +1146,7 @@ function hasRuntimeRows(text: string): boolean {
 interface TelemetryActivitySignals {
   metricAttempted: boolean;
   metricResolved: boolean;
+  metricUnresolved: boolean;
   logGapAttempted: boolean;
   logGapResolved: boolean;
   activityObserved: boolean;
@@ -1159,6 +1160,7 @@ function emptyTelemetrySignals(): TelemetryActivitySignals {
   return {
     metricAttempted: false,
     metricResolved: false,
+    metricUnresolved: false,
     logGapAttempted: false,
     logGapResolved: false,
     activityObserved: false,
@@ -1174,12 +1176,16 @@ function mergeTelemetrySignals(
   return {
     metricAttempted: current.metricAttempted || Boolean(update.metricAttempted),
     metricResolved: current.metricResolved || Boolean(update.metricResolved),
+    metricUnresolved: current.metricUnresolved || Boolean(update.metricUnresolved),
     logGapAttempted: current.logGapAttempted || Boolean(update.logGapAttempted),
     logGapResolved: current.logGapResolved || Boolean(update.logGapResolved),
     activityObserved: current.activityObserved || Boolean(update.activityObserved),
     ownerFound: current.ownerFound || Boolean(update.ownerFound),
     toolError: current.toolError || Boolean(update.toolError),
-    nextMetricSource: current.nextMetricSource ?? update.nextMetricSource,
+    nextMetricSource:
+      update.metricUnresolved && update.nextMetricSource
+        ? update.nextMetricSource
+        : (current.nextMetricSource ?? update.nextMetricSource),
     nextLogSource: current.nextLogSource ?? update.nextLogSource,
   };
 }
@@ -1195,7 +1201,7 @@ function classifyTelemetryGap(
   attempts: TelemetryFallbackAttempt[],
   signals: TelemetryActivitySignals
 ): TelemetryGap | undefined {
-  const metricGap = signals.metricAttempted && !signals.metricResolved;
+  const metricGap = signals.metricUnresolved || (signals.metricAttempted && !signals.metricResolved);
   const logGap = signals.logGapAttempted && !signals.logGapResolved;
 
   if (attempts.length === 0 || (!metricGap && !logGap)) {
@@ -1208,7 +1214,8 @@ function classifyTelemetryGap(
       next_telemetry_source:
         signals.nextMetricSource ??
         signals.nextLogSource ??
-        'Retry the failed fallback tool call once the underlying error clears.',
+        fallbackNextTelemetrySource(attempts) ??
+        'Retry get_metrics_and_alarms or query_logs for the exact source named in the failed fallback attempt.',
       fallback_attempts: attempts,
       reason: 'A telemetry fallback attempt errored, so the gap cannot be classified with confidence.',
     };
@@ -1219,7 +1226,8 @@ function classifyTelemetryGap(
       kind: 'instrumentation',
       next_telemetry_source:
         signals.nextMetricSource ??
-        'Confirm the metric publisher configuration and exact namespace/dimensions for the active workload.',
+        fallbackNextTelemetrySource(attempts) ??
+        'Inspect the CloudWatch metric namespace and dimensions captured in the metric_widened_lookback fallback.',
       fallback_attempts: attempts,
       reason:
         'Runtime activity was confirmed but the metric never published datapoints even after widened discovery.',
@@ -1230,7 +1238,9 @@ function classifyTelemetryGap(
     return {
       kind: 'discovery',
       next_telemetry_source:
-        signals.nextLogSource ?? 'Query the resolved runtime owner directly once its log group name is confirmed.',
+        signals.nextLogSource ??
+        fallbackNextTelemetrySource(attempts) ??
+        'Run discover_log_groups for the resolved ECS service, Lambda function, or EventBridge rule named in runtime_owner_discovery.',
       fallback_attempts: attempts,
       reason: 'A runtime owner was identified but no log group or log rows could be located after retry.',
     };
@@ -1242,7 +1252,8 @@ function classifyTelemetryGap(
       next_telemetry_source:
         signals.nextMetricSource ??
         signals.nextLogSource ??
-        'Confirm whether the expected owner (ECS service, Lambda function, or EventBridge rule) still exists for this service name.',
+        fallbackNextTelemetrySource(attempts) ??
+        'Run get_ecs_service_events, list_metrics, and find_alarms for the exact affected service name from this incident.',
       fallback_attempts: attempts,
       reason:
         'No runtime owner or activity could be found across metrics, logs, or discovery after bounded alternate lookups.',
@@ -1254,10 +1265,22 @@ function classifyTelemetryGap(
     next_telemetry_source:
       signals.nextMetricSource ??
       signals.nextLogSource ??
-      'Re-attempt discovery once additional identifying details (dimensions, log group name) are available.',
+      fallbackNextTelemetrySource(attempts) ??
+      'Re-run the concrete fallback query recorded in telemetry_fallbacks for this investigation item.',
     fallback_attempts: attempts,
     reason: 'Fallback attempts left conflicting or insufficient signal to classify the gap confidently.',
   };
+}
+
+function fallbackNextTelemetrySource(attempts: TelemetryFallbackAttempt[]): string | undefined {
+  for (const attempt of attempts.slice().reverse()) {
+    if (attempt.next_source) {
+      return attempt.next_source;
+    }
+  }
+  const lastAttempt = attempts[attempts.length - 1];
+  const lastQuery = lastAttempt?.query;
+  return lastQuery ? `Re-run ${lastQuery}` : undefined;
 }
 
 /**
@@ -1380,8 +1403,10 @@ async function attemptRuntimeOwnerDiscovery(
   ]).filter((alias) => alias.toLowerCase() !== service.toLowerCase());
 
   const candidateLogGroups = [...directLogGroups];
+  let attemptedAlias: string | undefined;
   if (candidateLogGroups.length === 0 && aliasCandidates.length > 0) {
     const alias = aliasCandidates[0]!;
+    attemptedAlias = alias;
     const retryDiscovery = await runEvidenceTool(
       `### ${id} ${kind}: discover_log_groups(${alias}) (runtime-owner discovery fallback for ${service})`,
       () => discoverLogGroupsTool.handler({ service_name: alias, limit: 5 }, ctx)
@@ -1391,6 +1416,9 @@ async function attemptRuntimeOwnerDiscovery(
   }
 
   if (candidateLogGroups.length === 0 && aliasCandidates.length === 0) {
+    telemetry.mergeSignals(id, {
+      nextLogSource: `discover_log_groups for ${service} using the runtime owner found in runtime_owner_discovery`,
+    });
     return { sections, logGroups: [] };
   }
 
@@ -1429,7 +1457,9 @@ async function attemptRuntimeOwnerDiscovery(
     toolError: queryErrored,
     nextLogSource: candidateLogGroups[0]
       ? `query_logs against ${candidateLogGroups[0]} with a wider lookback window`
-      : undefined,
+      : attemptedAlias
+        ? `discover_log_groups for resolved runtime owner ${attemptedAlias}`
+        : `discover_log_groups for ${service} using the runtime owner found in runtime_owner_discovery`,
   });
 
   telemetry.record(id, {
@@ -1533,6 +1563,7 @@ async function gatherStandardEvidence(
           telemetry.mergeSignals(id, {
             metricAttempted: true,
             metricResolved: primaryHasData || extendedHasData,
+            metricUnresolved: primaryMissingDatapoints && !extendedHasData,
             toolError: extendedErrored,
             nextMetricSource: `${metric.namespace}/${metric.metric_name} (alarm configuration and log-based runtime activity)`,
           });
@@ -1689,6 +1720,7 @@ async function gatherStandardEvidence(
             const discoveredMetricErrored = isToolErrorText(discoveredMetricHistoryText);
             telemetry.mergeSignals(id, {
               metricResolved: discoveredMetricResolved,
+              metricUnresolved: !discoveredMetricResolved,
               toolError: discoveredMetricErrored,
               nextMetricSource: `${metric.namespace}/${metric.metric_name} (discovered liveness metric)`,
             });
