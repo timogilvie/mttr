@@ -1,11 +1,16 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import type { Config } from '../config.js';
 import type { AgentState } from '../state/agentState.js';
-import type { AgentStateRepository, AlarmTriggerRow } from '../state/repository.js';
+import type {
+  AgentStateRepository,
+  AlarmTriggerRow,
+  RecoveryIncidentCandidate,
+} from '../state/repository.js';
 import {
   runAlarmTriggerConsumerOnce,
   startAlarmTriggerConsumer,
   type AlarmTriggerBatch,
+  type RecoveryVerifyResult,
   type TriggerInvestigationLauncher,
   type TriggerLaunchResult,
 } from '../alarm/triggerConsumer.js';
@@ -84,6 +89,20 @@ function makeRow(overrides: Partial<AlarmTriggerRow> = {}): AlarmTriggerRow {
   };
 }
 
+function makeRecoveryIncident(
+  overrides: Partial<RecoveryIncidentCandidate> = {}
+): RecoveryIncidentCandidate {
+  return {
+    incidentId: 'incident-1',
+    title: 'Active alarm for api: test-alarm',
+    severity: 'CRITICAL',
+    service: 'api',
+    state: 'decision',
+    closedAt: null,
+    ...overrides,
+  };
+}
+
 class FakeAlarmTriggerRepository implements AgentStateRepository {
   rows = new Map<string, AlarmTriggerRow>();
   reclaimCalls: number[] = [];
@@ -94,6 +113,9 @@ class FakeAlarmTriggerRepository implements AgentStateRepository {
   failedCalls: string[][] = [];
   cooldownLookups: Array<{ specKey: string; withinMs: number }> = [];
   cooldownHits = new Map<string, { runId: string }>();
+  recoveryLookups: AlarmTriggerRow[] = [];
+  recoveryIncident: RecoveryIncidentCandidate | null = null;
+  recoveryAmbiguous = false;
 
   seed(...rows: AlarmTriggerRow[]): this {
     for (const row of rows) {
@@ -131,7 +153,7 @@ class FakeAlarmTriggerRepository implements AgentStateRepository {
     return [...this.rows.values()].filter(
       (row) =>
         row.status === 'pending' &&
-        (row.new_state === 'ALARM' || row.new_state === 'INSUFFICIENT_DATA')
+        (row.new_state === 'ALARM' || row.new_state === 'OK' || row.new_state === 'INSUFFICIENT_DATA')
     ).length;
   }
 
@@ -140,7 +162,7 @@ class FakeAlarmTriggerRepository implements AgentStateRepository {
     const eligible = [...this.rows.values()].filter(
       (row) =>
         row.status === 'pending' &&
-        (row.new_state === 'ALARM' || row.new_state === 'INSUFFICIENT_DATA')
+        (row.new_state === 'ALARM' || row.new_state === 'OK' || row.new_state === 'INSUFFICIENT_DATA')
     );
     for (const row of eligible) {
       row.status = 'claimed';
@@ -201,6 +223,13 @@ class FakeAlarmTriggerRepository implements AgentStateRepository {
     this.cooldownLookups.push({ specKey, withinMs });
     return this.cooldownHits.get(specKey) ?? null;
   }
+
+  async findOpenAlarmIncidentForRecovery(
+    trigger: Pick<AlarmTriggerRow, 'spec_key' | 'alarm_name'>
+  ): Promise<{ incident: RecoveryIncidentCandidate | null; ambiguous: boolean }> {
+    this.recoveryLookups.push(trigger as AlarmTriggerRow);
+    return { incident: this.recoveryIncident, ambiguous: this.recoveryAmbiguous };
+  }
 }
 
 class ThrowingClaimRepository extends FakeAlarmTriggerRepository {
@@ -214,8 +243,15 @@ class SpyLauncher implements TriggerInvestigationLauncher {
   busy = false;
   isBusySequence: boolean[] | null = null;
   calls: AlarmTriggerBatch[] = [];
+  recoveryCalls: Array<{ trigger: AlarmTriggerRow; incident: RecoveryIncidentCandidate }> = [];
   launchImpl: ((batch: AlarmTriggerBatch) => Promise<TriggerLaunchResult> | TriggerLaunchResult) | null =
     null;
+  recoveryImpl:
+    | ((
+        trigger: AlarmTriggerRow,
+        incident: RecoveryIncidentCandidate
+      ) => Promise<RecoveryVerifyResult> | RecoveryVerifyResult)
+    | null = null;
 
   isBusy(): boolean {
     if (this.isBusySequence && this.isBusySequence.length > 0) {
@@ -230,6 +266,17 @@ class SpyLauncher implements TriggerInvestigationLauncher {
       return this.launchImpl(batch);
     }
     return { status: 'launched', runId: `run-${this.calls.length}` };
+  }
+
+  async verifyRecovery(
+    trigger: AlarmTriggerRow,
+    incident: RecoveryIncidentCandidate
+  ): Promise<RecoveryVerifyResult> {
+    this.recoveryCalls.push({ trigger, incident });
+    if (this.recoveryImpl) {
+      return this.recoveryImpl(trigger, incident);
+    }
+    return { status: 'confirmed', runId: `recovery-run-${this.recoveryCalls.length}` };
   }
 }
 
@@ -727,9 +774,83 @@ describe('runAlarmTriggerConsumerOnce', () => {
     expect(outcome.ignored).toBe(1);
     expect(repo.rows.get(row.id)).toMatchObject({ status: 'done', run_id: null });
     expect(launcher.calls).toHaveLength(0);
+    expect(launcher.recoveryCalls).toHaveLength(0);
   });
 
-  it('D4: OK rows are never claimed and stay pending for T7', async () => {
+  it('T7: OK rows run scoped recovery verify and never launch investigation', async () => {
+    const repo = new FakeAlarmTriggerRepository();
+    const row = makeRow({ new_state: 'OK' });
+    const incident = makeRecoveryIncident();
+    repo.recoveryIncident = incident;
+    repo.seed(row);
+    const launcher = new SpyLauncher();
+    const config = buildConfig();
+
+    const outcome = await runAlarmTriggerConsumerOnce({
+      config,
+      repository: repo,
+      launcher,
+      sleep: instantSleep,
+      logger: silentLogger(),
+    });
+
+    expect(outcome.recoveryVerified).toBe(1);
+    expect(launcher.calls).toHaveLength(0);
+    expect(launcher.recoveryCalls).toEqual([{ trigger: expect.objectContaining({ id: row.id }), incident }]);
+    expect(repo.rows.get(row.id)).toMatchObject({ status: 'done', run_id: 'recovery-run-1' });
+  });
+
+  it('T7: a failed recovery verify marks the OK row done and leaves investigation unlaunched', async () => {
+    const repo = new FakeAlarmTriggerRepository();
+    const row = makeRow({ new_state: 'OK' });
+    repo.recoveryIncident = makeRecoveryIncident();
+    repo.seed(row);
+    const launcher = new SpyLauncher();
+    launcher.recoveryImpl = () => ({
+      status: 'not_confirmed',
+      runId: 'recovery-run-open',
+      message: 'alarm still failing',
+    });
+    const config = buildConfig();
+
+    const outcome = await runAlarmTriggerConsumerOnce({
+      config,
+      repository: repo,
+      launcher,
+      sleep: instantSleep,
+      logger: silentLogger(),
+    });
+
+    expect(outcome.recoveryOpen).toBe(1);
+    expect(launcher.calls).toHaveLength(0);
+    expect(repo.rows.get(row.id)).toMatchObject({ status: 'done', run_id: 'recovery-run-open' });
+  });
+
+  it('T7: a thrown recovery verify marks only the OK row error and does not investigate', async () => {
+    const repo = new FakeAlarmTriggerRepository();
+    const row = makeRow({ new_state: 'OK' });
+    repo.recoveryIncident = makeRecoveryIncident();
+    repo.seed(row);
+    const launcher = new SpyLauncher();
+    launcher.recoveryImpl = () => {
+      throw new Error('verify unavailable');
+    };
+    const config = buildConfig();
+
+    const outcome = await runAlarmTriggerConsumerOnce({
+      config,
+      repository: repo,
+      launcher,
+      sleep: instantSleep,
+      logger: silentLogger(),
+    });
+
+    expect(outcome.recoveryErrors).toBe(1);
+    expect(launcher.calls).toHaveLength(0);
+    expect(repo.rows.get(row.id)).toMatchObject({ status: 'error' });
+  });
+
+  it('T7: OK with no eligible open alarm-born incident is ignored', async () => {
     const repo = new FakeAlarmTriggerRepository();
     const row = makeRow({ new_state: 'OK' });
     repo.seed(row);
@@ -744,8 +865,10 @@ describe('runAlarmTriggerConsumerOnce', () => {
       logger: silentLogger(),
     });
 
-    expect(outcome.skipped).toBe('empty');
-    expect(repo.rows.get(row.id)).toMatchObject({ status: 'pending' });
+    expect(outcome.ignored).toBe(1);
+    expect(launcher.calls).toHaveLength(0);
+    expect(launcher.recoveryCalls).toHaveLength(0);
+    expect(repo.rows.get(row.id)).toMatchObject({ status: 'done', run_id: null });
   });
 
   it('D6: reclaims stale claimed rows at the start of the tick', async () => {

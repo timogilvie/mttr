@@ -11,6 +11,7 @@ import { enqueueAlarmTriggerOnce, markSnsMessageProcessed } from '../state/repos
 import type { TriggerSource } from '../state/repository.js';
 import type { Severity } from '../types.js';
 import { ALARM_PIPELINE_COUNTER_METRICS, emitCounter } from '../util/metrics.js';
+import { alarmIdentityFromSns } from '../report/alarmSpecFromSns.js';
 import {
   UnsupportedSnsMessageError,
   confirmSnsSubscription,
@@ -361,12 +362,19 @@ export function createWebServer(
           return reply.code(200).send({ ok: true });
         }
 
+        const alarmIdentity = alarmIdentityFromSns(alarmMessage);
         const enqueueResult = await enqueueAlarmTriggerOnce(db, {
           snsMessageId: message.MessageId,
           alarmArn: alarmMessage.AlarmArn,
           alarmName: alarmMessage.AlarmName,
           newState: alarmMessage.NewStateValue,
           stateChangeTime: alarmMessage.StateChangeTime,
+          ...(alarmIdentity.ok
+            ? {
+                severity: alarmIdentity.severity,
+                specKey: alarmIdentity.dedupeKey,
+              }
+            : {}),
           payload: alarmMessage,
         });
         if (enqueueResult.duplicate) {
@@ -376,7 +384,7 @@ export function createWebServer(
             alarm_name: alarmMessage.AlarmName,
             sns_message_id: message.MessageId,
           });
-        } else if (enqueueResult.enqueued) {
+        } else if (enqueueResult.enqueued && alarmMessage.NewStateValue === 'ALARM') {
           emitCounter(request.log, ALARM_PIPELINE_COUNTER_METRICS.ALARMS_RECEIVED, {
             alarm_name: alarmMessage.AlarmName,
             sns_message_id: message.MessageId,

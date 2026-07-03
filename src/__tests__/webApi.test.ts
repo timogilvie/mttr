@@ -728,7 +728,7 @@ describe('web API', () => {
     expect(db.alarmTriggers).toHaveLength(1);
   });
 
-  it('records non-ALARM notifications as processed without enqueueing', async () => {
+  it('enqueues OK notifications so the consumer can verify recovery', async () => {
     const db = new FakeApiDatabase();
     const { app } = appFor(configWithWebhook(), db, {
       fetchSigningCert: async () => certPem,
@@ -744,7 +744,12 @@ describe('web API', () => {
 
     expect(response.statusCode).toBe(200);
     expect(db.processedSnsMessages.has(message.MessageId)).toBe(true);
-    expect(db.alarmTriggers).toHaveLength(0);
+    expect(db.alarmTriggers).toHaveLength(1);
+    expect(db.alarmTriggers[0]).toMatchObject({
+      new_state: 'OK',
+      status: 'pending',
+      alarm_name: 'CPUHigh',
+    });
   });
 
   it('rejects a validly-signed notification from an unexpected topic ARN', async () => {

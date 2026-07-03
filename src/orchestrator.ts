@@ -32,6 +32,7 @@ import {
   type AlarmTriggerRow,
   type IncidentEventInput,
   type AgentStateRepository,
+  type RecoveryIncidentCandidate,
 } from './state/repository.js';
 import type { IncidentTransition } from './state/transitions.js';
 import {
@@ -40,6 +41,7 @@ import {
   type AlarmTriggerConsumerHandle,
   type TriggerInvestigationLauncher,
   type TriggerLaunchResult,
+  type RecoveryVerifyResult,
 } from './alarm/triggerConsumer.js';
 
 function remapIncidentReference(value: string | null | undefined, idMap: Map<string, string>): string | null | undefined {
@@ -87,6 +89,7 @@ export class Orchestrator {
   private intervalId: NodeJS.Timeout | null = null;
   private classifyInFlight = false;
   private investigateInFlight = false;
+  private recoveryVerifyInFlight = false;
   private readonly config: Config;
   private readonly stateRepository: AgentStateRepository;
   private triggerConsumerHandle: AlarmTriggerConsumerHandle | null = null;
@@ -216,6 +219,220 @@ export class Orchestrator {
     } finally {
       this.investigateInFlight = false;
     }
+  }
+
+  async runRecoveryVerifyFromTrigger(
+    trigger: AlarmTriggerRow,
+    incident: RecoveryIncidentCandidate
+  ): Promise<RecoveryVerifyResult> {
+    if (this.classifyInFlight || this.investigateInFlight || this.recoveryVerifyInFlight) {
+      console.log('[Orchestrator] Another stage is in flight, deferring recovery verify');
+      return { status: 'busy' };
+    }
+    this.recoveryVerifyInFlight = true;
+
+    const now = new Date().toISOString();
+    let runId: string | undefined;
+    let finished = false;
+
+    const finishRun = async (update: {
+      status: 'success' | 'error';
+      summary?: string;
+      errorMessage?: string;
+    }): Promise<void> => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      await this.stateRepository.finishRun?.(runId, {
+        status: update.status,
+        finishedAt: new Date().toISOString(),
+        ...(update.summary ? { summary: update.summary } : {}),
+        ...(update.errorMessage ? { errorMessage: update.errorMessage } : {}),
+      });
+    };
+
+    try {
+      console.log(
+        `[Orchestrator] Starting recovery verify for trigger ${trigger.id}, incident ${incident.incidentId}`
+      );
+      runId = await this.stateRepository.startRun?.(now, 'alarm');
+
+      const decision = this.recoveryDecision(trigger, incident);
+      if (decision.decisions.length === 0) {
+        const verification = this.emptyRecoveryVerification(trigger, incident);
+        await this.stateRepository.recordStageOutput?.(runId, {
+          stage: 'Verify',
+          data: verification,
+        });
+        await this.stateRepository.recordIncidentEvents?.(
+          runId,
+          this.verificationEvents(verification)
+        );
+        await finishRun({ status: 'success', summary: verification.summary });
+        return {
+          status: 'not_confirmed',
+          runId,
+          message: 'Recovery verify had no scoped checks to run',
+        };
+      }
+
+      const result = await verifyStage.run(
+        { stage: 'Verify', timestamp: now },
+        this.config,
+        decision
+      );
+      if (result.status !== 'success' || !result.data) {
+        const message = result.error ?? 'Verify stage failed';
+        await finishRun({ status: 'error', errorMessage: message });
+        return { status: 'error', message };
+      }
+
+      const verification = this.normalizeRecoveryVerification(
+        result.data as VerificationResult,
+        trigger
+      );
+      await this.stateRepository.recordStageOutput?.(runId, {
+        stage: 'Verify',
+        data: verification,
+      });
+      await this.stateRepository.recordIncidentEvents?.(
+        runId,
+        this.verificationEvents(verification)
+      );
+      const transitions = await this.stateRepository.recordVerificationTransitions?.(
+        runId,
+        verification
+      );
+      await this.sendTransitionAlerts(runId, transitions ?? []);
+      await finishRun({ status: 'success', summary: verification.summary });
+
+      return verification.overall_status === 'VERIFIED_RECOVERED_TRANSIENT'
+        ? { status: 'confirmed', runId }
+        : {
+            status: 'not_confirmed',
+            runId,
+            message: `Verify returned ${verification.overall_status}`,
+          };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('[Orchestrator] Unhandled error in recovery verify:', error);
+      await finishRun({ status: 'error', errorMessage: message });
+      return { status: 'error', message };
+    } finally {
+      this.recoveryVerifyInFlight = false;
+    }
+  }
+
+  private recoveryDecision(
+    trigger: AlarmTriggerRow,
+    incident: RecoveryIncidentCandidate
+  ): DecisionResult {
+    const alarmName = trigger.alarm_name.trim();
+    if (!alarmName) {
+      return {
+        summary: 'Recovery verify skipped: no alarm name was available.',
+        overall_next_stage: 'None',
+        decisions: [],
+        handoff_notes: [],
+      };
+    }
+
+    return {
+      summary: `Scoped recovery verify for ${incident.title}.`,
+      overall_next_stage: 'Verify',
+      handoff_notes: [
+        `Verify only the recovering alarm/check context for trigger ${trigger.id}.`,
+      ],
+      decisions: [
+        {
+          incident_id: incident.incidentId,
+          title: incident.title,
+          disposition: 'VERIFY',
+          next_stage: 'Verify',
+          severity: incident.severity,
+          affected_services: incident.service ? [incident.service] : [],
+          rationale:
+            'CloudWatch reported OK for an open alarm-born incident; confirm the scoped health signal before resolving.',
+          evidence_to_pass: [
+            `alarm=${alarmName}`,
+            `state=OK`,
+            ...(trigger.spec_key ? [`spec_key=${trigger.spec_key}`] : []),
+          ],
+          follow_up_actions: [
+            `Check current CloudWatch alarm state for alarm=${alarmName}.`,
+          ],
+        },
+      ],
+    };
+  }
+
+  private emptyRecoveryVerification(
+    trigger: AlarmTriggerRow,
+    incident: RecoveryIncidentCandidate
+  ): VerificationResult {
+    return {
+      summary: 'Recovery verify could not run scoped checks; leaving incident open.',
+      overall_status: 'STILL_INCONCLUSIVE',
+      overall_next_stage: 'Investigate',
+      verifications: [
+        {
+          incident_id: incident.incidentId,
+          title: incident.title,
+          status: 'STILL_INCONCLUSIVE',
+          severity: incident.severity,
+          rationale: `No scoped recovery check was available for trigger ${trigger.id}.`,
+          checks: [],
+          recommended_next_stage: 'Investigate',
+        },
+      ],
+    };
+  }
+
+  private normalizeRecoveryVerification(
+    verification: VerificationResult,
+    trigger: AlarmTriggerRow
+  ): VerificationResult {
+    const normalized = verification.verifications.map((item) => {
+      if (
+        item.status === 'VERIFIED_NON_INCIDENT' ||
+        item.status === 'VERIFIED_OBSERVABILITY_ISSUE' ||
+        item.checks.length === 0
+      ) {
+        return {
+          ...item,
+          status: 'STILL_INCONCLUSIVE' as const,
+          recommended_next_stage: 'Investigate' as const,
+          rationale:
+            `${item.rationale} Recovery OK from ${trigger.alarm_name} did not prove this alarm-born incident should close.`,
+        };
+      }
+      return item;
+    });
+    const hasActive = normalized.some((item) => item.status === 'VERIFIED_ACTIVE_INCIDENT');
+    const hasInconclusive = normalized.some((item) => item.status === 'STILL_INCONCLUSIVE');
+    const allRecovered =
+      normalized.length > 0 &&
+      normalized.every((item) => item.status === 'VERIFIED_RECOVERED_TRANSIENT');
+    const overallStatus = hasActive
+      ? 'VERIFIED_ACTIVE_INCIDENT'
+      : hasInconclusive
+        ? 'STILL_INCONCLUSIVE'
+        : allRecovered
+          ? 'VERIFIED_RECOVERED_TRANSIENT'
+          : 'STILL_INCONCLUSIVE';
+    return {
+      ...verification,
+      summary: `Recovery Verify completed with ${overallStatus}.`,
+      overall_status: overallStatus,
+      overall_next_stage:
+        overallStatus === 'VERIFIED_RECOVERED_TRANSIENT'
+          ? 'None'
+          : overallStatus === 'VERIFIED_ACTIVE_INCIDENT'
+            ? 'Mitigate'
+            : 'Investigate',
+      verifications: normalized,
+    };
   }
 
   /**
@@ -434,6 +651,8 @@ export class Orchestrator {
       const launcher: TriggerInvestigationLauncher = {
         isBusy: () => this.investigateBusy,
         launch: (batch) => this.runInvestigationFromTrigger(batch),
+        verifyRecovery: (trigger, incident) =>
+          this.runRecoveryVerifyFromTrigger(trigger, incident),
       };
       this.triggerConsumerHandle = startAlarmTriggerConsumer({
         config: this.config,

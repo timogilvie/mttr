@@ -823,6 +823,144 @@ describe('Orchestrator alarm trigger consumer seam (T5)', () => {
     });
   });
 
+  describe('runRecoveryVerifyFromTrigger (T7)', () => {
+    it('invokes Verify only and confirms recovered verification', async () => {
+      const investigateStage = await import('../stages/investigate.js');
+      const verifyStage = await import('../stages/verify.js');
+      const verifySpy = vi.spyOn(verifyStage, 'run').mockResolvedValue({
+        stage: 'Verify',
+        status: 'success',
+        timestamp: 't',
+        data: {
+          summary: 'Recovered.',
+          overall_status: 'VERIFIED_RECOVERED_TRANSIENT',
+          overall_next_stage: 'None',
+          verifications: [
+            {
+              incident_id: 'incident-1',
+              title: 'Active alarm for api: test-alarm',
+              status: 'VERIFIED_RECOVERED_TRANSIENT',
+              severity: 'CRITICAL',
+              rationale: 'Alarm is OK.',
+              checks: [
+                {
+                  tool: 'find_alarms',
+                  target: 'test-alarm',
+                  status: 'passed',
+                  evidence: 'state=OK',
+                },
+              ],
+              recommended_next_stage: 'None',
+            },
+          ],
+        },
+      });
+      const startRunSpy = vi
+        .spyOn(FileAgentStateRepository.prototype, 'startRun')
+        .mockResolvedValue('recovery-run-1');
+      const stageSpy = vi.spyOn(FileAgentStateRepository.prototype, 'recordStageOutput');
+      const eventsSpy = vi.spyOn(FileAgentStateRepository.prototype, 'recordIncidentEvents');
+      const transitionsSpy = vi
+        .spyOn(FileAgentStateRepository.prototype, 'recordVerificationTransitions')
+        .mockResolvedValue([]);
+
+      const orchestrator = new Orchestrator(mockConfig);
+      const result = await orchestrator.runRecoveryVerifyFromTrigger(
+        makeAlarmTriggerRow({ new_state: 'OK', alarm_name: 'test-alarm' }),
+        {
+          incidentId: 'incident-1',
+          title: 'Active alarm for api: test-alarm',
+          severity: 'CRITICAL',
+          service: 'api',
+          state: 'decision',
+          closedAt: null,
+        }
+      );
+
+      expect(result).toEqual({ status: 'confirmed', runId: 'recovery-run-1' });
+      expect(investigateStage.run).not.toHaveBeenCalled();
+      expect(verifySpy).toHaveBeenCalledTimes(1);
+      expect(verifySpy.mock.calls[0]?.[2]).toMatchObject({
+        decisions: [
+          expect.objectContaining({
+            incident_id: 'incident-1',
+            next_stage: 'Verify',
+            evidence_to_pass: expect.arrayContaining(['alarm=test-alarm', 'state=OK']),
+          }),
+        ],
+      });
+      expect(stageSpy).toHaveBeenCalledWith('recovery-run-1', expect.objectContaining({ stage: 'Verify' }));
+      expect(eventsSpy).toHaveBeenCalledWith('recovery-run-1', expect.any(Array));
+      expect(transitionsSpy).toHaveBeenCalledWith(
+        'recovery-run-1',
+        expect.objectContaining({ overall_status: 'VERIFIED_RECOVERED_TRANSIENT' })
+      );
+
+      verifySpy.mockRestore();
+      startRunSpy.mockRestore();
+      stageSpy.mockRestore();
+      eventsSpy.mockRestore();
+      transitionsSpy.mockRestore();
+    });
+
+    it('does not confirm or close when Verify returns non-recovery or an empty scope', async () => {
+      const verifyStage = await import('../stages/verify.js');
+      const verifySpy = vi.spyOn(verifyStage, 'run').mockResolvedValue({
+        stage: 'Verify',
+        status: 'success',
+        timestamp: 't',
+        data: {
+          summary: 'No candidates.',
+          overall_status: 'VERIFIED_NON_INCIDENT',
+          overall_next_stage: 'None',
+          verifications: [
+            {
+              incident_id: 'incident-1',
+              title: 'Active alarm for api: test-alarm',
+              status: 'VERIFIED_NON_INCIDENT',
+              severity: 'CRITICAL',
+              rationale: 'No checks.',
+              checks: [],
+              recommended_next_stage: 'None',
+            },
+          ],
+        },
+      });
+      const startRunSpy = vi
+        .spyOn(FileAgentStateRepository.prototype, 'startRun')
+        .mockResolvedValue('recovery-run-2');
+      const transitionsSpy = vi
+        .spyOn(FileAgentStateRepository.prototype, 'recordVerificationTransitions')
+        .mockResolvedValue([]);
+
+      const orchestrator = new Orchestrator(mockConfig);
+      const result = await orchestrator.runRecoveryVerifyFromTrigger(
+        makeAlarmTriggerRow({ new_state: 'OK', alarm_name: 'test-alarm' }),
+        {
+          incidentId: 'incident-1',
+          title: 'Active alarm for api: test-alarm',
+          severity: 'CRITICAL',
+          service: 'api',
+          state: 'decision',
+          closedAt: null,
+        }
+      );
+
+      expect(result).toMatchObject({ status: 'not_confirmed', runId: 'recovery-run-2' });
+      expect(transitionsSpy).toHaveBeenCalledWith(
+        'recovery-run-2',
+        expect.objectContaining({
+          overall_status: 'STILL_INCONCLUSIVE',
+          overall_next_stage: 'Investigate',
+        })
+      );
+
+      verifySpy.mockRestore();
+      startRunSpy.mockRestore();
+      transitionsSpy.mockRestore();
+    });
+  });
+
   it('starts the alarm trigger consumer when the webhook feature is enabled', async () => {
     const classifyStage = await import('../stages/classify.js');
     const investigateStage = await import('../stages/investigate.js');

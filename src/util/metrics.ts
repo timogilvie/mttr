@@ -33,6 +33,12 @@ export const ALARM_PIPELINE_COUNTER_METRICS = {
   COOLDOWN_ATTACHED: 'alarm_pipeline.cooldown_attached',
   COALESCED: 'alarm_pipeline.coalesced',
   INVESTIGATIONS_LAUNCHED: 'alarm_pipeline.investigations_launched',
+  RECOVERY_VERIFY_ATTEMPTED: 'alarm_pipeline.recovery_verify_attempted',
+  RECOVERY_VERIFY_CONFIRMED: 'alarm_pipeline.recovery_verify_confirmed',
+  RECOVERY_VERIFY_FAILED: 'alarm_pipeline.recovery_verify_failed',
+  RECOVERY_VERIFY_ERROR: 'alarm_pipeline.recovery_verify_error',
+  RECOVERY_NO_OPEN_INCIDENT: 'alarm_pipeline.recovery_no_open_incident',
+  INSUFFICIENT_DATA_IGNORED: 'alarm_pipeline.insufficient_data_ignored',
 } as const;
 
 export type AlarmPipelineCounterMetric =
