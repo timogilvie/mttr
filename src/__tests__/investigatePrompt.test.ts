@@ -174,6 +174,22 @@ describe('investigatePrompt', () => {
     expect(prompt).toContain('mitigation_confidence=high requires a corroborated causal chain');
   });
 
+  it('describes the telemetry gap recovery paths and all four gap kinds', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('Telemetry Gap Recovery');
+    expect(prompt).toContain('telemetry_gap');
+    expect(prompt).toContain('telemetry_fallbacks');
+    expect(prompt).toContain('"instrumentation"');
+    expect(prompt).toContain('"discovery"');
+    expect(prompt).toContain('"runtime"');
+    expect(prompt).toContain('"unknown"');
+    expect(prompt).toContain('widened lookback');
+    expect(prompt).toContain('alternate runtime-owner discovery');
+    expect(prompt).toContain('concrete telemetry source');
+    expect(prompt).toContain('more data is needed');
+  });
+
   it('encodes causal_evidence and mitigation fields in the output schema', () => {
     const prompt = buildInvestigatePrompt(sampleStep1);
 
@@ -185,5 +201,15 @@ describe('investigatePrompt', () => {
     expect(prompt).toContain('"dependency_health"');
     expect(prompt).toContain('"next_highest_value_query"');
     expect(prompt).toContain('"mitigation_confidence": "high | medium | low"');
+  });
+
+  it('encodes telemetry_fallbacks and telemetry_gap in the output schema', () => {
+    const prompt = buildInvestigatePrompt(sampleStep1);
+
+    expect(prompt).toContain('"telemetry_fallbacks"');
+    expect(prompt).toContain('"telemetry_gap"');
+    expect(prompt).toContain('"fallback_attempts"');
+    expect(prompt).toContain('"next_telemetry_source"');
+    expect(prompt).toContain('metric_exact_discovery | metric_widened_lookback | alarm_configuration | runtime_owner_discovery | log_group_retry');
   });
 });

@@ -60,6 +60,20 @@ Use suggested_cloudwatch_queries and signals to target your queries. For finding
 - Do not fabricate logs, metrics, timestamps, or service names. Preserve service names exactly as given in Step 1.
 - Do not recommend remediation. Any remediation idea goes in possible_future_remediation, labelled as a possibility, never an instruction.
 
+## Telemetry Gap Recovery
+
+Missing telemetry is a branch in the investigation, not a stopping point. Treat the Pre-gathered Tool Evidence's fallback sections (widened metric history, expanded metric discovery, alarm configuration, and runtime-owner/log retries) as the exact attempts described below, already executed for you.
+
+- If alarm history or metric datapoints are missing, exact metric/dimension discovery, alarm configuration (threshold, evaluation period, missing-data handling), and a widened lookback window must be attempted before you may conclude INSUFFICIENT_EVIDENCE. Do not stop at "no data" — the Pre-gathered Tool Evidence already ran this widened lookback for known and discovered candidate metrics; use its result.
+- If log groups are not found by service name, alternate runtime-owner discovery (infrastructure inventory / service-resource registry, deployment metadata, ECS/Lambda/EventBridge names recovered from metric dimensions, task definitions, tags) and a retried log lookup against whatever owner is found must be attempted before you may conclude OBSERVABILITY_GAP.
+- Distinguish four telemetry_gap.kind values, and only report telemetry_gap when a real gap remains after the fallback attempts above:
+  - "instrumentation": the runtime/service is active (recent logs, an active ECS service, Lambda invocations, or comparable evidence) but the metric or log stream itself never published.
+  - "discovery": a runtime owner (ECS service, Lambda function, EventBridge rule, or registry entry) was identified, but discovery/query could not locate its logs or metric.
+  - "runtime": no owner and no activity could be found anywhere (metrics, logs, ECS, Lambda, EventBridge) after the bounded alternate discovery.
+  - "unknown": a fallback tool call errored, or the signals conflict enough that a confident classification is not possible.
+- Every telemetry_gap.next_telemetry_source (and every attempt's next_source) must name a concrete telemetry source — an exact metric namespace/name/dimensions and window, or a specific log group/runtime resource name — never a generic statement like "more data is needed".
+- Record every fallback you or the pre-gather attempted in telemetry_fallbacks, including ones that resolved the original gap (outcome "resolved"). Only set telemetry_gap when a gap remains unresolved after the attempts; when a fallback resolves it, leave telemetry_gap unset and keep the resolved attempt in telemetry_fallbacks.
+
 ## Causal-Evidence Pivot
 
 For every investigation whose original_classification is APPLICATION_ERROR, or whose evidence otherwise describes an API 5xx / ALB-backed application failure, and whose investigation_status is CONFIRMED_INCIDENT: symptom confirmation (request failures corroborated, health checks surviving) is the START of the investigation, not the end. Generate and execute a second-level causal-evidence plan and report it in that investigation's causal_evidence object, separate from confirmed_facts/supporting_evidence. Set causal_evidence.performed=true whenever you attempt this pivot, even if every category ends up in missing. Leave causal_evidence unset (or performed=false) for investigations that are not a confirmed application-level incident — do not run this pivot for infrastructure-only, observability, or unconfirmed items.
@@ -144,7 +158,14 @@ Return valid JSON only. Do not include markdown. Use this schema:
   "next_highest_value_query": ""
 },
 "mitigation_confidence": "high | medium | low",
-"confidence_justification": ""
+"confidence_justification": "",
+"telemetry_fallbacks": [ { "path": "metric_exact_discovery | metric_widened_lookback | alarm_configuration | runtime_owner_discovery | log_group_retry", "query": "", "outcome": "resolved | empty | error", "detail": "", "next_source": "" } ],
+"telemetry_gap": {
+  "kind": "instrumentation | discovery | runtime | unknown",
+  "next_telemetry_source": "",
+  "fallback_attempts": [ { "path": "metric_exact_discovery | metric_widened_lookback | alarm_configuration | runtime_owner_discovery | log_group_retry", "query": "", "outcome": "resolved | empty | error", "detail": "", "next_source": "" } ],
+  "reason": ""
+}
 }
 ],
 "cross_cutting_observations": [],

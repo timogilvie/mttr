@@ -388,4 +388,153 @@ describe('investigationSchema', () => {
       expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
     });
   });
+
+  describe('telemetry gap recovery', () => {
+    it('accepts a legacy investigation payload without telemetry fields', () => {
+      const result = parseInvestigation(validResult());
+
+      expect(result.investigations[0]?.telemetry_fallbacks).toBeUndefined();
+      expect(result.investigations[0]?.telemetry_gap).toBeUndefined();
+    });
+
+    it('accepts telemetry_fallbacks recording a resolved fallback with no unresolved gap', () => {
+      const result = parseInvestigation(
+        validResult({
+          investigations: [
+            validInvestigation({
+              telemetry_fallbacks: [
+                {
+                  path: 'metric_widened_lookback',
+                  query: 'get_metrics_and_alarms(Hokusai/Detectors/DetectorLiveness, 14-day window)',
+                  outcome: 'resolved',
+                  detail: 'Extended lookback located datapoints outside the report window.',
+                  next_source: 'Hokusai/Detectors/DetectorLiveness',
+                },
+              ],
+            }),
+          ],
+        })
+      );
+
+      expect(result.investigations[0]?.telemetry_fallbacks).toHaveLength(1);
+      expect(result.investigations[0]?.telemetry_fallbacks?.[0]?.outcome).toBe('resolved');
+      expect(result.investigations[0]?.telemetry_gap).toBeUndefined();
+    });
+
+    it.each(['instrumentation', 'discovery', 'runtime', 'unknown'] as const)(
+      'accepts telemetry_gap.kind = %s',
+      (kind) => {
+        const result = parseInvestigation(
+          validResult({
+            investigations: [
+              validInvestigation({
+                investigation_status: 'OBSERVABILITY_GAP',
+                telemetry_gap: {
+                  kind,
+                  next_telemetry_source: 'Hokusai/Detectors/DetectorLiveness widened to a 30-day window',
+                  fallback_attempts: [
+                    {
+                      path: 'metric_widened_lookback',
+                      query: 'get_metrics_and_alarms(...)',
+                      outcome: 'empty',
+                      detail: 'Still no datapoints after the widened lookback.',
+                    },
+                  ],
+                  reason: 'No corroborating activity was found.',
+                },
+              }),
+            ],
+          })
+        );
+
+        expect(result.investigations[0]?.telemetry_gap?.kind).toBe(kind);
+      }
+    );
+
+    it('rejects an invalid telemetry_gap.kind', () => {
+      const result = validResult({
+        investigations: [
+          validInvestigation({
+            telemetry_gap: {
+              kind: 'not-a-real-kind',
+              next_telemetry_source: 'some source',
+              fallback_attempts: [],
+            },
+          }),
+        ],
+      });
+
+      expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
+    });
+
+    it('rejects an invalid telemetry_fallbacks[].path', () => {
+      const result = validResult({
+        investigations: [
+          validInvestigation({
+            telemetry_fallbacks: [
+              {
+                path: 'not_a_real_path',
+                query: 'x',
+                outcome: 'empty',
+                detail: 'x',
+              },
+            ],
+          }),
+        ],
+      });
+
+      expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
+    });
+
+    it('rejects an invalid telemetry_fallbacks[].outcome', () => {
+      const result = validResult({
+        investigations: [
+          validInvestigation({
+            telemetry_fallbacks: [
+              {
+                path: 'alarm_configuration',
+                query: 'x',
+                outcome: 'partially-resolved',
+                detail: 'x',
+              },
+            ],
+          }),
+        ],
+      });
+
+      expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
+    });
+
+    it('rejects an empty next_telemetry_source', () => {
+      const result = validResult({
+        investigations: [
+          validInvestigation({
+            telemetry_gap: {
+              kind: 'unknown',
+              next_telemetry_source: '',
+              fallback_attempts: [],
+            },
+          }),
+        ],
+      });
+
+      expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
+    });
+
+    it('rejects a generic "more data is needed" next_telemetry_source', () => {
+      const result = validResult({
+        investigations: [
+          validInvestigation({
+            telemetry_gap: {
+              kind: 'unknown',
+              next_telemetry_source: 'More data is needed',
+              fallback_attempts: [],
+            },
+          }),
+        ],
+      });
+
+      expect(() => parseInvestigation(result)).toThrow(InvestigationValidationError);
+    });
+  });
 });

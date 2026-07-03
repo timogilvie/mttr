@@ -245,6 +245,32 @@ export interface CausalEvidence {
 
 export type MitigationConfidence = 'high' | 'medium' | 'low';
 
+export type TelemetryGapKind = 'instrumentation' | 'discovery' | 'runtime' | 'unknown';
+
+export type TelemetryFallbackOutcome = 'resolved' | 'empty' | 'error';
+
+export type TelemetryFallbackPath =
+  | 'metric_exact_discovery'
+  | 'metric_widened_lookback'
+  | 'alarm_configuration'
+  | 'runtime_owner_discovery'
+  | 'log_group_retry';
+
+export interface TelemetryFallbackAttempt {
+  path: TelemetryFallbackPath;
+  query: string;
+  outcome: TelemetryFallbackOutcome;
+  detail: string;
+  next_source?: string | undefined;
+}
+
+export interface TelemetryGap {
+  kind: TelemetryGapKind;
+  next_telemetry_source: string;
+  fallback_attempts: TelemetryFallbackAttempt[];
+  reason?: string | undefined;
+}
+
 export interface Investigation {
   incident_id: string;
   title: string;
@@ -267,6 +293,8 @@ export interface Investigation {
   causal_evidence?: CausalEvidence | undefined;
   mitigation_confidence?: MitigationConfidence | undefined;
   confidence_justification?: string | undefined;
+  telemetry_fallbacks?: TelemetryFallbackAttempt[] | undefined;
+  telemetry_gap?: TelemetryGap | undefined;
 }
 
 export interface InvestigationResult {
