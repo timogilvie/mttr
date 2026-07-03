@@ -8,6 +8,7 @@ import type { Config } from '../config.js';
 import type { DatabaseClient, DatabasePool } from '../db/postgres.js';
 import { createPostgresPool } from '../db/postgres.js';
 import { enqueueAlarmTriggerOnce, markSnsMessageProcessed } from '../state/repository.js';
+import type { TriggerSource } from '../state/repository.js';
 import type { Severity } from '../types.js';
 import {
   UnsupportedSnsMessageError,
@@ -38,6 +39,7 @@ interface RunRow {
   started_at: Date | string;
   finished_at: Date | string | null;
   status: string;
+  trigger_source: TriggerSource;
   health_report_s3_uri: string;
   report_hash: string | null;
   summary: string | null;
@@ -109,6 +111,7 @@ function runDto(row: RunRow): JsonRecord {
     startedAt: toIso(row.started_at),
     finishedAt: toIso(row.finished_at),
     status: row.status,
+    triggerSource: row.trigger_source,
     healthReportS3Uri: row.health_report_s3_uri,
     reportHash: row.report_hash,
     summary: row.summary,
@@ -372,7 +375,7 @@ export function createWebServer(
     const [runResult, incidentResult, heartbeatResult, transitionResult] =
       await Promise.all([
       db.query<RunRow>(
-        `SELECT id, started_at, finished_at, status, health_report_s3_uri, report_hash,
+        `SELECT id, started_at, finished_at, status, trigger_source, health_report_s3_uri, report_hash,
                 summary, overall_severity, error_message
          FROM runs
          ORDER BY started_at DESC
@@ -429,7 +432,7 @@ export function createWebServer(
   app.get('/api/runs', async (request) => {
     const limit = parseLimit((request.query as JsonRecord)['limit'], 50, 200);
     const result = await db.query<RunRow>(
-      `SELECT id, started_at, finished_at, status, health_report_s3_uri, report_hash,
+      `SELECT id, started_at, finished_at, status, trigger_source, health_report_s3_uri, report_hash,
               summary, overall_severity, error_message
        FROM runs
        ORDER BY started_at DESC
@@ -443,7 +446,7 @@ export function createWebServer(
     const { id } = request.params as { id: string };
     const [result, incidentResult] = await Promise.all([
       db.query<RunRow>(
-        `SELECT id, started_at, finished_at, status, health_report_s3_uri, report_hash,
+        `SELECT id, started_at, finished_at, status, trigger_source, health_report_s3_uri, report_hash,
                 summary, overall_severity, raw_classification_json, raw_investigation_json,
                 raw_decision_json, raw_verification_json, error_message
          FROM runs

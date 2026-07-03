@@ -39,6 +39,7 @@ function RawStage({
 
 export function RunDetail({ data }: { data: RunDetailResponse }): ReactElement {
   const { run, incidents } = data;
+  const triggerSource = run.triggerSource ?? 'scheduled';
   const partial =
     Boolean(run.raw.classification) &&
     (!run.raw.investigation || !run.raw.decision || run.status === 'error');
@@ -49,6 +50,7 @@ export function RunDetail({ data }: { data: RunDetailResponse }): ReactElement {
         <div>
           <p className="eyebrow">Run</p>
           <h1>{run.status}</h1>
+          <span className={`source-badge source-${triggerSource}`}>{triggerSource}</span>
         </div>
         <p>{run.summary ?? run.errorMessage ?? run.id}</p>
       </header>

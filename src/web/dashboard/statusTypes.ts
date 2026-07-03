@@ -7,6 +7,7 @@ export interface RunSummary {
   startedAt: string | null;
   finishedAt: string | null;
   status: string;
+  triggerSource?: 'scheduled' | 'alarm';
   healthReportS3Uri: string;
   reportHash: string | null;
   summary: string | null;

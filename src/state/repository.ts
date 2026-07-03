@@ -103,6 +103,7 @@ export interface AgentStateRepository {
   load(): Promise<AgentState>;
   save(state: AgentState): Promise<void>;
   startRun?(startedAt: string, triggerSource?: TriggerSource): Promise<string | undefined>;
+  getRunTriggerSource?(runId: string | undefined): Promise<TriggerSource | undefined>;
   finishRun?(runId: string | undefined, update: RunRecordUpdate): Promise<void>;
   recordReconciliation?(
     runId: string | undefined,
@@ -154,6 +155,10 @@ export class FileAgentStateRepository implements AgentStateRepository {
   }
 
   async startRun(_startedAt: string, _triggerSource?: TriggerSource): Promise<string | undefined> {
+    return undefined;
+  }
+
+  async getRunTriggerSource(_runId: string | undefined): Promise<TriggerSource | undefined> {
     return undefined;
   }
 
@@ -599,6 +604,20 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
       throw new Error('Postgres did not return a run id');
     }
     return id;
+  }
+
+  async getRunTriggerSource(runId: string | undefined): Promise<TriggerSource | undefined> {
+    if (!runId) {
+      return undefined;
+    }
+
+    const result = await this.client.query<RunRow>(
+      `SELECT trigger_source
+       FROM runs
+       WHERE id = $1`,
+      [runId]
+    );
+    return result.rows[0]?.trigger_source;
   }
 
   async finishRun(runId: string | undefined, update: RunRecordUpdate): Promise<void> {

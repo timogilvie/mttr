@@ -1,5 +1,5 @@
 import type { Config } from '../config.js';
-import type { AgentStateRepository } from '../state/repository.js';
+import type { AgentStateRepository, TriggerSource } from '../state/repository.js';
 import type { IncidentTransition } from '../state/transitions.js';
 
 interface FetchResponse {
@@ -49,6 +49,21 @@ function dispositionForDedupe(transition: IncidentTransition): string {
   return String(disposition);
 }
 
+async function triggerSourceForAlert(
+  repository: AgentStateRepository,
+  runId: string | undefined
+): Promise<TriggerSource> {
+  if (!runId || !repository.getRunTriggerSource) {
+    return 'scheduled';
+  }
+
+  try {
+    return (await repository.getRunTriggerSource(runId)) ?? 'scheduled';
+  } catch {
+    return 'scheduled';
+  }
+}
+
 export function slackDedupeKey(channel: string, transition: IncidentTransition): string {
   return [
     channel,
@@ -59,9 +74,13 @@ export function slackDedupeKey(channel: string, transition: IncidentTransition):
   ].join(':');
 }
 
-function slackPayload(transition: IncidentTransition): Record<string, unknown> {
+function slackPayload(
+  transition: IncidentTransition,
+  triggerSource: TriggerSource
+): Record<string, unknown> {
+  const provenanceLabel = triggerSource === 'alarm' ? 'ALARM triggered' : 'scheduled';
   return {
-    text: `[${transition.severity}] ${transition.message}`,
+    text: `[${transition.severity}] [${triggerSource}] ${transition.message}`,
     blocks: [
       {
         type: 'section',
@@ -77,6 +96,7 @@ function slackPayload(transition: IncidentTransition): Record<string, unknown> {
             type: 'mrkdwn',
             text:
               `Incident: ${transition.incidentId} | Severity: ${transition.severity}` +
+              ` | Trigger: ${provenanceLabel}` +
               (transition.service ? ` | Service: ${transition.service}` : ''),
           },
         ],
@@ -116,6 +136,7 @@ export async function sendSlackAlerts(
   }
 
   const results: AlertDeliveryResult[] = [];
+  let triggerSource: TriggerSource | undefined;
   for (const transition of transitions) {
     const dedupeKey = slackDedupeKey(config.alerts.slack.channel, transition);
     if (!transition.alertable || !ALERTABLE_TRANSITIONS.has(transition.transitionType)) {
@@ -128,7 +149,8 @@ export async function sendSlackAlerts(
       continue;
     }
 
-    const payload = slackPayload(transition);
+    triggerSource ??= await triggerSourceForAlert(repository, runId);
+    const payload = slackPayload(transition, triggerSource);
     const signal = timeoutSignal(config.alerts.slack.timeoutMs);
     const response = await fetchImpl(webhookUrl, {
       method: 'POST',

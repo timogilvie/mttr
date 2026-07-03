@@ -125,6 +125,7 @@ class FakeApiDatabase implements DatabaseClient {
       started_at: '2026-06-08T10:00:00Z',
       finished_at: '2026-06-08T10:01:00Z',
       status: 'success',
+      trigger_source: 'scheduled',
       health_report_s3_uri: 's3://test/report.md',
       report_hash: 'abc123',
       summary: 'High 4xx',
@@ -374,6 +375,7 @@ describe('web API', () => {
       lastRun: {
         id: 'run-1',
         status: 'success',
+        triggerSource: 'scheduled',
         overallSeverity: 'HIGH',
       },
       openIncidentCounts: { HIGH: 1 },
@@ -447,7 +449,35 @@ describe('web API', () => {
     });
   });
 
-  it('returns run detail with raw stage output', async () => {
+  it('returns run list with trigger provenance', async () => {
+    const db = new FakeApiDatabase();
+    const scheduledRun = db.runs[0];
+    if (!scheduledRun) {
+      throw new Error('Expected fake database to seed a scheduled run');
+    }
+    db.runs = [
+      scheduledRun,
+      {
+        ...scheduledRun,
+        id: 'run-2',
+        started_at: '2026-06-08T10:05:00Z',
+        trigger_source: 'alarm',
+      },
+    ];
+    const { app } = appFor(baseConfig, db);
+
+    const response = await app.inject({ method: 'GET', url: '/api/runs' });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      runs: [
+        { id: 'run-1', triggerSource: 'scheduled' },
+        { id: 'run-2', triggerSource: 'alarm' },
+      ],
+    });
+  });
+
+  it('returns run detail with raw stage output and trigger provenance', async () => {
     const { app } = appFor();
 
     const response = await app.inject({ method: 'GET', url: '/api/runs/run-1' });
@@ -456,6 +486,7 @@ describe('web API', () => {
     expect(response.json()).toMatchObject({
       run: {
         id: 'run-1',
+        triggerSource: 'scheduled',
         raw: {
           classification: { summary: 'classified' },
           investigation: { summary: 'investigated' },
