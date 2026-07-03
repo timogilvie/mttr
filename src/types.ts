@@ -184,6 +184,67 @@ export interface PriorityItem {
   reason: string;
 }
 
+export type FailureConcentrationDimension =
+  | 'endpoint'
+  | 'method'
+  | 'statusCode'
+  | 'resourceId'
+  | 'logStream';
+
+export interface FailureConcentrationValue {
+  value: string;
+  count: number;
+}
+
+export interface FailureConcentration {
+  dimension: FailureConcentrationDimension;
+  values: FailureConcentrationValue[];
+}
+
+export type ChangeEventType = 'deploy' | 'config' | 'runtime' | 'other';
+
+export interface ChangeCorrelationEvent {
+  type: ChangeEventType;
+  timestamp: string;
+  description: string;
+}
+
+export interface TaskHealthFinding {
+  summary: string;
+  stopped_task_count?: number | undefined;
+  details: string[];
+}
+
+export interface ResourceSaturationFinding {
+  resource: string;
+  metric: string;
+  summary: string;
+}
+
+export type DependencyHealthStatus = 'healthy' | 'degraded' | 'unknown';
+
+export interface DependencyHealthFinding {
+  dependency: string;
+  status: DependencyHealthStatus;
+  summary: string;
+}
+
+export interface CausalEvidence {
+  performed: boolean;
+  failure_concentration?: FailureConcentration | undefined;
+  first_bad_timestamp?: string | null | undefined;
+  first_bad_source?: string | undefined;
+  change_correlation: ChangeCorrelationEvent[];
+  task_health?: TaskHealthFinding | undefined;
+  resource_saturation: ResourceSaturationFinding[];
+  dependency_health: DependencyHealthFinding[];
+  found: string[];
+  missing: string[];
+  next_highest_value_query: string;
+}
+
+export type MitigationConfidence = 'high' | 'medium' | 'low';
+
 export interface Investigation {
   incident_id: string;
   title: string;
@@ -203,6 +264,9 @@ export interface Investigation {
   recommended_next_investigation_steps: NextInvestigationStep[];
   requires_more_evidence_before_mitigation: boolean;
   possible_future_remediation: string[];
+  causal_evidence?: CausalEvidence | undefined;
+  mitigation_confidence?: MitigationConfidence | undefined;
+  confidence_justification?: string | undefined;
 }
 
 export interface InvestigationResult {

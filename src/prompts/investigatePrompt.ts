@@ -41,6 +41,7 @@ Use suggested_cloudwatch_queries and signals to target your queries. For finding
   - observability_reliability distinguishes TRUSTED, PARTIAL, UNRELIABLE, or UNKNOWN telemetry.
 - If Step 1 reports a high 4xx rate or AUTH_FAILURE without direct auth evidence, do not stop at the aggregate count. Use discover_log_groups if needed, then query recent logs to break down 4xx responses by status code, endpoint/path, and caller/client/tenant fields when present. Search for explicit auth terms such as unauthorized, forbidden, token, signature, credential, authentication, and authorization.
 - If Step 1 reports 5xx responses or APPLICATION_ERROR, do not stop at the aggregate count. Break the errors down by status code and endpoint using query_alb_access_logs and application logs, and use get_ecs_service_events to check for deployments or stopped tasks overlapping the error window. Target 5xx responses (especially 502/504) may never appear in application logs because the task crashed or timed out; in that case ALB access logs and ECS stopped-task reasons are the evidence to use.
+- Once you confirm an application-level incident (API 5xx or ALB-backed failure with investigation_status CONFIRMED_INCIDENT), do not stop at symptom corroboration ("the endpoint is failing"). Pivot to the Causal-Evidence Pivot below and populate causal_evidence for that investigation.
 - Prefer aggregation queries (e.g. stats count(*) by status, path) over raw newest-N row dumps, and exclude health-check endpoints (e.g. /health) when sampling raw logs — otherwise routine health checks drown out the signal.
 - A log query that returns only healthy traffic is NOT evidence that the errors did not happen. Narrow the window to the metric spike, filter for error status codes, and retry before concluding the logs are silent.
 - If Step 1 reports a missing or zero-datapoint metric (e.g. detector liveness) or an OBSERVABILITY_FAILURE, do not stop at "no data". Use list_metrics to recover the exact metric namespace/name/dimensions, then get_metrics_and_alarms with an explicit start_time well before the report window (use period_seconds=3600 for multi-day scans) to find when datapoints stopped. Use find_alarms to check whether any alarm covers the signal, and discover_log_groups + query_logs to check whether the workload still ran: recent runtime logs without metric datapoints indicate a metric-emission failure, while silent logs indicate the workload stopped.
@@ -58,6 +59,28 @@ Use suggested_cloudwatch_queries and signals to target your queries. For finding
 - Do NOT assign a per-item confidence higher than that item's Step 1 confidence unless you obtained corroborating evidence from a tool.
 - Do not fabricate logs, metrics, timestamps, or service names. Preserve service names exactly as given in Step 1.
 - Do not recommend remediation. Any remediation idea goes in possible_future_remediation, labelled as a possibility, never an instruction.
+
+## Causal-Evidence Pivot
+
+For every investigation whose original_classification is APPLICATION_ERROR, or whose evidence otherwise describes an API 5xx / ALB-backed application failure, and whose investigation_status is CONFIRMED_INCIDENT: symptom confirmation (request failures corroborated, health checks surviving) is the START of the investigation, not the end. Generate and execute a second-level causal-evidence plan and report it in that investigation's causal_evidence object, separate from confirmed_facts/supporting_evidence. Set causal_evidence.performed=true whenever you attempt this pivot, even if every category ends up in missing. Leave causal_evidence unset (or performed=false) for investigations that are not a confirmed application-level incident — do not run this pivot for infrastructure-only, observability, or unconfirmed items.
+
+This playbook is generic: it applies to any API 5xx / ALB-backed service the same way, never only to a specific named service. Resolve targets (log groups, ECS services/clusters, load balancers) from the Pre-gathered Tool Evidence and your own tool calls, not from assumptions about a particular service name.
+
+Attempt to gather each of these seven evidence categories using the Pre-gathered Tool Evidence and, if still unanswered and tool budget remains, your own additional tool calls:
+
+1. **Failure concentration** — from ALB access logs and/or application logs, determine whether failures concentrate by endpoint, method, status code, resource/model id, or log stream. Report the single most informative dimension in causal_evidence.failure_concentration with the top values and counts. If the logs are uniform or empty, omit failure_concentration and add a missing entry explaining why (e.g. "no error logs found" or "logs do not expose a distinguishing dimension").
+2. **First-bad timestamp** — the earliest failure timestamp from logs or ALB access logs. Populate causal_evidence.first_bad_timestamp and first_bad_source. If no error evidence exists, leave it null and record the gap in missing.
+3. **Adjacent error logs** — the raw error-context sample around that timestamp (exceptions, timeouts, dependency names) that explains *why*, not just *which endpoint*.
+4. **Deployment / config / runtime change correlation** — CloudTrail or ECS deployment evidence for changes (deploys, task-definition registrations, config updates) in the hours before the first bad timestamp. When such a source is available, populate causal_evidence.change_correlation with matching events and note their proximity to the first bad timestamp. When no change source is exposed by the available tools, leave change_correlation empty and add "change correlation source unavailable" (or equivalent) to missing.
+5. **Task health** — ECS service events, deployments, and stopped-task reasons (exit codes, OOM kills, failed health checks) summarized into causal_evidence.task_health.
+6. **Resource saturation** — CPU/memory/connection utilization for the affected service's compute resources, when a metrics source is available. Summarize each signal as an entry in causal_evidence.resource_saturation. If no saturation metric is available, record the gap in missing.
+7. **Dependency health** — evidence about the health of services this one depends on: other affected_services in this same investigation, or dependency names surfaced in adjacent error logs (timeouts, connection refused, unavailable). Summarize each as an entry in causal_evidence.dependency_health with a healthy/degraded/unknown status. If no dependency evidence source is available, record the gap in missing.
+
+For every category you cannot resolve, add a short human-readable entry to causal_evidence.missing (not just unknowns) instead of silently omitting it. For every category you do resolve, add a short entry to causal_evidence.found describing what was learned. A tool error, timeout, or empty result for one causal query is never a reason to fail the investigation or skip the remaining categories — record the gap and continue.
+
+Set causal_evidence.next_highest_value_query to the single query that would close the highest-value remaining unknown (not a list). When causal_evidence.missing is non-empty, pick it in this priority order and name the missing category it targets: dependency health, change/deploy correlation, first-bad timestamp, task health, resource saturation, failure concentration, adjacent logs. When nothing is missing, next_highest_value_query is still non-empty — describe a confirmation or ongoing-monitoring query instead of leaving it blank.
+
+Based on causal_evidence, set that investigation's mitigation_confidence to high, medium, or low, and write confidence_justification naming the specific causal_evidence items (e.g. a first_bad_timestamp tightly correlated with a deploy, or a resource-saturation reading) that justify it. mitigation_confidence=high requires a corroborated causal chain (e.g. failure concentration plus a correlated change or a saturated/unhealthy resource), not just confirmed symptoms. Sparse or entirely missing causal_evidence means mitigation_confidence=low, with confidence_justification naming what is missing.
 
 ## Identifiers
 
@@ -106,7 +129,22 @@ Return valid JSON only. Do not include markdown. Use this schema:
 "unresolved_evidence_requirements": [ { "type": "CUSTOM_METRIC_HISTORY | FIRST_BAD_LOG_TIMESTAMP | LAMBDA_FAILURE_SUMMARY | CHANGE_EVENT_DETAILS | DEPLOYMENT_PROVENANCE | ALARM_COVERAGE", "description": "", "tool_hint": "" } ],
 "recommended_next_investigation_steps": [ { "priority": 1, "action": "", "expected_signal": "" } ],
 "requires_more_evidence_before_mitigation": true,
-"possible_future_remediation": []
+"possible_future_remediation": [],
+"causal_evidence": {
+  "performed": true,
+  "failure_concentration": { "dimension": "endpoint | method | statusCode | resourceId | logStream", "values": [ { "value": "", "count": 0 } ] },
+  "first_bad_timestamp": null,
+  "first_bad_source": "",
+  "change_correlation": [ { "type": "deploy | config | runtime | other", "timestamp": "", "description": "" } ],
+  "task_health": { "summary": "", "stopped_task_count": 0, "details": [] },
+  "resource_saturation": [ { "resource": "", "metric": "", "summary": "" } ],
+  "dependency_health": [ { "dependency": "", "status": "healthy | degraded | unknown", "summary": "" } ],
+  "found": [],
+  "missing": [],
+  "next_highest_value_query": ""
+},
+"mitigation_confidence": "high | medium | low",
+"confidence_justification": ""
 }
 ],
 "cross_cutting_observations": [],
@@ -120,6 +158,7 @@ Return valid JSON only. Do not include markdown. Use this schema:
 - Set requires_more_evidence_before_mitigation=false ONLY for CONFIRMED_INCIDENT items whose root cause is supported by gathered evidence. A repeated application error is a proximate failure, not a root cause, unless deployment/configuration/schema/API-contract evidence explains why it started; otherwise keep this true and name the missing root-cause evidence.
 - You MAY raise overall_severity above the Step 1 overall_severity when findings warrant it.
 - Emit one investigations[] entry per Step 1 incident and finding.
+- mitigation_confidence and confidence_justification are independent of requires_more_evidence_before_mitigation and must be set whenever causal_evidence.performed=true; they describe how much the causal evidence (not just symptom confirmation) supports acting.
 
 ## Step 1 Input
 
