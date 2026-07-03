@@ -304,6 +304,11 @@ function cloudWatchAlarmPayload(
     StateChangeTime: '2026-07-01T12:34:56.000+0000',
     AWSAccountId: '123456789012',
     Region: 'US East (N. Virginia)',
+    Trigger: {
+      MetricName: 'CPUUtilization',
+      Namespace: 'AWS/ECS',
+      Dimensions: [{ name: 'ServiceName', value: 'api' }],
+    },
     ...overrides,
   };
 }
@@ -661,6 +666,8 @@ describe('web API', () => {
       alarm_arn: 'arn:aws:cloudwatch:us-east-1:123456789012:alarm:CPUHigh',
       alarm_name: 'CPUHigh',
       new_state: 'ALARM',
+      severity: 'HIGH',
+      spec_key: 'api|UNKNOWN|cpuhigh',
       status: 'pending',
       payload: {
         AlarmName: 'CPUHigh',

@@ -2,11 +2,21 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { rmSync } from 'node:fs';
 import { Orchestrator } from '../orchestrator.js';
 import type { Config } from '../config.js';
-import type { StageResult, ClassificationResult } from '../types.js';
+import type { StageResult, ClassificationResult, VerificationResult } from '../types.js';
 import { canonicalObservationKey } from '../state/agentState.js';
+import type { AgentState } from '../state/agentState.js';
+import { buildActiveAlarmSpec, buildMandatoryIncident } from '../report/mandatoryIncidents.js';
+import type {
+  AgentStateRepository,
+  AlarmTriggerRow,
+  IncidentEventInput,
+  RunRecordUpdate,
+  StageOutputUpdate,
+} from '../state/repository.js';
 
 vi.mock('../stages/classify.js');
 vi.mock('../stages/investigate.js');
+vi.mock('../stages/verify.js');
 vi.mock('../report/fetchReport.js');
 
 let stateFileCounter = 0;
@@ -81,6 +91,106 @@ const mockConfig: Config = {
     },
   },
 };
+
+function alarmPayload(alarmName = 'api-task-health', service = 'api') {
+  return {
+    AlarmName: alarmName,
+    AlarmArn: `arn:aws:cloudwatch:us-east-1:123456789012:alarm:${alarmName}`,
+    NewStateValue: 'ALARM',
+    NewStateReason: 'Threshold crossed',
+    StateChangeTime: '2026-06-08T10:00:00.000Z',
+    Trigger: {
+      MetricName: 'UnHealthyHostCount',
+      Namespace: 'AWS/ApplicationELB',
+      Dimensions: [{ name: 'ServiceName', value: service }],
+    },
+  };
+}
+
+function alarmTrigger(
+  overrides: Partial<AlarmTriggerRow> = {},
+  payload = alarmPayload()
+): AlarmTriggerRow {
+  return {
+    id: 'trigger-1',
+    sns_message_id: 'sns-1',
+    alarm_arn: 'arn:aws:cloudwatch:us-east-1:123456789012:alarm:api-task-health',
+    alarm_name: 'api-task-health',
+    new_state: 'ALARM',
+    state_change_time: '2026-06-08T10:00:00.000Z',
+    severity: 'CRITICAL',
+    spec_key: 'api|UNKNOWN|api-task-health|',
+    payload,
+    status: 'claimed',
+    received_at: '2026-06-08T10:00:01.000Z',
+    claimed_at: '2026-06-08T10:00:02.000Z',
+    processed_at: null,
+    run_id: null,
+    ...overrides,
+  };
+}
+
+function expectedAlarmIncident() {
+  return buildMandatoryIncident(
+    buildActiveAlarmSpec({ service: 'api', alarmName: 'api-task-health' }),
+    0
+  );
+}
+
+class FakeOrchestratorRepository implements AgentStateRepository {
+  state: AgentState = { version: 1, observations: {} };
+  runs: Array<{ id: string; startedAt: string; triggerSource: string | undefined }> = [];
+  finishes: Array<{ runId: string | undefined; update: RunRecordUpdate }> = [];
+  stageOutputs: StageOutputUpdate[] = [];
+  eventStages: string[] = [];
+  private runCounter = 0;
+
+  async load(): Promise<AgentState> {
+    return this.state;
+  }
+
+  async save(state: AgentState): Promise<void> {
+    this.state = state;
+  }
+
+  async startRun(startedAt: string, triggerSource?: 'scheduled' | 'alarm'): Promise<string> {
+    this.runCounter += 1;
+    const id = `run-${this.runCounter}`;
+    this.runs.push({ id, startedAt, triggerSource });
+    return id;
+  }
+
+  async finishRun(runId: string | undefined, update: RunRecordUpdate): Promise<void> {
+    this.finishes.push({ runId, update });
+  }
+
+  async recordReconciliation(): Promise<void> {
+    return;
+  }
+
+  async recordStageOutput(_runId: string | undefined, update: StageOutputUpdate): Promise<void> {
+    this.stageOutputs.push(update);
+  }
+
+  async recordIncidentEvents(
+    _runId: string | undefined,
+    events: IncidentEventInput[]
+  ): Promise<void> {
+    this.eventStages.push(...events.map((event) => event.stage));
+  }
+
+  async recordDecisionTransitions(): Promise<[]> {
+    return [];
+  }
+
+  async recordVerificationTransitions(): Promise<[]> {
+    return [];
+  }
+
+  async recordDecisions(): Promise<void> {
+    return;
+  }
+}
 
 describe('Orchestrator', () => {
   beforeEach(() => {
@@ -527,15 +637,166 @@ describe('Orchestrator alarm trigger consumer seam (T5)', () => {
     orchestrator.stop();
   });
 
-  it('runInvestigationFromTrigger placeholder returns the T6-not-implemented error', async () => {
-    const orchestrator = new Orchestrator(mockConfig);
+  it('launches an alarm-triggered Investigate to Decide to Verify run', async () => {
+    const investigateStage = await import('../stages/investigate.js');
+    const verifyStage = await import('../stages/verify.js');
+    const repository = new FakeOrchestratorRepository();
+    const trigger = alarmTrigger();
 
-    const result = await orchestrator.runInvestigationFromTrigger({ triggers: [], specKeys: [] });
-
-    expect(result).toEqual({
-      status: 'error',
-      message: expect.stringContaining('T6'),
+    vi.mocked(investigateStage.run).mockResolvedValue({
+      stage: 'Investigate',
+      status: 'success',
+      timestamp: 't',
+      data: {
+        summary: 'possible alarm incident',
+        overall_assessment: 'POSSIBLE_INCIDENT',
+        overall_severity: 'CRITICAL',
+        investigations: [
+          {
+            incident_id: canonicalObservationKey('incident', expectedAlarmIncident()),
+            title: 'Active alarm for api: api-task-health',
+            original_classification: 'UNKNOWN',
+            investigation_status: 'POSSIBLE_INCIDENT',
+            severity: 'CRITICAL',
+            confidence: 0.8,
+            affected_services: ['api'],
+            confirmed_facts: ['Alarm api-task-health is active.'],
+            supporting_evidence: ['CloudWatch alarm state=ALARM.'],
+            contradicting_evidence: [],
+            likely_causes: [],
+            unknowns: [],
+            additional_data_needed: [],
+            unresolved_evidence_requirements: [],
+            recommended_next_investigation_steps: [],
+            requires_more_evidence_before_mitigation: false,
+            possible_future_remediation: [],
+          },
+        ],
+        cross_cutting_observations: [],
+        priority_order: [],
+      },
     });
+    const verification: VerificationResult = {
+      summary: 'verified',
+      overall_status: 'STILL_INCONCLUSIVE',
+      overall_next_stage: 'None',
+      verifications: [
+        {
+          incident_id: 'incident-1',
+          title: 'Active alarm for api: api-task-health',
+          status: 'STILL_INCONCLUSIVE',
+          severity: 'CRITICAL',
+          rationale: 'Mock verification',
+          checks: [],
+          recommended_next_stage: 'None',
+        },
+      ],
+    };
+    vi.mocked(verifyStage.run).mockResolvedValue({
+      stage: 'Verify',
+      status: 'success',
+      timestamp: 't',
+      data: verification,
+    });
+
+    const orchestrator = new Orchestrator(mockConfig, repository);
+    const result = await orchestrator.runInvestigationFromTrigger({
+      triggers: [trigger],
+      specKeys: [trigger.spec_key as string],
+    });
+
+    expect(result).toEqual({ status: 'launched', runId: 'run-1' });
+    expect(repository.runs).toMatchObject([{ id: 'run-1', triggerSource: 'alarm' }]);
+    expect(repository.finishes.at(-1)?.update).toMatchObject({
+      status: 'success',
+      overallSeverity: 'CRITICAL',
+    });
+    expect(repository.stageOutputs.map((output) => output.stage)).toEqual([
+      'Classify',
+      'Investigate',
+      'Decide',
+      'Verify',
+    ]);
+    expect(investigateStage.run).toHaveBeenCalledTimes(1);
+    expect(verifyStage.run).toHaveBeenCalledTimes(1);
+    expect((repository.stageOutputs[0]?.data as ClassificationResult).incidents[0]).toMatchObject({
+      title: 'Active alarm for api: api-task-health',
+      affected_services: ['api'],
+      signals: { alarms: ['api-task-health'] },
+    });
+  });
+
+  it('returns busy for trigger launches while Investigate is already in flight', async () => {
+    const classifyStage = await import('../stages/classify.js');
+    const investigateStage = await import('../stages/investigate.js');
+    await mockReport();
+    vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
+
+    let resolveInvestigate: (() => void) | null = null;
+    vi.mocked(investigateStage.run).mockReturnValue(
+      new Promise<StageResult>((resolve) => {
+        resolveInvestigate = () => resolve(investigateResult);
+      })
+    );
+
+    const repository = new FakeOrchestratorRepository();
+    const orchestrator = new Orchestrator(
+      { ...mockConfig, monitoring: { intervalMs: 1_000_000 } },
+      repository
+    );
+    orchestrator.start();
+    await vi.waitFor(() => expect(orchestrator.investigateBusy).toBe(true));
+
+    await expect(
+      orchestrator.runInvestigationFromTrigger({
+        triggers: [alarmTrigger()],
+        specKeys: ['api|UNKNOWN|api-task-health|'],
+      })
+    ).resolves.toEqual({ status: 'busy' });
+    expect(repository.runs).toHaveLength(1);
+
+    resolveInvestigate!();
+    await vi.waitFor(() => expect(orchestrator.investigateBusy).toBe(false));
+    orchestrator.stop();
+  });
+
+  it('dedupes an alarm-born incident with the matching report-born mandatory incident', async () => {
+    const investigateStage = await import('../stages/investigate.js');
+    const repository = new FakeOrchestratorRepository();
+    const orchestrator = new Orchestrator(mockConfig, repository);
+    vi.mocked(investigateStage.run).mockResolvedValue(investigateResult);
+
+    const reportIncident: ClassificationResult = {
+      summary: 'Mandatory report incident',
+      overall_severity: 'CRITICAL',
+      findings: [],
+      incidents: [expectedAlarmIncident()],
+    };
+    const canonicalId = canonicalObservationKey('incident', reportIncident.incidents[0]!);
+    repository.state.observations[canonicalId] = {
+      key: canonicalId,
+      type: 'incident',
+      title: reportIncident.incidents[0]!.title,
+      classification: reportIncident.incidents[0]!.classification,
+      affectedServices: reportIncident.incidents[0]!.affected_services,
+      severity: reportIncident.incidents[0]!.severity,
+      confidence: reportIncident.incidents[0]!.confidence,
+      signature: 'existing-signature',
+      status: 'active',
+      firstSeen: '2026-06-08T09:55:00.000Z',
+      lastSeen: '2026-06-08T09:55:00.000Z',
+      lastChangedAt: '2026-06-08T09:55:00.000Z',
+      occurrences: 1,
+    };
+
+    const result = await orchestrator.runInvestigationFromTrigger({
+      triggers: [alarmTrigger()],
+      specKeys: ['api|UNKNOWN|api-task-health|'],
+    });
+
+    expect(result).toEqual({ status: 'launched', runId: 'run-1' });
+    expect(Object.keys(repository.state.observations)).toEqual([canonicalId]);
+    expect(investigateStage.run).toHaveBeenCalledTimes(1);
   });
 
   it('starts the alarm trigger consumer when the webhook feature is enabled', async () => {

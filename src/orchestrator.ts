@@ -13,6 +13,13 @@ import * as verifyStage from './stages/verify.js';
 import { mitigateStage } from './stages/stubs.js';
 import { sendSlackAlerts } from './alerts/slack.js';
 import { fetchReport } from './report/fetchReport.js';
+import { alarmSpecFromSns } from './report/alarmSpecFromSns.js';
+import {
+  buildMandatoryIncident,
+  maxSeverity,
+  specDedupeKey,
+  type MandatoryIncidentSpec,
+} from './report/mandatoryIncidents.js';
 import {
   canonicalObservationKey,
   hashReportContent,
@@ -76,6 +83,57 @@ function canonicalizeClassificationIncidents(classification: ClassificationResul
   };
 }
 
+function triggerStateChangeTime(trigger: AlarmTriggerBatch['triggers'][number]): string {
+  return trigger.state_change_time instanceof Date
+    ? trigger.state_change_time.toISOString()
+    : trigger.state_change_time;
+}
+
+function bestSpecByDedupeKey(
+  specs: MandatoryIncidentSpec[]
+): MandatoryIncidentSpec[] {
+  const byKey = new Map<string, MandatoryIncidentSpec>();
+  for (const spec of specs) {
+    const key = specDedupeKey(spec);
+    const existing = byKey.get(key);
+    if (!existing || maxSeverity(spec.severity, existing.severity) === spec.severity) {
+      byKey.set(key, spec);
+    }
+  }
+  return [...byKey.values()].sort((a, b) => specDedupeKey(a).localeCompare(specDedupeKey(b)));
+}
+
+function classificationFromAlarmSpecs(
+  batch: AlarmTriggerBatch,
+  specs: MandatoryIncidentSpec[]
+): ClassificationResult {
+  const incidents = specs.map((spec, index) => buildMandatoryIncident(spec, index));
+  const highestSeverity = incidents.reduce(
+    (severity, incident) => maxSeverity(severity, incident.severity),
+    'NONE' as ClassificationResult['overall_severity']
+  );
+  const triggerWindow = batch.triggers
+    .map(triggerStateChangeTime)
+    .sort((a, b) => a.localeCompare(b));
+  const firstChange = triggerWindow[0];
+  const lastChange = triggerWindow.at(-1);
+
+  return {
+    summary: `Alarm-triggered investigation for ${incidents.length} incident signal(s).`,
+    overall_severity: highestSeverity,
+    incidents,
+    findings: [],
+    report_context:
+      firstChange && lastChange
+        ? {
+            window_label: 'Alarm trigger batch',
+            window_start: firstChange,
+            window_end: lastChange,
+          }
+        : undefined,
+  };
+}
+
 export class Orchestrator {
   private intervalId: NodeJS.Timeout | null = null;
   private classifyInFlight = false;
@@ -84,9 +142,9 @@ export class Orchestrator {
   private readonly stateRepository: AgentStateRepository;
   private triggerConsumerHandle: AlarmTriggerConsumerHandle | null = null;
 
-  constructor(config: Config) {
+  constructor(config: Config, stateRepository?: AgentStateRepository) {
     this.config = structuredClone(config);
-    this.stateRepository = createAgentStateRepository(this.config);
+    this.stateRepository = stateRepository ?? createAgentStateRepository(this.config);
   }
 
   /** Public read of the single-flight investigate guard — the T5 consumer's concurrency seam. */
@@ -94,18 +152,120 @@ export class Orchestrator {
     return this.investigateInFlight;
   }
 
-  /**
-   * T6 out-of-band entry point (design §5.4): builds a ClassificationResult-shaped payload from
-   * the coalesced alarm-trigger batch and drives the existing
-   * runInvestigate → runDecide → runSelectedResponseStage chain, recording `trigger_source =
-   * 'alarm'`. Not implemented in T5 — the feature ships dark (`ALARM_WEBHOOK_ENABLED=false`), so
-   * this placeholder never executes in practice; T5 tests inject a fake launcher instead.
-   */
-  async runInvestigationFromTrigger(_batch: AlarmTriggerBatch): Promise<TriggerLaunchResult> {
-    return {
-      status: 'error',
-      message: 'trigger investigation entry point not implemented (T6)',
+  async runInvestigationFromTrigger(batch: AlarmTriggerBatch): Promise<TriggerLaunchResult> {
+    if (this.investigateInFlight) {
+      return { status: 'busy' };
+    }
+
+    if (batch.triggers.length === 0) {
+      return { status: 'error', message: 'No alarm triggers supplied' };
+    }
+
+    let runId: string | undefined;
+    let finished = false;
+    const finishRun = async (update: {
+      status: 'success' | 'error';
+      summary?: string;
+      overallSeverity?: ClassificationResult['overall_severity'];
+      errorMessage?: string;
+    }): Promise<void> => {
+      if (finished) {
+        return;
+      }
+      finished = true;
+      await this.stateRepository.finishRun?.(runId, {
+        status: update.status,
+        finishedAt: new Date().toISOString(),
+        ...(update.summary ? { summary: update.summary } : {}),
+        ...(update.overallSeverity ? { overallSeverity: update.overallSeverity } : {}),
+        ...(update.errorMessage ? { errorMessage: update.errorMessage } : {}),
+      });
     };
+
+    try {
+      const parsedSpecs: MandatoryIncidentSpec[] = [];
+      const invalidTriggers: string[] = [];
+      for (const trigger of batch.triggers) {
+        const parsed = alarmSpecFromSns(trigger.payload);
+        if (parsed.ok) {
+          parsedSpecs.push(parsed.spec);
+        } else {
+          invalidTriggers.push(`${trigger.id}:${parsed.reason}`);
+        }
+      }
+
+      const specs = bestSpecByDedupeKey(parsedSpecs);
+      if (specs.length === 0) {
+        return {
+          status: 'error',
+          message:
+            invalidTriggers.length > 0
+              ? `No usable alarm specs in trigger batch (${invalidTriggers.join(', ')})`
+              : 'No usable alarm specs in trigger batch',
+        };
+      }
+
+      const startedAt = new Date().toISOString();
+      runId = await this.stateRepository.startRun?.(startedAt, 'alarm');
+      if (!runId) {
+        return {
+          status: 'error',
+          message: 'Alarm-triggered investigations require a repository that records runs',
+        };
+      }
+
+      const state = await this.stateRepository.load();
+      const classification = canonicalizeClassificationIncidents(
+        classificationFromAlarmSpecs(batch, specs)
+      );
+      const reconciliation = reconcileObservations(state, classification, startedAt);
+      await this.stateRepository.save(state);
+      await this.stateRepository.recordReconciliation?.(runId, reconciliation);
+      await this.stateRepository.recordStageOutput?.(runId, {
+        stage: 'Classify',
+        data: classification,
+      });
+      await this.stateRepository.recordIncidentEvents?.(
+        runId,
+        this.classificationEvents(classification, reconciliation)
+      );
+      this.logObservationReconciliation(reconciliation);
+
+      if (reconciliation.shouldInvestigate) {
+        const downstreamSucceeded = await this.runInvestigate(classification, runId);
+        if (!downstreamSucceeded) {
+          await finishRun({
+            status: 'error',
+            summary: classification.summary,
+            overallSeverity: classification.overall_severity,
+            errorMessage: 'Investigate or Decide stage failed',
+          });
+          return {
+            status: 'error',
+            message: 'Investigate or Decide stage failed',
+          };
+        }
+      } else {
+        console.log(
+          '[Orchestrator] Alarm observations are recurring unchanged; skipping Investigate'
+        );
+      }
+
+      await finishRun({
+        status: 'success',
+        summary: classification.summary,
+        overallSeverity: classification.overall_severity,
+      });
+      return { status: 'launched', runId };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('[Orchestrator] Alarm-triggered investigation failed:', error);
+      await finishRun({
+        status: 'error',
+        errorMessage: message,
+      });
+      return { status: 'error', message };
+    }
   }
 
   private classificationEvents(

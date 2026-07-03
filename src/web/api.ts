@@ -9,6 +9,7 @@ import type { DatabaseClient, DatabasePool } from '../db/postgres.js';
 import { createPostgresPool } from '../db/postgres.js';
 import { enqueueAlarmTriggerOnce, markSnsMessageProcessed } from '../state/repository.js';
 import type { Severity } from '../types.js';
+import { alarmSpecFromSns } from '../report/alarmSpecFromSns.js';
 import {
   UnsupportedSnsMessageError,
   confirmSnsSubscription,
@@ -354,12 +355,17 @@ export function createWebServer(
           return reply.code(200).send({ ok: true });
         }
 
+        const alarmSpec = alarmSpecFromSns(alarmMessage, {
+          minSeverity: config.alarm.trigger.minSeverity,
+        });
         await enqueueAlarmTriggerOnce(db, {
           snsMessageId: message.MessageId,
           alarmArn: alarmMessage.AlarmArn,
           alarmName: alarmMessage.AlarmName,
           newState: alarmMessage.NewStateValue,
           stateChangeTime: alarmMessage.StateChangeTime,
+          severity: alarmSpec.ok ? alarmSpec.severity : null,
+          specKey: alarmSpec.ok ? alarmSpec.dedupeKey : null,
           payload: alarmMessage,
         });
         return reply.code(200).send({ ok: true });

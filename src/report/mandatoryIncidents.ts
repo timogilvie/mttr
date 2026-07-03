@@ -78,7 +78,7 @@ function severityFor5xx(totalRequests: number | null, fiveXx: number): Severity 
   return 'MEDIUM';
 }
 
-function buildIncident(spec: MandatoryIncidentSpec, index: number): Incident {
+export function buildMandatoryIncident(spec: MandatoryIncidentSpec, index: number): Incident {
   return {
     incident_id: `mandatory-${spec.key}-${index}`,
     title: spec.title,
@@ -163,7 +163,7 @@ function incidentServiceMatchesSpec(incident: Incident, spec: MandatoryIncidentS
   return incident.affected_services.some((service) => services.includes(service.toLowerCase()));
 }
 
-function incidentCoversSpec(incident: Incident, spec: MandatoryIncidentSpec): boolean {
+export function incidentCoversSpec(incident: Incident, spec: MandatoryIncidentSpec): boolean {
   if (!incidentServiceMatchesSpec(incident, spec)) {
     return false;
   }
@@ -508,7 +508,7 @@ export function enforceMandatoryIncidents(
   }
 
   const addedIncidents = missingSpecs.map((spec, index) =>
-    buildIncident(spec, enrichedIncidents.length + index)
+    buildMandatoryIncident(spec, enrichedIncidents.length + index)
   );
   const allIncidents = [...enrichedIncidents, ...addedIncidents];
   const highestSeverity = allIncidents.reduce(
