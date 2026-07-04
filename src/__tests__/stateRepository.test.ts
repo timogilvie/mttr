@@ -147,6 +147,47 @@ class FakeStateDatabase implements DatabaseClient {
       return result<T>(rows as unknown as T[]);
     }
 
+    if (normalized.startsWith('WITH candidates AS')) {
+      const specKey = params[0] as string | null;
+      const alarmName = String(params[1]);
+      const rows = this.alarmTriggers
+        .filter(
+          (trigger) =>
+            trigger['new_state'] === 'ALARM' &&
+            trigger['status'] === 'done' &&
+            trigger['run_id'] &&
+            ((specKey && trigger['spec_key'] === specKey) ||
+              trigger['alarm_name'] === alarmName)
+        )
+        .flatMap((trigger) =>
+          this.incidentEvents
+            .filter(
+              (event) =>
+                event['run_id'] === trigger['run_id'] &&
+                JSON.stringify(event['evidence_json']).includes(alarmName)
+            )
+            .map((event) => {
+              const incident = this.incidents.get(String(event['incident_id']));
+              if (!incident || incident['closed_at'] || ['resolved', 'closed'].includes(String(incident['state']))) {
+                return [];
+              }
+              return [{
+                incident_id: incident['incident_id'],
+                title: incident['title'],
+                severity: incident['severity'],
+                service: incident['service'] ?? null,
+                state: incident['state'],
+                closed_at: incident['closed_at'] ?? null,
+                match_rank: specKey && trigger['spec_key'] === specKey ? 0 : 1,
+              }];
+            })
+            .flat()
+        )
+        .sort((a, b) => Number(a['match_rank']) - Number(b['match_rank']))
+        .slice(0, 2);
+      return result<T>(rows as unknown as T[]);
+    }
+
     if (normalized.startsWith('SELECT dedupe_key FROM alerts')) {
       const alert = this.alerts.get(String(params[0]));
       return result<T>(alert ? [alert as T] : []);
@@ -220,6 +261,23 @@ class FakeStateDatabase implements DatabaseClient {
         overall_severity: params[5],
         error_message: params[6],
       });
+      return result<T>([]);
+    }
+
+    if (normalized.startsWith('UPDATE incidents')) {
+      const id = String(params[0]);
+      const existing = this.incidents.get(id);
+      if (existing) {
+        this.incidents.set(id, {
+          ...existing,
+          state: params[1],
+          closed_at: params[2],
+          severity: params[3],
+          current_disposition: params[4] ?? existing['current_disposition'],
+          current_next_stage: params[5] ?? existing['current_next_stage'],
+          last_run_id: params[6],
+        });
+      }
       return result<T>([]);
     }
 
@@ -374,7 +432,7 @@ describe('Postgres state repository', () => {
     expect(db.alarmTriggers).toHaveLength(1);
   });
 
-  it('records non-ALARM messages without enqueueing a trigger row', async () => {
+  it('enqueues OK messages so the consumer can verify recovery', async () => {
     const db = new FakeStateDatabase();
 
     await expect(
@@ -386,10 +444,11 @@ describe('Postgres state repository', () => {
         stateChangeTime: '2026-07-01T12:34:56.000+0000',
         payload: { AlarmName: 'CPUHigh', NewStateValue: 'OK' },
       })
-    ).resolves.toMatchObject({ duplicate: false, enqueued: false });
+    ).resolves.toMatchObject({ duplicate: false, enqueued: true, id: 'trigger-1' });
 
     expect(db.processedSnsMessages.has('sns-2')).toBe(true);
-    expect(db.alarmTriggers).toHaveLength(0);
+    expect(db.alarmTriggers).toHaveLength(1);
+    expect(db.alarmTriggers[0]).toMatchObject({ new_state: 'OK', status: 'pending' });
   });
 
   it('runs the enqueue transaction on a single pinned pool connection and releases it', async () => {
@@ -759,6 +818,55 @@ describe('Postgres state repository', () => {
       alertable: true,
       status: 'VERIFIED_RECOVERED_TRANSIENT',
     });
+    expect(db.incidents.get('INC-001')).toMatchObject({
+      state: 'resolved',
+      closed_at: expect.any(String),
+      last_run_id: runId,
+    });
+  });
+
+  it('finds one open alarm-born incident for recovery by spec_key and alarm evidence', async () => {
+    const db = new FakeStateDatabase();
+    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
+    const runId = await repository.startRun('2026-06-08T10:00:00Z', 'alarm');
+    db.alarmTriggers.push({
+      id: 'trigger-alarm',
+      new_state: 'ALARM',
+      status: 'done',
+      run_id: runId,
+      spec_key: 'api|UNKNOWN|test-alarm',
+      alarm_name: 'test-alarm',
+    });
+    db.incidents.set('INC-001', {
+      incident_id: 'INC-001',
+      title: 'Active alarm for api: test-alarm',
+      service: 'api',
+      severity: 'CRITICAL',
+      state: 'decision',
+      closed_at: null,
+    });
+    db.incidentEvents.push({
+      incident_id: 'INC-001',
+      run_id: runId,
+      evidence_json: { signals: { alarms: ['test-alarm'] } },
+    });
+
+    await expect(
+      repository.findOpenAlarmIncidentForRecovery({
+        spec_key: 'api|UNKNOWN|test-alarm',
+        alarm_name: 'test-alarm',
+      })
+    ).resolves.toEqual({
+      incident: {
+        incidentId: 'INC-001',
+        title: 'Active alarm for api: test-alarm',
+        severity: 'CRITICAL',
+        service: 'api',
+        state: 'decision',
+        closedAt: null,
+      },
+      ambiguous: false,
+    });
   });
 
   it('persists raw stage JSON on runs with secret-like values redacted', async () => {
@@ -900,7 +1008,9 @@ class FakeAgingTriggerDatabase implements DatabaseClient {
       const eligible = this.rows.filter(
         (row) =>
           row.status === 'pending' &&
-          (row.new_state === 'ALARM' || row.new_state === 'INSUFFICIENT_DATA') &&
+          (row.new_state === 'ALARM' ||
+            row.new_state === 'OK' ||
+            row.new_state === 'INSUFFICIENT_DATA') &&
           row.received_at.getTime() < threshold
       );
       const oldest = eligible.reduce<Date | null>(
@@ -970,7 +1080,7 @@ describe('getAgingPendingAlarmTriggers', () => {
     expect(summary).toEqual({ count: 0, oldestAgeMs: null, oldestReceivedAt: null });
   });
 
-  it('excludes pending OK rows left for T7 — they are not consumer backlog', async () => {
+  it('includes pending OK rows because recovery verify should drain them', async () => {
     const oldReceivedAt = new Date(Date.now() - 120_000);
     const db = new FakeAgingTriggerDatabase().seed({
       status: 'pending',
@@ -981,7 +1091,8 @@ describe('getAgingPendingAlarmTriggers', () => {
 
     const summary = await repository.getAgingPendingAlarmTriggers(60_000);
 
-    expect(summary).toEqual({ count: 0, oldestAgeMs: null, oldestReceivedAt: null });
+    expect(summary.count).toBe(1);
+    expect(summary.oldestReceivedAt).toBe(oldReceivedAt.toISOString());
   });
 
   it('returns the oldest received_at across multiple aging rows', async () => {

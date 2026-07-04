@@ -49,6 +49,17 @@ export interface AlarmSpecFromSnsFailure {
 
 export type AlarmSpecFromSnsResult = AlarmSpecFromSnsSuccess | AlarmSpecFromSnsFailure;
 
+export interface AlarmIdentityFromSnsSuccess {
+  ok: true;
+  severity: Severity;
+  dedupeKey: string;
+  gated?: boolean | undefined;
+}
+
+export type AlarmIdentityFromSnsResult =
+  | AlarmIdentityFromSnsSuccess
+  | AlarmSpecFromSnsFailure;
+
 export interface AlarmSpecFromSnsOptions {
   minSeverity?: Severity | undefined;
 }
@@ -104,6 +115,31 @@ export function alarmSpecFromSns(
   payload: unknown,
   options: AlarmSpecFromSnsOptions = {}
 ): AlarmSpecFromSnsResult {
+  const identity = alarmIdentityFromSns(payload, options);
+  if (!identity.ok) {
+    return identity;
+  }
+  if (!isRecord(payload) || readTrimmedString(payload['NewStateValue']) !== 'ALARM') {
+    return { ok: false, reason: 'not-active' };
+  }
+
+  const alarmName = readTrimmedString(payload['AlarmName']) as string;
+  const dimensions = readDimensions((payload['Trigger'] as Record<string, unknown>)['Dimensions']);
+  const service = deriveServiceIdentity(alarmName, dimensions) as string;
+  const spec = buildActiveAlarmSpec({ service, alarmName });
+  return {
+    ok: true,
+    spec,
+    severity: identity.severity,
+    dedupeKey: identity.dedupeKey,
+    ...(identity.gated === undefined ? {} : { gated: identity.gated }),
+  };
+}
+
+export function alarmIdentityFromSns(
+  payload: unknown,
+  options: AlarmSpecFromSnsOptions = {}
+): AlarmIdentityFromSnsResult {
   if (!isRecord(payload)) {
     return { ok: false, reason: 'invalid-payload' };
   }
@@ -111,10 +147,6 @@ export function alarmSpecFromSns(
   const alarmName = readTrimmedString(payload['AlarmName']);
   if (!alarmName) {
     return { ok: false, reason: 'missing-alarm-name' };
-  }
-
-  if (readTrimmedString(payload['NewStateValue']) !== 'ALARM') {
-    return { ok: false, reason: 'not-active' };
   }
 
   if (!isRecord(payload['Trigger'])) {
@@ -129,9 +161,8 @@ export function alarmSpecFromSns(
 
   const spec = buildActiveAlarmSpec({ service, alarmName });
   const severity = spec.severity;
-  const result: AlarmSpecFromSnsSuccess = {
+  const result: AlarmIdentityFromSnsSuccess = {
     ok: true,
-    spec,
     severity,
     dedupeKey: specDedupeKey(spec),
   };

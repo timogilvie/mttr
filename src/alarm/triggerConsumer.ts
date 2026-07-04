@@ -1,5 +1,9 @@
 import type { Config } from '../config.js';
-import type { AgentStateRepository, AlarmTriggerRow } from '../state/repository.js';
+import type {
+  AgentStateRepository,
+  AlarmTriggerRow,
+  RecoveryIncidentCandidate,
+} from '../state/repository.js';
 import type { Severity } from '../types.js';
 import {
   ALARM_PIPELINE_COUNTER_METRICS,
@@ -24,10 +28,21 @@ export type TriggerLaunchResult =
   | { status: 'busy' }
   | { status: 'error'; message: string };
 
+export type RecoveryVerifyResult =
+  | { status: 'confirmed'; runId: string | undefined }
+  | { status: 'not_confirmed'; runId: string | undefined; message?: string }
+  | { status: 'ignored'; message: string }
+  | { status: 'busy' }
+  | { status: 'error'; message: string };
+
 export interface TriggerInvestigationLauncher {
   /** Mirrors the Orchestrator's `investigateInFlight` flag. */
   isBusy(): boolean;
   launch(batch: AlarmTriggerBatch): Promise<TriggerLaunchResult>;
+  verifyRecovery?(
+    trigger: AlarmTriggerRow,
+    incident: RecoveryIncidentCandidate
+  ): Promise<RecoveryVerifyResult>;
 }
 
 export interface AlarmTriggerConsumerDeps {
@@ -52,6 +67,9 @@ export interface TickOutcome {
   launched: number;
   released: number;
   failed: number;
+  recoveryVerified: number;
+  recoveryOpen: number;
+  recoveryErrors: number;
 }
 
 export interface AlarmTriggerConsumerHandle {
@@ -96,6 +114,9 @@ function emptyOutcome(skipped?: TickSkipReason): TickOutcome {
     launched: 0,
     released: 0,
     failed: 0,
+    recoveryVerified: 0,
+    recoveryOpen: 0,
+    recoveryErrors: 0,
   };
 }
 
@@ -160,13 +181,15 @@ export async function runAlarmTriggerConsumerOnce(
   const outcome = emptyOutcome();
   outcome.claimed = claimed.length;
 
-  // D4: INSUFFICIENT_DATA is terminal-ignored (no investigation); OK rows are never claimed here
-  // (excluded by the claim query) and are left `pending` for T7.
+  // D4/T7: INSUFFICIENT_DATA is terminal-ignored; OK rows run scoped recovery Verify only.
   const insufficientIds: string[] = [];
+  const okRows: AlarmTriggerRow[] = [];
   const alarmRows: AlarmTriggerRow[] = [];
   for (const row of claimed) {
     if (row.new_state === 'INSUFFICIENT_DATA') {
       insufficientIds.push(row.id);
+    } else if (row.new_state === 'OK') {
+      okRows.push(row);
     } else {
       alarmRows.push(row);
     }
@@ -178,6 +201,117 @@ export async function runAlarmTriggerConsumerOnce(
     logger.log(
       `[AlarmTriggerConsumer] Ignored ${insufficientIds.length} INSUFFICIENT_DATA trigger(s), no investigation`
     );
+    for (const id of insufficientIds) {
+      emitCounter(logger, ALARM_PIPELINE_COUNTER_METRICS.INSUFFICIENT_DATA_IGNORED, {
+        trigger_id: id,
+      });
+    }
+  }
+
+  for (const row of okRows) {
+    emitCounter(logger, ALARM_PIPELINE_COUNTER_METRICS.RECOVERY_VERIFY_ATTEMPTED, {
+      trigger_id: row.id,
+      alarm_name: row.alarm_name,
+      spec_key: row.spec_key,
+    });
+
+    const lookup = await repository.findOpenAlarmIncidentForRecovery?.(row);
+    if (!lookup?.incident) {
+      await repository.completeAlarmTriggers?.([row.id], null);
+      outcome.ignored += 1;
+      logger.log(
+        `[AlarmTriggerConsumer] Ignored OK trigger ${row.id} (${row.alarm_name}); no open alarm-born incident`
+      );
+      emitCounter(logger, ALARM_PIPELINE_COUNTER_METRICS.RECOVERY_NO_OPEN_INCIDENT, {
+        trigger_id: row.id,
+        alarm_name: row.alarm_name,
+        spec_key: row.spec_key,
+      });
+      continue;
+    }
+
+    if (lookup.ambiguous) {
+      logger.warn(
+        `[AlarmTriggerConsumer] OK trigger ${row.id} (${row.alarm_name}) matched multiple open incidents; verifying ${lookup.incident.incidentId}`
+      );
+    }
+
+    if (!launcher.verifyRecovery) {
+      await repository.failAlarmTriggers?.([row.id]);
+      outcome.recoveryErrors += 1;
+      logger.error('[AlarmTriggerConsumer] Recovery verifier is not configured');
+      emitCounter(logger, ALARM_PIPELINE_COUNTER_METRICS.RECOVERY_VERIFY_ERROR, {
+        trigger_id: row.id,
+        alarm_name: row.alarm_name,
+        spec_key: row.spec_key,
+      });
+      continue;
+    }
+
+    try {
+      const result = await launcher.verifyRecovery(row, lookup.incident);
+      if (result.status === 'busy') {
+        await repository.releaseAlarmTriggers?.([row.id]);
+        outcome.released += 1;
+        continue;
+      }
+      if (result.status === 'confirmed') {
+        await repository.completeAlarmTriggers?.([row.id], result.runId ?? null);
+        outcome.recoveryVerified += 1;
+        logger.log(
+          `[AlarmTriggerConsumer] Confirmed recovery for trigger ${row.id}, incident ${lookup.incident.incidentId}`
+        );
+        emitCounter(logger, ALARM_PIPELINE_COUNTER_METRICS.RECOVERY_VERIFY_CONFIRMED, {
+          trigger_id: row.id,
+          alarm_name: row.alarm_name,
+          spec_key: row.spec_key,
+          incident_id: lookup.incident.incidentId,
+        });
+        continue;
+      }
+      if (result.status === 'not_confirmed') {
+        await repository.completeAlarmTriggers?.([row.id], result.runId ?? null);
+        outcome.recoveryOpen += 1;
+        logger.log(
+          `[AlarmTriggerConsumer] Recovery not confirmed for trigger ${row.id}, incident ${lookup.incident.incidentId}: ${result.message ?? result.status}`
+        );
+        emitCounter(logger, ALARM_PIPELINE_COUNTER_METRICS.RECOVERY_VERIFY_FAILED, {
+          trigger_id: row.id,
+          alarm_name: row.alarm_name,
+          spec_key: row.spec_key,
+          incident_id: lookup.incident.incidentId,
+        });
+        continue;
+      }
+      if (result.status === 'ignored') {
+        await repository.completeAlarmTriggers?.([row.id], null);
+        outcome.ignored += 1;
+        logger.log(
+          `[AlarmTriggerConsumer] Ignored OK trigger ${row.id}, incident ${lookup.incident.incidentId}: ${result.message}`
+        );
+        continue;
+      }
+
+      await repository.failAlarmTriggers?.([row.id]);
+      outcome.recoveryErrors += 1;
+      logger.error(`[AlarmTriggerConsumer] Recovery verify failed: ${result.message}`);
+      emitCounter(logger, ALARM_PIPELINE_COUNTER_METRICS.RECOVERY_VERIFY_ERROR, {
+        trigger_id: row.id,
+        alarm_name: row.alarm_name,
+        spec_key: row.spec_key,
+        incident_id: lookup.incident.incidentId,
+      });
+    } catch (error) {
+      await repository.failAlarmTriggers?.([row.id]);
+      outcome.recoveryErrors += 1;
+      logger.error('[AlarmTriggerConsumer] Recovery verify threw:', error);
+      emitCounter(logger, ALARM_PIPELINE_COUNTER_METRICS.RECOVERY_VERIFY_ERROR, {
+        trigger_id: row.id,
+        alarm_name: row.alarm_name,
+        spec_key: row.spec_key,
+        incident_id: lookup.incident.incidentId,
+      });
+    }
   }
 
   const deferIds: string[] = [];

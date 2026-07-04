@@ -67,6 +67,15 @@ export interface AlarmTriggerEnqueueResult {
   id?: string;
 }
 
+export interface RecoveryIncidentCandidate {
+  incidentId: string;
+  title: string;
+  severity: Severity;
+  service: string | null;
+  state: string | null;
+  closedAt: string | null;
+}
+
 /**
  * Stuck-consumer signal (design doc §10): if `count` grows and `oldestAgeMs` keeps climbing,
  * the trigger consumer has stopped draining `alarm_triggers` and the scheduled loop / SNS
@@ -150,6 +159,9 @@ export interface AgentStateRepository {
     specKey: string,
     withinMs: number
   ): Promise<{ runId: string } | null>;
+  findOpenAlarmIncidentForRecovery?(
+    trigger: Pick<AlarmTriggerRow, 'spec_key' | 'alarm_name'>
+  ): Promise<{ incident: RecoveryIncidentCandidate | null; ambiguous: boolean }>;
   /** Stuck-consumer detection (design doc §10) — read-only, no schema change required. */
   getAgingPendingAlarmTriggers?(olderThanMs: number): Promise<AgingPendingTriggersSummary>;
 }
@@ -259,6 +271,12 @@ export class FileAgentStateRepository implements AgentStateRepository {
     _withinMs: number
   ): Promise<{ runId: string } | null> {
     return null;
+  }
+
+  async findOpenAlarmIncidentForRecovery(
+    _trigger: Pick<AlarmTriggerRow, 'spec_key' | 'alarm_name'>
+  ): Promise<{ incident: RecoveryIncidentCandidate | null; ambiguous: boolean }> {
+    return { incident: null, ambiguous: false };
   }
 
   async getAgingPendingAlarmTriggers(_olderThanMs: number): Promise<AgingPendingTriggersSummary> {
@@ -387,6 +405,37 @@ function transitionEvents(
   }));
 }
 
+function incidentStateFromTransition(transition: IncidentTransition): {
+  state: string;
+  closedAt: string | null;
+} | null {
+  switch (transition.transitionType) {
+    case 'recovered':
+      return { state: 'resolved', closedAt: new Date().toISOString() };
+    case 'closed':
+      return { state: 'closed', closedAt: new Date().toISOString() };
+    case 'ready_for_mitigation':
+      return { state: 'mitigation_ready', closedAt: null };
+    case 'verified_active':
+      return { state: 'verified_active', closedAt: null };
+    case 'new_incident':
+    case 'severity_increased':
+      return { state: 'open', closedAt: null };
+    case 'unchanged':
+      return null;
+  }
+}
+
+function transitionDisposition(transition: IncidentTransition): DecisionDisposition | null {
+  const disposition = transition.evidence['disposition'];
+  return typeof disposition === 'string' ? (disposition as DecisionDisposition) : null;
+}
+
+function transitionNextStage(transition: IncidentTransition): DecisionNextStage | null {
+  const nextStage = transition.evidence['next_stage'] ?? transition.evidence['recommended_next_stage'];
+  return typeof nextStage === 'string' ? (nextStage as DecisionNextStage) : null;
+}
+
 export async function markSnsMessageProcessed(
   client: DatabaseClient,
   snsMessageId: string
@@ -441,11 +490,6 @@ export async function enqueueAlarmTriggerOnce(
       if ((inserted.rowCount ?? 0) === 0) {
         await tx.query('COMMIT');
         return { duplicate: true, enqueued: false };
-      }
-
-      if (input.newState !== 'ALARM') {
-        await tx.query('COMMIT');
-        return { duplicate: false, enqueued: false };
       }
 
       const result = await tx.query<{ id: string }>(
@@ -830,6 +874,7 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
     );
     const transitions = transitionsFromDecision(previous, decision);
     await this.recordIncidentEvents(runId, transitionEvents('Decide', transitions));
+    await this.applyIncidentTransitions(runId, transitions);
     return transitions;
   }
 
@@ -846,7 +891,43 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
     );
     const transitions = transitionsFromVerification(previous, verification);
     await this.recordIncidentEvents(runId, transitionEvents('Verify', transitions));
+    await this.applyIncidentTransitions(runId, transitions);
     return transitions;
+  }
+
+  private async applyIncidentTransitions(
+    runId: string | undefined,
+    transitions: IncidentTransition[]
+  ): Promise<void> {
+    if (!runId || transitions.length === 0) {
+      return;
+    }
+
+    for (const transition of transitions) {
+      const state = incidentStateFromTransition(transition);
+      if (!state) {
+        continue;
+      }
+      await this.client.query(
+        `UPDATE incidents
+         SET state = $2,
+             closed_at = $3,
+             severity = $4,
+             current_disposition = COALESCE($5, current_disposition),
+             current_next_stage = COALESCE($6, current_next_stage),
+             last_run_id = $7
+         WHERE incident_id = $1`,
+        [
+          transition.incidentId,
+          state.state,
+          state.closedAt,
+          transition.severity,
+          transitionDisposition(transition),
+          transitionNextStage(transition),
+          runId,
+        ]
+      );
+    }
   }
 
   async hasAlert(dedupeKey: string): Promise<boolean> {
@@ -890,7 +971,7 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
     const result = await this.client.query<{ count: string }>(
       `SELECT count(*)::text AS count
        FROM alarm_triggers
-       WHERE status = 'pending' AND new_state IN ('ALARM', 'INSUFFICIENT_DATA')`
+       WHERE status = 'pending' AND new_state IN ('ALARM', 'OK', 'INSUFFICIENT_DATA')`
     );
     return Number(result.rows[0]?.count ?? 0);
   }
@@ -901,7 +982,7 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
       const pending = await this.client.query<{ id: string }>(
         `SELECT id
          FROM alarm_triggers
-         WHERE status = 'pending' AND new_state IN ('ALARM', 'INSUFFICIENT_DATA')
+         WHERE status = 'pending' AND new_state IN ('ALARM', 'OK', 'INSUFFICIENT_DATA')
          ORDER BY received_at
          FOR UPDATE SKIP LOCKED`
       );
@@ -995,9 +1076,81 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
     return row ? { runId: row.run_id } : null;
   }
 
+  async findOpenAlarmIncidentForRecovery(
+    trigger: Pick<AlarmTriggerRow, 'spec_key' | 'alarm_name'>
+  ): Promise<{ incident: RecoveryIncidentCandidate | null; ambiguous: boolean }> {
+    const result = await this.client.query<{
+      incident_id: string;
+      title: string;
+      severity: Severity;
+      service: string | null;
+      state: string | null;
+      closed_at: Date | string | null;
+      match_rank: number;
+    }>(
+      `WITH candidates AS (
+         SELECT i.incident_id,
+                i.title,
+                i.severity,
+                i.service,
+                i.state,
+                i.closed_at,
+                CASE WHEN $1::text IS NOT NULL AND at.spec_key = $1 THEN 0 ELSE 1 END AS match_rank,
+                at.processed_at,
+                e.created_at,
+                row_number() OVER (
+                  PARTITION BY i.incident_id
+                  ORDER BY
+                    CASE WHEN $1::text IS NOT NULL AND at.spec_key = $1 THEN 0 ELSE 1 END,
+                    at.processed_at DESC NULLS LAST,
+                    e.created_at DESC
+                ) AS rn
+         FROM alarm_triggers at
+         JOIN incident_events e ON e.run_id = at.run_id
+         JOIN incidents i ON i.incident_id = e.incident_id
+         WHERE at.new_state = 'ALARM'
+           AND at.status = 'done'
+           AND at.run_id IS NOT NULL
+           AND i.closed_at IS NULL
+           AND i.state NOT IN ('resolved', 'closed')
+           AND (
+             ($1::text IS NOT NULL AND at.spec_key = $1)
+             OR at.alarm_name = $2
+           )
+           AND (
+             e.evidence_json->'signals'->'alarms' ? $2
+             OR e.evidence_json->'alarms' ? $2
+             OR e.evidence_json::text ILIKE '%' || $2 || '%'
+           )
+       )
+       SELECT incident_id, title, severity, service, state, closed_at, match_rank
+       FROM candidates
+       WHERE rn = 1
+       ORDER BY match_rank, processed_at DESC NULLS LAST, created_at DESC, incident_id
+       LIMIT 2`,
+      [trigger.spec_key, trigger.alarm_name]
+    );
+
+    const rows = result.rows;
+    const first = rows[0];
+    if (!first) {
+      return { incident: null, ambiguous: false };
+    }
+
+    return {
+      incident: {
+        incidentId: first.incident_id,
+        title: first.title,
+        severity: first.severity,
+        service: first.service,
+        state: first.state,
+        closedAt: first.closed_at ? toIso(first.closed_at) : null,
+      },
+      ambiguous: rows.length > 1,
+    };
+  }
+
   async getAgingPendingAlarmTriggers(olderThanMs: number): Promise<AgingPendingTriggersSummary> {
-    // Scoped to the same `new_state` filter the claim query uses: `OK` rows are intentionally
-    // left `pending` forever pending T7 and are not backlog, so they must not count as "stuck".
     const result = await this.client.query<{
       count: string;
       oldest_received_at: Date | string | null;
@@ -1005,7 +1158,7 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
       `SELECT count(*)::text AS count, min(received_at) AS oldest_received_at
        FROM alarm_triggers
        WHERE status = 'pending'
-         AND new_state IN ('ALARM', 'INSUFFICIENT_DATA')
+         AND new_state IN ('ALARM', 'OK', 'INSUFFICIENT_DATA')
          AND received_at < now() - make_interval(secs => $1::double precision / 1000)`,
       [olderThanMs]
     );

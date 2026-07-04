@@ -76,6 +76,12 @@ describe('metrics', () => {
         'alarm_pipeline.cooldown_attached',
         'alarm_pipeline.coalesced',
         'alarm_pipeline.investigations_launched',
+        'alarm_pipeline.recovery_verify_attempted',
+        'alarm_pipeline.recovery_verify_confirmed',
+        'alarm_pipeline.recovery_verify_failed',
+        'alarm_pipeline.recovery_verify_error',
+        'alarm_pipeline.recovery_no_open_incident',
+        'alarm_pipeline.insufficient_data_ignored',
       ]);
     });
 
