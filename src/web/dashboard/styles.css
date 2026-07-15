@@ -162,6 +162,73 @@ select {
   background: #f9fafb;
 }
 
+.operator-readout {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.8fr) minmax(0, 1.2fr);
+  gap: 18px;
+  margin-top: 12px;
+  padding: 18px;
+  border: 1px solid #d8e0e3;
+  border-left-width: 8px;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.readout-green {
+  border-left-color: #16875d;
+}
+
+.readout-yellow {
+  border-left-color: #b7791f;
+}
+
+.readout-red {
+  border-left-color: #c2413a;
+}
+
+.readout-stale {
+  border-left-color: #5b6472;
+}
+
+.readout-lede {
+  min-width: 0;
+}
+
+.readout-lede h2 {
+  margin: 0 0 8px;
+  color: #172023;
+  font-size: 22px;
+  line-height: 1.1;
+  letter-spacing: 0;
+}
+
+.readout-lede p,
+.readout-grid p {
+  margin: 0;
+  color: #455257;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.readout-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.readout-grid div {
+  min-width: 0;
+}
+
+.readout-grid span {
+  display: block;
+  margin-bottom: 6px;
+  color: #617176;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
 .panel {
   min-height: 340px;
   padding: 16px;
@@ -318,6 +385,8 @@ a:hover {
   .status-band,
   .metrics-grid,
   .content-grid,
+  .operator-readout,
+  .readout-grid,
   .run-strip {
     grid-template-columns: 1fr;
   }

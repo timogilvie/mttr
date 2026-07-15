@@ -90,6 +90,9 @@ describe('incident detail', () => {
 
     expect(html).toContain('finding-abc123');
     expect(html).toContain('Ready');
+    expect(html).toContain('Operator Readout');
+    expect(html).toContain('Action needed');
+    expect(html).toContain('Closure Gate');
     expect(html).toContain('4xx spike');
     expect(html).toContain('upstream_of: auth-service');
     expect(html).toContain('duplicate_of: INC-000');
@@ -127,7 +130,67 @@ describe('incident detail', () => {
     );
 
     expect(html).toContain('resolved');
+    expect(html).toContain('Closed');
     expect(html).toContain('Recovered transient incident');
+  });
+
+  it('renders why an inconclusive incident remains open and what to check next', () => {
+    const html = renderToStaticMarkup(
+      <IncidentDetail
+        data={detail({
+          incident: {
+            ...detail().incident,
+            title: 'High detector errors in deltaone-anomaly-detection',
+            state: 'open',
+            currentDisposition: 'CONTINUE_INVESTIGATION',
+            currentNextStage: 'Investigate',
+            closedAt: null,
+          },
+          events: [
+            {
+              id: 'investigate-2',
+              incidentId: 'finding-abc123',
+              runId: 'run-5',
+              stage: 'Investigate',
+              message: 'POSSIBLE_INCIDENT: High detector errors',
+              severity: 'HIGH',
+              evidence: {
+                confirmed_facts: ['670 detector errors observed'],
+                supporting_evidence: ['Auth errors occur during the RPC block-number call'],
+                unresolved_evidence_requirements: [
+                  {
+                    description: 'Confirm whether RPC authorization failures are still occurring',
+                    tool_hint: 'Query detector Lambda logs for authorization errors',
+                  },
+                ],
+              },
+              createdAt: new Date().toISOString(),
+            },
+            {
+              id: 'decide-2',
+              incidentId: 'finding-abc123',
+              runId: 'run-5',
+              stage: 'Decide',
+              message: 'CONTINUE_INVESTIGATION: next=Investigate',
+              severity: 'HIGH',
+              evidence: {
+                disposition: 'CONTINUE_INVESTIGATION',
+                next_stage: 'Investigate',
+                rationale: 'Incident is confirmed, but root-cause evidence is not sufficient for mitigation.',
+                follow_up_actions: ['Check the downstream RPC/API credentials and authorization policy'],
+              },
+              createdAt: new Date().toISOString(),
+            },
+          ],
+        })}
+      />
+    );
+
+    expect(html).toContain('Still open');
+    expect(html).toContain('Needs more evidence before closure');
+    expect(html).toContain('Check the downstream RPC/API credentials');
+    expect(html).toContain('670 detector errors observed');
+    expect(html).toContain('RPC block-number call');
   });
 
   it('renders an observability-gap timeline', () => {
