@@ -281,6 +281,73 @@ describe('Orchestrator', () => {
     orchestrator.stop();
   });
 
+  it('produces and persists a mitigation proposal for a confirmed incident', async () => {
+    const classifyStage = await import('../stages/classify.js');
+    const investigateStage = await import('../stages/investigate.js');
+    await mockReport();
+
+    const confirmedInvestigation: StageResult = {
+      stage: 'Investigate',
+      status: 'success',
+      timestamp: 't',
+      data: {
+        summary: 'confirmed',
+        overall_assessment: 'ACTIVE_INCIDENT',
+        overall_severity: 'HIGH',
+        investigations: [
+          {
+            incident_id: 'INC-conf',
+            title: 'High detector errors',
+            original_classification: 'AUTH_FAILURE',
+            investigation_status: 'CONFIRMED_INCIDENT',
+            severity: 'HIGH',
+            confidence: 0.9,
+            affected_services: ['deltaone-anomaly-detection'],
+            confirmed_facts: ['670 detector errors.'],
+            supporting_evidence: ['403 then 401 on the RPC call.'],
+            contradicting_evidence: [],
+            likely_causes: [
+              { cause: 'Downstream auth failure.', confidence: 0.86, evidence: ['403 errors.'] },
+            ],
+            unknowns: [],
+            additional_data_needed: [],
+            unresolved_evidence_requirements: [],
+            recommended_next_investigation_steps: [],
+            requires_more_evidence_before_mitigation: false,
+            possible_future_remediation: [],
+            mitigation_confidence: 'high',
+          },
+        ],
+        cross_cutting_observations: [],
+        priority_order: [],
+      },
+    };
+
+    vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
+    vi.mocked(investigateStage.run).mockResolvedValue(confirmedInvestigation);
+
+    const proposalsSpy = vi
+      .spyOn(FileAgentStateRepository.prototype, 'recordMitigationProposals')
+      .mockResolvedValue();
+
+    const config = { ...mockConfig, monitoring: { ...mockConfig.monitoring, intervalMs: 1_000_000 } };
+    const orchestrator = new Orchestrator(config);
+    orchestrator.start();
+
+    await vi.waitFor(() => expect(proposalsSpy).toHaveBeenCalledTimes(1));
+
+    const mitigation = proposalsSpy.mock.calls[0]?.[1];
+    expect(mitigation?.proposals).toHaveLength(1);
+    expect(mitigation?.proposals[0]).toMatchObject({
+      incident_id: 'INC-conf',
+      action_kind: 'credential_rotation',
+      requires_human_approval: true,
+    });
+
+    orchestrator.stop();
+    proposalsSpy.mockRestore();
+  });
+
   it('passes canonical incident ids to downstream stages', async () => {
     const classifyStage = await import('../stages/classify.js');
     const investigateStage = await import('../stages/investigate.js');

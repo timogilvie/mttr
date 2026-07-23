@@ -342,6 +342,87 @@ export interface DecisionResult {
   handoff_notes: string[];
 }
 
+/**
+ * Mitigate produces *proposals*, never actions. The tool layer is read-only by construction and
+ * nothing in this pipeline executes a change; a proposal is a reviewable recommendation carrying
+ * enough structure for a human to judge it in seconds and for Restore to later confirm whether it
+ * was applied and whether it worked.
+ */
+export type MitigationActionKind =
+  | 'rollback'
+  | 'restart'
+  | 'scale'
+  | 'config_change'
+  | 'credential_rotation'
+  | 'dependency_failover'
+  | 'instrumentation'
+  | 'no_action'
+  | 'other';
+
+/** How hard the action is to undo. `irreversible` must never be automated, at any confidence. */
+export type MitigationReversibility = 'trivial' | 'manual' | 'irreversible';
+
+export type MitigationTargetKind =
+  | 'ecs_service'
+  | 'lambda_function'
+  | 'load_balancer'
+  | 'eventbridge_rule'
+  | 'log_group'
+  | 'alarm'
+  | 'unknown';
+
+export interface MitigationTarget {
+  kind: MitigationTargetKind;
+  identifier: string;
+  region?: string | undefined;
+}
+
+/** A Verify-stage check, named up front, that would show the mitigation worked. */
+export interface MitigationCheckSpec {
+  tool: string;
+  target: string;
+}
+
+export interface MitigationSuccessSignal {
+  description: string;
+  checks: MitigationCheckSpec[];
+}
+
+export interface MitigationProposal {
+  incident_id: string;
+  title: string;
+  action: string;
+  action_kind: MitigationActionKind;
+  target: MitigationTarget;
+  /** The specific `likely_cause` this addresses — if that cause is wrong, so is the proposal. */
+  addresses_cause: string;
+  cause_confidence: number | null;
+  evidence_refs: string[];
+  proposal_confidence: MitigationConfidence;
+  /** Outstanding evidence requirements, carried rather than used to suppress the proposal. */
+  evidence_gaps: string[];
+  preconditions: string[];
+  rollback_plan: string[];
+  blast_radius: string;
+  reversibility: MitigationReversibility;
+  success_signal: MitigationSuccessSignal;
+  /** Always true today. Kept explicit so removing it is a visible, deliberate change. */
+  requires_human_approval: true;
+}
+
+export interface MitigationResult {
+  summary: string;
+  proposals: MitigationProposal[];
+}
+
+/** Lifecycle of a recorded proposal. Nothing sets these but `proposed`/`superseded` yet. */
+export type MitigationOutcome =
+  | 'proposed'
+  | 'accepted'
+  | 'rejected'
+  | 'superseded'
+  | 'expired';
+
 export type VerificationStatus =
   | 'VERIFIED_ACTIVE_INCIDENT'
   | 'VERIFIED_RECOVERED_TRANSIENT'
@@ -384,6 +465,12 @@ export interface StageResult {
   stage: Stage;
   status: 'success' | 'error' | 'not_implemented';
   timestamp: string;
-  data?: ClassificationResult | InvestigationResult | DecisionResult | VerificationResult | { message: string };
+  data?:
+    | ClassificationResult
+    | InvestigationResult
+    | DecisionResult
+    | VerificationResult
+    | MitigationResult
+    | { message: string };
   error?: string;
 }

@@ -61,6 +61,41 @@ function isTransientCandidate(investigation: Investigation): boolean {
   );
 }
 
+/**
+ * The bar for *proposing* a mitigation, which is lower than the bar for taking one.
+ *
+ * Mitigate emits a reviewable proposal and never acts, so suppressing a proposal because evidence
+ * gaps remain costs more than it saves: the gaps ride along on the proposal itself. This also
+ * consults `mitigation_confidence` — the field the Investigate prompt computes from a corroborated
+ * causal chain — which nothing previously read. Without it the gate never opened: every production
+ * incident to date routed to CONTINUE_INVESTIGATION, VERIFY, or a close, and never once to
+ * Mitigate.
+ *
+ * `requires_more_evidence_before_mitigation` is deliberately *not* a blocker here. It becomes a
+ * label on the proposal, and the incident stays open for the sweep to keep driving.
+ */
+function meetsProposalBar(investigation: Investigation): boolean {
+  if (investigation.investigation_status === 'CONFIRMED_INCIDENT') {
+    return true;
+  }
+  return (
+    investigation.investigation_status === 'POSSIBLE_INCIDENT' &&
+    investigation.mitigation_confidence === 'high'
+  );
+}
+
+function proposalRationale(investigation: Investigation): string {
+  if (investigation.investigation_status !== 'CONFIRMED_INCIDENT') {
+    return (
+      'Not fully confirmed, but causal evidence is strong enough (mitigation_confidence=high) ' +
+      'to propose a mitigation for human review.'
+    );
+  }
+  return investigation.requires_more_evidence_before_mitigation
+    ? 'Confirmed incident; proposing a mitigation with the outstanding evidence gaps recorded on it.'
+    : 'Confirmed incident with enough root-cause evidence to propose a mitigation.';
+}
+
 function decideInvestigation(investigation: Investigation): IncidentDecision {
   const actions = unresolvedActions(investigation);
   const base = {
@@ -71,25 +106,12 @@ function decideInvestigation(investigation: Investigation): IncidentDecision {
     evidence_to_pass: evidenceToPass(investigation),
   };
 
-  if (
-    investigation.investigation_status === 'CONFIRMED_INCIDENT' &&
-    !investigation.requires_more_evidence_before_mitigation
-  ) {
+  if (meetsProposalBar(investigation)) {
     return {
       ...base,
       disposition: 'MITIGATE',
       next_stage: 'Mitigate',
-      rationale: 'Confirmed incident with enough root-cause evidence to choose a mitigation.',
-      follow_up_actions: actions,
-    };
-  }
-
-  if (investigation.investigation_status === 'CONFIRMED_INCIDENT') {
-    return {
-      ...base,
-      disposition: 'CONTINUE_INVESTIGATION',
-      next_stage: 'Investigate',
-      rationale: 'Incident is confirmed, but root-cause evidence is not sufficient for mitigation.',
+      rationale: proposalRationale(investigation),
       follow_up_actions: actions,
     };
   }

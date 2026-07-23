@@ -8,10 +8,12 @@ import type {
 import type { IncidentTransition } from '../state/transitions.js';
 import {
   AlertDeliveryError,
+  sendMitigationProposalAlerts,
   sendSlackAlerts,
   slackDedupeKey,
   type SlackFetch,
 } from '../alerts/slack.js';
+import type { MitigationProposal } from '../types.js';
 
 function config(overrides: Partial<Config['alerts']['slack']> = {}): Config {
   return {
@@ -255,6 +257,93 @@ describe('Slack alerts', () => {
       ],
       fetchImpl
     );
+
+    expect(result[0]?.status).toBe('skipped');
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(alerts).toHaveLength(0);
+  });
+});
+
+function proposal(overrides: Partial<MitigationProposal> = {}): MitigationProposal {
+  return {
+    incident_id: 'INC-001',
+    title: 'High detector errors',
+    action: 'Rotate the detector RPC credential.',
+    action_kind: 'credential_rotation',
+    target: { kind: 'lambda_function', identifier: 'hokusai-detector', region: 'us-east-1' },
+    addresses_cause: 'Downstream auth failure.',
+    cause_confidence: 0.86,
+    evidence_refs: ['659 repeated 403 errors.'],
+    proposal_confidence: 'high',
+    evidence_gaps: ['Remote host unknown.'],
+    preconditions: ['Confirm which credential the call uses.'],
+    rollback_plan: ['Keep the old credential valid until confirmed.'],
+    blast_radius: 'Every consumer of the credential.',
+    reversibility: 'manual',
+    success_signal: { description: 'Errors clear.', checks: [] },
+    requires_human_approval: true,
+    ...overrides,
+  };
+}
+
+describe('mitigation proposal alerts', () => {
+  it('sends a review-request payload leading with the action, and states nothing was executed', async () => {
+    const { repo, alerts } = repository();
+    const bodies: string[] = [];
+    const fetchImpl = okFetch(bodies);
+
+    const result = await sendMitigationProposalAlerts(config(), repo, 'run-1', [proposal()], fetchImpl);
+
+    expect(result[0]?.status).toBe('sent');
+    const payload = sentPayload(bodies);
+    expect(payload['text']).toContain('mitigation proposed');
+    const rendered = JSON.stringify(payload);
+    expect(rendered).toContain('Rotate the detector RPC credential.');
+    expect(rendered).toContain('manual');
+    expect(rendered).toContain('No action has been taken');
+    expect(rendered).toContain('/api/incidents/INC-001/brief');
+    expect(alerts[0]?.dedupeKey).toBe(
+      'slack:INC-001:mitigation_proposed:credential_rotation:hokusai-detector:high'
+    );
+  });
+
+  it('does not alert for a no_action proposal but still returns a result', async () => {
+    const { repo, alerts } = repository();
+    const fetchImpl = okFetch();
+
+    const result = await sendMitigationProposalAlerts(
+      config(),
+      repo,
+      'run-1',
+      [proposal({ action_kind: 'no_action', action: 'No mitigation recommended.' })],
+      fetchImpl
+    );
+
+    expect(result[0]?.status).toBe('skipped');
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(alerts).toHaveLength(0);
+  });
+
+  it('dedupes an unchanged proposal on re-run', async () => {
+    const existingKey =
+      'slack:INC-001:mitigation_proposed:credential_rotation:hokusai-detector:high';
+    const { repo } = repository(new Set([existingKey]));
+    const fetchImpl = okFetch();
+
+    const result = await sendMitigationProposalAlerts(config(), repo, 'run-2', [proposal()], fetchImpl);
+
+    expect(result[0]?.status).toBe('deduped');
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('skips delivery when no webhook is configured but the proposal is still persisted elsewhere', async () => {
+    const { repo, alerts } = repository();
+    const fetchImpl = okFetch();
+
+    const noWebhook = config();
+    delete (noWebhook.alerts.slack as { webhookUrl?: string }).webhookUrl;
+
+    const result = await sendMitigationProposalAlerts(noWebhook, repo, 'run-1', [proposal()], fetchImpl);
 
     expect(result[0]?.status).toBe('skipped');
     expect(fetchImpl).not.toHaveBeenCalled();

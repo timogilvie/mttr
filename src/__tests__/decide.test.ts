@@ -86,6 +86,49 @@ describe('Decide stage', () => {
     expect(decision.decisions[0]?.disposition).toBe('MITIGATE');
   });
 
+  it('still proposes a mitigation for a confirmed incident that wants more evidence', () => {
+    // The gap becomes a label on the proposal, not a reason to withhold it — otherwise the
+    // Mitigate gate never opens (no production incident ever cleared the old both-conditions bar).
+    const decision = decide(
+      result([
+        investigation({
+          investigation_status: 'CONFIRMED_INCIDENT',
+          requires_more_evidence_before_mitigation: true,
+        }),
+      ])
+    );
+
+    expect(decision.overall_next_stage).toBe('Mitigate');
+    expect(decision.decisions[0]?.disposition).toBe('MITIGATE');
+  });
+
+  it('proposes a mitigation for a possible incident when mitigation_confidence is high', () => {
+    const decision = decide(
+      result([
+        investigation({
+          investigation_status: 'POSSIBLE_INCIDENT',
+          mitigation_confidence: 'high',
+        }),
+      ])
+    );
+
+    expect(decision.decisions[0]?.disposition).toBe('MITIGATE');
+    expect(decision.decisions[0]?.rationale).toContain('mitigation_confidence=high');
+  });
+
+  it('does not propose a mitigation for a possible incident with only medium confidence', () => {
+    const decision = decide(
+      result([
+        investigation({
+          investigation_status: 'POSSIBLE_INCIDENT',
+          mitigation_confidence: 'medium',
+        }),
+      ])
+    );
+
+    expect(decision.decisions[0]?.disposition).not.toBe('MITIGATE');
+  });
+
   it('routes observability gaps to follow-up work without response stages', () => {
     const decision = decide(
       result([

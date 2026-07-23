@@ -1,3 +1,4 @@
+import type { MitigationProposal } from '../../types.js';
 import type { IncidentSummary, TransitionEvent } from './statusTypes.js';
 import { deriveOperatorReadout } from './operatorReadout.js';
 
@@ -12,8 +13,38 @@ import { deriveOperatorReadout } from './operatorReadout.js';
 export interface IncidentBriefInput {
   incident: IncidentSummary;
   events: TransitionEvent[];
+  /** The incident's current (non-superseded) mitigation proposal, if one exists. */
+  proposal?: MitigationProposal | null;
   /** Injected so output is deterministic in tests. */
   now?: Date;
+}
+
+function proposalSection(proposal: MitigationProposal): string[] {
+  const confidence =
+    proposal.cause_confidence === null
+      ? proposal.proposal_confidence
+      : `${proposal.proposal_confidence} (cause ${proposal.cause_confidence.toFixed(2)})`;
+  return [
+    '## Proposed mitigation (needs human approval — not executed)',
+    '',
+    `**Action** (${proposal.action_kind}): ${proposal.action}`,
+    '',
+    `- **Target**: ${proposal.target.kind} \`${proposal.target.identifier}\``,
+    `- **Addresses**: ${proposal.addresses_cause}`,
+    `- **Confidence**: ${confidence}`,
+    `- **Reversibility**: ${proposal.reversibility}`,
+    `- **Blast radius**: ${proposal.blast_radius}`,
+    ...(proposal.preconditions.length > 0
+      ? ['', '_Check first:_', ...proposal.preconditions.map((item) => `- ${item}`)]
+      : []),
+    ...(proposal.rollback_plan.length > 0
+      ? ['', '_Rollback:_', ...proposal.rollback_plan.map((item) => `- ${item}`)]
+      : []),
+    ...(proposal.success_signal.description
+      ? ['', `_Success signal:_ ${proposal.success_signal.description}`]
+      : []),
+    '',
+  ];
 }
 
 function relativeAge(value: string | null | undefined, nowMs: number): string {
@@ -50,7 +81,12 @@ function bullets(items: string[]): string[] {
   return items.map((item) => `- ${item}`);
 }
 
-export function buildIncidentBrief({ incident, events, now }: IncidentBriefInput): string {
+export function buildIncidentBrief({
+  incident,
+  events,
+  proposal,
+  now,
+}: IncidentBriefInput): string {
   const nowMs = (now ?? new Date()).getTime();
   const readout = deriveOperatorReadout(incident, events);
 
@@ -108,6 +144,7 @@ export function buildIncidentBrief({ incident, events, now }: IncidentBriefInput
     '',
     readout.closeGate,
     '',
+    ...(proposal ? proposalSection(proposal) : []),
     ...section('Likely causes', causes),
     ...section('Recommended next checks', bullets(readout.nextActions)),
     ...section('Open evidence requirements', requirements),

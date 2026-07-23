@@ -186,6 +186,7 @@ class FakeApiDatabase implements DatabaseClient {
       metadata_json: { version: 'test' },
     },
   ];
+  mitigationProposals: Array<Record<string, unknown>> = [];
   processedSnsMessages = new Set<string>();
   alarmTriggers: FakeAlarmTriggerRow[] = [];
   failAlarmTriggerInsert = false;
@@ -294,6 +295,13 @@ class FakeApiDatabase implements DatabaseClient {
     }
     if (normalized.includes('FROM alerts')) {
       return result<T>(this.alerts as unknown as T[]);
+    }
+    if (normalized.includes('FROM mitigation_proposals')) {
+      return result<T>(
+        this.mitigationProposals.filter(
+          (row) => row['incident_id'] === params[0]
+        ) as unknown as T[]
+      );
     }
 
     throw new Error(`Unexpected query: ${text}`);

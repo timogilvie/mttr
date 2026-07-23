@@ -7,6 +7,7 @@ import type {
   DecisionDisposition,
   DecisionNextStage,
   InvestigationResult,
+  MitigationResult,
   Severity,
   Stage,
   VerificationResult,
@@ -168,6 +169,10 @@ export interface AgentStateRepository {
   recordAlertSent?(alert: AlertRecordInput): Promise<void>;
   /** Open incidents with no activity for `olderThanMs`, oldest first (stale-incident sweep). */
   findStaleIncidents?(olderThanMs: number, limit: number): Promise<StaleIncidentRow[]>;
+  recordMitigationProposals?(
+    runId: string | undefined,
+    result: MitigationResult
+  ): Promise<void>;
   close?(): Promise<void>;
 
   // Alarm trigger queue (T5) — optional; only implemented for the Postgres backend.
@@ -264,6 +269,13 @@ export class FileAgentStateRepository implements AgentStateRepository {
   async findStaleIncidents(_olderThanMs: number, _limit: number): Promise<StaleIncidentRow[]> {
     // The file backend keeps no incident table, so there is nothing to sweep.
     return [];
+  }
+
+  async recordMitigationProposals(
+    _runId: string | undefined,
+    _result: MitigationResult
+  ): Promise<void> {
+    return;
   }
 
   async reclaimStaleClaimedTriggers(_olderThanMs: number): Promise<number> {
@@ -1045,6 +1057,49 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
       evidenceToPass: decisionStringList(row.current_decision_json, 'evidence_to_pass'),
       followUpActions: decisionStringList(row.current_decision_json, 'follow_up_actions'),
     }));
+  }
+
+  /**
+   * Records this run's proposals and supersedes the incident's previous outstanding ones, so
+   * "the current proposal" is always unambiguous while the full history stays auditable.
+   * Superseding only touches rows still in `proposed` — a human's accept/reject is never
+   * overwritten by a later run.
+   */
+  async recordMitigationProposals(
+    runId: string | undefined,
+    result: MitigationResult
+  ): Promise<void> {
+    if (!runId || result.proposals.length === 0) {
+      return;
+    }
+
+    for (const proposal of result.proposals) {
+      await this.client.query(
+        `UPDATE mitigation_proposals
+         SET outcome = 'superseded', outcome_at = now()
+         WHERE incident_id = $1 AND outcome = 'proposed'`,
+        [proposal.incident_id]
+      );
+
+      await this.client.query(
+        `INSERT INTO mitigation_proposals (
+           incident_id, run_id, action, action_kind, target_kind, target_identifier,
+           proposal_confidence, reversibility, proposal_json
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
+        [
+          proposal.incident_id,
+          runId,
+          proposal.action,
+          proposal.action_kind,
+          proposal.target.kind,
+          proposal.target.identifier,
+          proposal.proposal_confidence,
+          proposal.reversibility,
+          JSON.stringify(sanitizeForStorage(proposal)),
+        ]
+      );
+    }
   }
 
   async reclaimStaleClaimedTriggers(olderThanMs: number): Promise<number> {

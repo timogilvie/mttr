@@ -298,6 +298,12 @@ select {
   text-transform: uppercase;
 }
 
+.readout-grid code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-word;
+}
+
 .panel {
   min-height: 340px;
   padding: 16px;

@@ -150,6 +150,37 @@ ALTER TABLE runs
   ADD COLUMN IF NOT EXISTS trigger_source text NOT NULL DEFAULT 'scheduled';
 `,
   },
+  {
+    id: 3,
+    name: 'mitigation_proposals',
+    sql: `
+CREATE TABLE IF NOT EXISTS mitigation_proposals (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  incident_id text NOT NULL REFERENCES incidents(incident_id) ON DELETE CASCADE,
+  run_id uuid REFERENCES runs(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  action text NOT NULL,
+  action_kind text NOT NULL,
+  target_kind text NOT NULL,
+  target_identifier text NOT NULL,
+  proposal_confidence text NOT NULL CHECK (proposal_confidence IN ('high', 'medium', 'low')),
+  reversibility text NOT NULL CHECK (reversibility IN ('trivial', 'manual', 'irreversible')),
+  -- Nothing sets anything but 'proposed'/'superseded' yet. Recording the outcome is what makes
+  -- proposal precision measurable, which is the evidence any future automation must be gated on.
+  outcome text NOT NULL DEFAULT 'proposed'
+    CHECK (outcome IN ('proposed', 'accepted', 'rejected', 'superseded', 'expired')),
+  outcome_at timestamptz,
+  outcome_note text,
+  proposal_json jsonb NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS mitigation_proposals_incident_created_idx
+  ON mitigation_proposals (incident_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS mitigation_proposals_outcome_idx
+  ON mitigation_proposals (outcome, created_at DESC);
+`,
+  },
 ];
 
 export async function runMigrations(client: DatabaseClient): Promise<void> {

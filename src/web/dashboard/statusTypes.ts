@@ -1,3 +1,4 @@
+import type { MitigationProposal, MitigationOutcome } from '../../types.js';
 import type { Severity } from '../../types.js';
 
 export type DashboardStatus = 'green' | 'yellow' | 'red';
@@ -86,10 +87,22 @@ export interface StatusResponse {
   recentTransitions: TransitionEvent[];
 }
 
+export interface MitigationProposalSummary {
+  id: string;
+  incidentId: string;
+  runId: string | null;
+  createdAt: string | null;
+  outcome: MitigationOutcome;
+  outcomeAt: string | null;
+  outcomeNote: string | null;
+  proposal: MitigationProposal | null;
+}
+
 export interface IncidentDetailResponse {
   incident: IncidentSummary;
   events: TransitionEvent[];
   alerts: AlertSummary[];
+  mitigationProposals?: MitigationProposalSummary[];
 }
 
 export interface RunDetailResponse {
