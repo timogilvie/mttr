@@ -50,6 +50,7 @@ const mockConfig: Config = {
   },
   monitoring: {
     intervalMs: 1000,
+    sweep: { enabled: false, staleAfterMs: 21600000, maxIncidents: 3 },
   },
   state: {
     backend: 'file',
@@ -265,7 +266,7 @@ describe('Orchestrator', () => {
     vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
     vi.mocked(investigateStage.run).mockResolvedValue(investigateResult);
 
-    const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+    const config = { ...mockConfig, monitoring: { ...mockConfig.monitoring, intervalMs: 1_000_000 } };
     const orchestrator = new Orchestrator(config);
     orchestrator.start();
 
@@ -323,7 +324,7 @@ describe('Orchestrator', () => {
     });
     vi.mocked(investigateStage.run).mockResolvedValue(investigateResult);
 
-    const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+    const config = { ...mockConfig, monitoring: { ...mockConfig.monitoring, intervalMs: 1_000_000 } };
     const orchestrator = new Orchestrator(config);
     orchestrator.start();
 
@@ -347,7 +348,7 @@ describe('Orchestrator', () => {
       data: { summary: '', overall_severity: 'NONE', incidents: [], findings: [] },
     });
 
-    const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+    const config = { ...mockConfig, monitoring: { ...mockConfig.monitoring, intervalMs: 1_000_000 } };
     const orchestrator = new Orchestrator(config);
     orchestrator.start();
 
@@ -405,7 +406,7 @@ describe('Orchestrator', () => {
     vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
     vi.mocked(investigateStage.run).mockResolvedValue(investigateResult);
 
-    const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+    const config = { ...mockConfig, monitoring: { ...mockConfig.monitoring, intervalMs: 1_000_000 } };
     const orchestrator = new Orchestrator(config);
     orchestrator.start();
 
@@ -429,7 +430,7 @@ describe('Orchestrator', () => {
     vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
     vi.mocked(investigateStage.run).mockResolvedValue(investigateResult);
 
-    const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+    const config = { ...mockConfig, monitoring: { ...mockConfig.monitoring, intervalMs: 1_000_000 } };
     const orchestrator = new Orchestrator(config);
     orchestrator.start();
 
@@ -515,7 +516,7 @@ describe('Orchestrator alarm trigger consumer seam (T5)', () => {
     });
     vi.mocked(investigateStage.run).mockReturnValue(pending);
 
-    const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+    const config = { ...mockConfig, monitoring: { ...mockConfig.monitoring, intervalMs: 1_000_000 } };
     const orchestrator = new Orchestrator(config);
 
     expect(orchestrator.investigateBusy).toBe(false);
@@ -569,7 +570,7 @@ describe('Orchestrator alarm trigger consumer seam (T5)', () => {
       });
       vi.mocked(investigateStage.run).mockReturnValue(pending);
 
-      const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+      const config = { ...mockConfig, monitoring: { ...mockConfig.monitoring, intervalMs: 1_000_000 } };
       const orchestrator = new Orchestrator(config);
       orchestrator.start();
 
@@ -603,7 +604,7 @@ describe('Orchestrator alarm trigger consumer seam (T5)', () => {
       });
       vi.mocked(classifyStage.runWithReport).mockReturnValue(pending);
 
-      const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+      const config = { ...mockConfig, monitoring: { ...mockConfig.monitoring, intervalMs: 1_000_000 } };
       const orchestrator = new Orchestrator(config);
       orchestrator.start();
 
@@ -723,7 +724,7 @@ describe('Orchestrator alarm trigger consumer seam (T5)', () => {
         },
       });
 
-      const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+      const config = { ...mockConfig, monitoring: { ...mockConfig.monitoring, intervalMs: 1_000_000 } };
       const orchestrator = new Orchestrator(config);
       orchestrator.start();
 
@@ -788,7 +789,7 @@ describe('Orchestrator alarm trigger consumer seam (T5)', () => {
           return `run-${runCounter}`;
         });
 
-      const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+      const config = { ...mockConfig, monitoring: { ...mockConfig.monitoring, intervalMs: 1_000_000 } };
       const orchestrator = new Orchestrator(config);
       orchestrator.start();
 
@@ -961,6 +962,177 @@ describe('Orchestrator alarm trigger consumer seam (T5)', () => {
     });
   });
 
+  describe('stale incident sweep', () => {
+    const sweepConfig = {
+      ...mockConfig,
+      monitoring: {
+        ...mockConfig.monitoring,
+        intervalMs: 1_000_000,
+        sweep: { enabled: true, staleAfterMs: 3_600_000, maxIncidents: 3 },
+      },
+    };
+
+    const staleRow = {
+      incidentId: 'incident-stale',
+      title: 'High detector errors in deltaone-anomaly-detection',
+      service: 'deltaone-anomaly-detection',
+      severity: 'MEDIUM' as const,
+      state: 'open',
+      lastActivityAt: '2026-06-01T10:00:00Z',
+      currentDisposition: 'VERIFY' as const,
+      currentNextStage: 'Verify' as const,
+      evidenceToPass: ['alarm=hokusai-deltaone-detector-errors-development'],
+      followUpActions: ['Check current CloudWatch alarm state.'],
+    };
+
+    const recoveredVerification: StageResult = {
+      stage: 'Verify',
+      status: 'success',
+      timestamp: 't',
+      data: {
+        summary: 'Recovered.',
+        overall_status: 'VERIFIED_RECOVERED_TRANSIENT',
+        overall_next_stage: 'None',
+        verifications: [
+          {
+            incident_id: 'incident-stale',
+            title: staleRow.title,
+            status: 'VERIFIED_RECOVERED_TRANSIENT',
+            severity: 'MEDIUM',
+            rationale: 'Alarm is OK.',
+            checks: [
+              { tool: 'find_alarms', target: 'a', status: 'passed', evidence: 'state=OK' },
+            ],
+            recommended_next_stage: 'None',
+          },
+        ],
+      },
+    };
+
+    it('re-verifies stale open incidents on ticks where the report is unchanged', async () => {
+      const classifyStage = await import('../stages/classify.js');
+      const verifyStage = await import('../stages/verify.js');
+      await mockReport();
+      vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
+
+      const verifySpy = vi.spyOn(verifyStage, 'run').mockResolvedValue(recoveredVerification);
+      const staleSpy = vi
+        .spyOn(FileAgentStateRepository.prototype, 'findStaleIncidents')
+        .mockResolvedValue([staleRow]);
+      const transitionsSpy = vi
+        .spyOn(FileAgentStateRepository.prototype, 'recordVerificationTransitions')
+        .mockResolvedValue([]);
+
+      const orchestrator = new Orchestrator(sweepConfig);
+      orchestrator.start();
+      // First tick processes the report; the second sees an unchanged fingerprint and sweeps.
+      await vi.waitFor(() => expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1));
+      await orchestrator['runClassifyAsync']({ stage: 'Classify', timestamp: 't' });
+
+      expect(staleSpy).toHaveBeenCalledWith(3_600_000, 3);
+      expect(verifySpy).toHaveBeenCalledTimes(1);
+      // Verify scrapes evidence_to_pass for alarm names, so the stored decision must survive.
+      expect(verifySpy.mock.calls[0]?.[2]).toMatchObject({
+        overall_next_stage: 'Verify',
+        decisions: [
+          expect.objectContaining({
+            incident_id: 'incident-stale',
+            next_stage: 'Verify',
+            evidence_to_pass: ['alarm=hokusai-deltaone-detector-errors-development'],
+          }),
+        ],
+      });
+      expect(transitionsSpy).toHaveBeenCalledWith(
+        undefined,
+        expect.objectContaining({ overall_status: 'VERIFIED_RECOVERED_TRANSIENT' })
+      );
+
+      orchestrator.stop();
+      verifySpy.mockRestore();
+      staleSpy.mockRestore();
+      transitionsSpy.mockRestore();
+    });
+
+    it('does not sweep when the feature is disabled', async () => {
+      const classifyStage = await import('../stages/classify.js');
+      const verifyStage = await import('../stages/verify.js');
+      await mockReport();
+      vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
+
+      const verifySpy = vi.spyOn(verifyStage, 'run').mockResolvedValue(recoveredVerification);
+      const staleSpy = vi
+        .spyOn(FileAgentStateRepository.prototype, 'findStaleIncidents')
+        .mockResolvedValue([staleRow]);
+
+      const orchestrator = new Orchestrator({
+        ...mockConfig,
+        monitoring: { ...mockConfig.monitoring, intervalMs: 1_000_000 },
+      });
+      orchestrator.start();
+      await vi.waitFor(() => expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1));
+      await orchestrator['runClassifyAsync']({ stage: 'Classify', timestamp: 't' });
+
+      expect(staleSpy).not.toHaveBeenCalled();
+      expect(verifySpy).not.toHaveBeenCalled();
+
+      orchestrator.stop();
+      verifySpy.mockRestore();
+      staleSpy.mockRestore();
+    });
+
+    it('still finishes the run when there is nothing stale to sweep', async () => {
+      const classifyStage = await import('../stages/classify.js');
+      const verifyStage = await import('../stages/verify.js');
+      await mockReport();
+      vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
+
+      const verifySpy = vi.spyOn(verifyStage, 'run').mockResolvedValue(recoveredVerification);
+      const staleSpy = vi
+        .spyOn(FileAgentStateRepository.prototype, 'findStaleIncidents')
+        .mockResolvedValue([]);
+
+      const orchestrator = new Orchestrator(sweepConfig);
+      orchestrator.start();
+      await vi.waitFor(() => expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1));
+      await expect(
+        orchestrator['runClassifyAsync']({ stage: 'Classify', timestamp: 't' })
+      ).resolves.toBeUndefined();
+
+      expect(staleSpy).toHaveBeenCalledTimes(1);
+      expect(verifySpy).not.toHaveBeenCalled();
+
+      orchestrator.stop();
+      verifySpy.mockRestore();
+      staleSpy.mockRestore();
+    });
+
+    it('does not fail the run when the stale lookup errors', async () => {
+      const classifyStage = await import('../stages/classify.js');
+      await mockReport();
+      vi.mocked(classifyStage.runWithReport).mockResolvedValue(actionableClassifyResult);
+
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const staleSpy = vi
+        .spyOn(FileAgentStateRepository.prototype, 'findStaleIncidents')
+        .mockRejectedValue(new Error('database is down'));
+
+      const orchestrator = new Orchestrator(sweepConfig);
+      orchestrator.start();
+      await vi.waitFor(() => expect(classifyStage.runWithReport).toHaveBeenCalledTimes(1));
+      await expect(
+        orchestrator['runClassifyAsync']({ stage: 'Classify', timestamp: 't' })
+      ).resolves.toBeUndefined();
+
+      expect(
+        errorSpy.mock.calls.some((call) => String(call[0]).includes('Stale incident lookup failed'))
+      ).toBe(true);
+
+      orchestrator.stop();
+      errorSpy.mockRestore();
+      staleSpy.mockRestore();
+    });
+  });
+
   it('starts the alarm trigger consumer when the webhook feature is enabled', async () => {
     const classifyStage = await import('../stages/classify.js');
     const investigateStage = await import('../stages/investigate.js');
@@ -971,7 +1143,7 @@ describe('Orchestrator alarm trigger consumer seam (T5)', () => {
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
     const config = {
       ...mockConfig,
-      monitoring: { intervalMs: 1_000_000 },
+      monitoring: { ...mockConfig.monitoring, intervalMs: 1_000_000 },
       alarm: {
         ...mockConfig.alarm,
         webhook: { ...mockConfig.alarm.webhook, enabled: true },
@@ -997,7 +1169,7 @@ describe('Orchestrator alarm trigger consumer seam (T5)', () => {
     vi.mocked(investigateStage.run).mockResolvedValue(investigateResult);
 
     const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    const config = { ...mockConfig, monitoring: { intervalMs: 1_000_000 } };
+    const config = { ...mockConfig, monitoring: { ...mockConfig.monitoring, intervalMs: 1_000_000 } };
     const orchestrator = new Orchestrator(config);
 
     orchestrator.start();

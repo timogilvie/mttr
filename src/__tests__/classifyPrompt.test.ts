@@ -25,6 +25,22 @@ describe('classifyPrompt', () => {
     expect(() => buildClassifyPrompt('   \n  ')).toThrow(PromptBuildError);
   });
 
+  it('asks for a stable signal key on both incidents and findings', () => {
+    const prompt = buildClassifyPrompt(sampleReport);
+
+    expect(prompt).toContain('## **Signal Keys**');
+    expect(prompt).toContain('alarm:<exact-alarm-name>');
+    expect(prompt).toContain('The same underlying condition MUST produce the same signal_key');
+    // Once in the incident output schema, once in the finding output schema.
+    expect(prompt.match(/"signal_key": ""/g)).toHaveLength(2);
+  });
+
+  it('forbids magnitude words inside a signal key', () => {
+    const prompt = buildClassifyPrompt(sampleReport);
+
+    expect(prompt).toContain('Never include magnitudes, counts, dates, or severity words.');
+  });
+
   it('includes classification taxonomy', () => {
     const prompt = buildClassifyPrompt(sampleReport);
 

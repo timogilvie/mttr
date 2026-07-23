@@ -7,6 +7,7 @@ import {
   buildClassificationFromSpecs,
   dedupeMandatorySpecs,
   enforceIncidentSpecs,
+  enforceMandatoryIncidents,
   extractActiveAlarmSpecs,
   specDedupeKey,
   type MandatoryIncidentSpec,
@@ -162,5 +163,69 @@ describe('enforceIncidentSpecs', () => {
 
     expect(result.incidents).toHaveLength(1);
     expect(result.incidents[0]?.incident_id).toBe('INC-1');
+  });
+});
+
+describe('mandatory incident signal keys', () => {
+  it('gives report-derived incidents deterministic signal keys', () => {
+    const report = [
+      '### api',
+      '- ECS service: `api-service`',
+      '| Alarm | State | Reason |',
+      '| `hokusai-api-5xx-production` | `ALARM` | breach |',
+      '',
+      '### mlflow',
+      "No datapoints from the detector's liveness metric in this window.",
+    ].join('\n');
+
+    const classification = enforceMandatoryIncidents(
+      { summary: '', overall_severity: 'NONE', incidents: [], findings: [] },
+      report
+    );
+
+    const keys = classification.incidents.map((incident) => incident.signal_key);
+    expect(keys).toContain('alarm:hokusai-api-5xx-production');
+    expect(keys).toContain('mlflow:metric-missing:detector-liveness');
+  });
+
+  it('overrides an LLM-authored signal key with the report-derived one', () => {
+    const report = [
+      '### api',
+      '| Alarm | State | Reason |',
+      '| `hokusai-api-5xx-production` | `ALARM` | breach |',
+    ].join('\n');
+
+    const classification = enforceMandatoryIncidents(
+      {
+        summary: 'seen',
+        overall_severity: 'HIGH',
+        incidents: [
+          {
+            incident_id: 'INC-1',
+            title: 'Active alarm for api',
+            signal_key: 'api:something-the-model-made-up',
+            classification: 'UNKNOWN',
+            severity: 'HIGH',
+            confidence: 0.9,
+            affected_services: ['api'],
+            evidence: ['hokusai-api-5xx-production is in ALARM'],
+            signals: { alarms: ['hokusai-api-5xx-production'], metrics: [], logs: [] },
+            suspected_causes: [],
+            investigation_plan: {
+              priority: 1,
+              estimated_user_impact: 'PARTIAL',
+              first_actions: [],
+              questions_to_answer: [],
+              suggested_cloudwatch_queries: [],
+            },
+            recommended_next_stage: 'INVESTIGATE',
+          },
+        ],
+        findings: [],
+      },
+      report
+    );
+
+    expect(classification.incidents[0]?.signal_key).toBe('alarm:hokusai-api-5xx-production');
   });
 });

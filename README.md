@@ -39,6 +39,8 @@ Commonly tuned (with defaults):
 - `HEALTH_REPORT_S3_URI` (`s3://hokusai-health-reports-development/latest/development/report.md`)
 - `AWS_REGION` (`us-east-1`)
 - `MONITOR_INTERVAL_MS` (`900000`)
+- `INCIDENT_SWEEP_ENABLED` (`true`), `INCIDENT_SWEEP_STALE_AFTER_MS` (`21600000`),
+  `INCIDENT_SWEEP_MAX_INCIDENTS` (`3`): stale-incident re-verification, see below
 - `STATE_BACKEND` (`file`): use `postgres` on the continuous-monitoring server
 - `DATABASE_URL`: required when `STATE_BACKEND=postgres`
 - `POOLED_DATABASE_URL`: optional runtime pooler URL; when set, worker/web connections use this
@@ -82,7 +84,37 @@ pnpm start:web
 
 It listens on `WEB_HOST` / `WEB_PORT` and exposes read-only JSON endpoints for `/api/status`,
 `/api/runs`, `/api/runs/:id`, `/api/incidents`, `/api/incidents/:id`, `/api/alerts`, and
-`/api/settings`.
+`/api/settings`, plus `/api/incidents/:id/brief`, which returns a markdown handoff document
+(current status, closure gate, ranked likely causes with confidence, unresolved evidence
+requirements and the tool call that would resolve each, verification checks, and the timeline).
+The incident page's "Copy handoff" button serves the same document.
+
+## Incident identity and lifecycle
+
+**Identity.** Incidents are keyed on a *signal key* — a name for the monitored signal, not for the
+occurrence (`src/state/signalKey.ts`). Classify emits a `signal_key` per incident and finding, and
+report-derived incidents get a deterministic one that overrides it. This is what stops a single
+condition from re-entering as a new incident every time the model rewords its title. When no
+signal key is available the agent falls back to the previous title-based hash.
+
+**Lifecycle.** An observation disappearing from the health report moves its incident to
+`absent_unverified`, not `resolved`: the report generator going quiet is not evidence that
+anything was fixed. Those incidents are listed separately on the dashboard and stay eligible for
+the sweep until a Verify pass proves recovery (`resolved`) or proves they were never incidents
+(`closed`).
+
+**Sweep.** Classify only runs when the report's content hash changes. On the other ticks the agent
+re-verifies open incidents that have had no activity for `INCIDENT_SWEEP_STALE_AFTER_MS`, at most
+`INCIDENT_SWEEP_MAX_INCIDENTS` per tick. This is what advances an incident whose report text is
+stable. It requires `STATE_BACKEND=postgres`; the file backend has no incident table to sweep.
+
+A swept incident always records a Verify event, so its staleness clock resets and it will not be
+swept again until the threshold elapses. How decisively the sweep closes an incident depends on
+what Verify can check: it builds checks from alarm names scraped out of the stored decision's
+`evidence_to_pass` plus ECS/ALB checks for the affected service. Incidents whose signal is a plain
+CloudWatch metric with no alarm give Verify little to check, so they tend to land on
+`VERIFIED_OBSERVABILITY_ISSUE` rather than a confident recovery. Broadening the Verify stage's
+check vocabulary is the follow-up that would make those closures precise.
 
 ## Docker Compose deployment
 

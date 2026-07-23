@@ -27,6 +27,7 @@ function status(overrides: Partial<StatusResponse> = {}): StatusResponse {
     stale: { worker: false, report: false },
     openIncidentCounts: {},
     openIncidents: [],
+    absentUnverifiedIncidents: [],
     recentTransitions: [],
     ...overrides,
   };
@@ -97,6 +98,62 @@ describe('dashboard', () => {
     expect(html).toContain('data-pipeline-api');
     expect(html).toContain('href="/incidents/INC-001"');
     expect(html).toContain('href="/runs/run-1"');
+  });
+
+  it('surfaces incidents that went absent without being verified, separately from open ones', () => {
+    const html = renderToStaticMarkup(
+      <Dashboard
+        status={status({
+          absentUnverifiedIncidents: [
+            {
+              incidentId: 'INC-ABSENT',
+              title: 'No requests on mlflow',
+              service: 'mlflow',
+              severity: 'LOW',
+              state: 'absent_unverified',
+              openedAt: '2026-07-01T10:00:00Z',
+              closedAt: null,
+              lastActivityAt: '2026-07-02T10:00:00Z',
+              currentDisposition: null,
+              currentNextStage: null,
+              lastRunId: 'run-2',
+            },
+          ],
+        })}
+      />
+    );
+
+    expect(html).toContain('Absent — Not Verified');
+    expect(html).toContain('No requests on mlflow');
+    expect(html).toContain('nothing confirmed they recovered');
+    // Absent incidents must not be counted as open, or the board reads as broken.
+    expect(html).toContain('No open incidents.');
+  });
+
+  it('shows how long an incident has gone without activity', () => {
+    const html = renderToStaticMarkup(
+      <Dashboard
+        status={status({
+          openIncidents: [
+            {
+              incidentId: 'INC-STALE',
+              title: 'High detector errors',
+              service: 'deltaone-anomaly-detection',
+              severity: 'MEDIUM',
+              state: 'open',
+              openedAt: '2026-07-14T10:00:00Z',
+              closedAt: null,
+              lastActivityAt: '2026-07-14T10:00:00Z',
+              currentDisposition: 'VERIFY',
+              currentNextStage: 'Verify',
+              lastRunId: 'run-3',
+            },
+          ],
+        })}
+      />
+    );
+
+    expect(html).toContain('last activity');
   });
 
   it('prioritizes stale state over green/yellow/red status', () => {

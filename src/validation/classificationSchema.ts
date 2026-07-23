@@ -98,6 +98,7 @@ const InvestigationPlanSchema = z.object({
 const IncidentSchema = z.object({
   incident_id: z.string(),
   title: z.string(),
+  signal_key: z.string().optional(),
   classification: IncidentClassificationSchema,
   severity: SeveritySchema,
   confidence: z.number().min(0).max(1),
@@ -112,6 +113,7 @@ const IncidentSchema = z.object({
 
 const FindingSchema = z.object({
   title: z.string(),
+  signal_key: z.string().optional(),
   classification: IncidentClassificationSchema,
   severity: SeveritySchema,
   confidence: z.number().min(0).max(1),

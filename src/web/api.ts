@@ -9,6 +9,12 @@ import type { DatabaseClient, DatabasePool } from '../db/postgres.js';
 import { createPostgresPool } from '../db/postgres.js';
 import { enqueueAlarmTriggerOnce, markSnsMessageProcessed } from '../state/repository.js';
 import type { TriggerSource } from '../state/repository.js';
+import {
+  ABSENT_UNVERIFIED_STATE,
+  TERMINAL_INCIDENT_STATES_SQL,
+} from '../state/incidentStates.js';
+import { buildIncidentBrief } from './dashboard/incidentBrief.js';
+import type { IncidentSummary, TransitionEvent } from './dashboard/statusTypes.js';
 import type { Severity } from '../types.js';
 import { ALARM_PIPELINE_COUNTER_METRICS, emitCounter } from '../util/metrics.js';
 import { alarmIdentityFromSns } from '../report/alarmSpecFromSns.js';
@@ -65,7 +71,26 @@ interface IncidentRow {
   current_next_stage: string | null;
   current_decision_json: unknown;
   last_run_id: string | null;
+  /** Newest incident_events timestamp, or opened_at when the incident has no events. */
+  last_activity_at?: Date | string | null;
 }
+
+/**
+ * Incident columns plus the derived last-activity timestamp. An incident sitting untouched for
+ * days is the single most useful thing an operator can know about it, and it is not otherwise
+ * visible from the incidents table.
+ */
+const INCIDENT_SELECT_WITH_ACTIVITY = `
+  WITH activity AS (
+    SELECT incident_id, max(created_at) AS last_event_at
+    FROM incident_events
+    GROUP BY incident_id
+  )
+  SELECT i.incident_id, i.title, i.service, i.severity, i.state, i.opened_at, i.closed_at,
+         i.current_disposition, i.current_next_stage, i.current_decision_json, i.last_run_id,
+         GREATEST(i.opened_at, COALESCE(a.last_event_at, i.opened_at)) AS last_activity_at
+  FROM incidents i
+  LEFT JOIN activity a ON a.incident_id = i.incident_id`;
 
 interface IncidentEventRow {
   id: string;
@@ -143,6 +168,7 @@ function incidentDto(row: IncidentRow): JsonRecord {
     state: row.state,
     openedAt: toIso(row.opened_at),
     closedAt: toIso(row.closed_at),
+    lastActivityAt: toIso(row.last_activity_at ?? null),
     currentDisposition: row.current_disposition,
     currentNextStage: row.current_next_stage,
     currentDecision: row.current_decision_json ?? null,
@@ -398,7 +424,7 @@ export function createWebServer(
 
   app.get('/api/status', async () => {
     const staleAfterMs = config.monitoring.intervalMs * 2;
-    const [runResult, incidentResult, heartbeatResult, transitionResult] =
+    const [runResult, incidentResult, absentResult, heartbeatResult, transitionResult] =
       await Promise.all([
       db.query<RunRow>(
         `SELECT id, started_at, finished_at, status, trigger_source, health_report_s3_uri, report_hash,
@@ -408,11 +434,18 @@ export function createWebServer(
          LIMIT 1`
       ),
       db.query<IncidentRow>(
-        `SELECT incident_id, title, service, severity, state, opened_at, closed_at,
-                current_disposition, current_next_stage, current_decision_json, last_run_id
-         FROM incidents
-         WHERE state NOT IN ('resolved', 'closed')
-         ORDER BY opened_at DESC
+        `${INCIDENT_SELECT_WITH_ACTIVITY}
+         WHERE i.state NOT IN (${TERMINAL_INCIDENT_STATES_SQL}, '${ABSENT_UNVERIFIED_STATE}')
+         ORDER BY i.opened_at DESC
+         LIMIT 20`
+      ),
+      // Incidents whose observation vanished from the report without anything verifying recovery.
+      // Kept out of the open list and the severity roll-up so the board does not go red for
+      // something that merely stopped being reported, but surfaced so it is not silently dropped.
+      db.query<IncidentRow>(
+        `${INCIDENT_SELECT_WITH_ACTIVITY}
+         WHERE i.state = '${ABSENT_UNVERIFIED_STATE}'
+         ORDER BY i.opened_at DESC
          LIMIT 20`
       ),
       db.query<WorkerHeartbeatRow>(
@@ -451,6 +484,7 @@ export function createWebServer(
       },
       openIncidentCounts: incidentCounts(dedupedIncidentRows),
       openIncidents,
+      absentUnverifiedIncidents: dedupeIncidents(absentResult.rows).map(incidentDto),
       recentTransitions: transitionResult.rows.map(eventDto),
     };
   });
@@ -502,10 +536,8 @@ export function createWebServer(
 
   app.get('/api/incidents', async () => {
     const result = await db.query<IncidentRow>(
-      `SELECT incident_id, title, service, severity, state, opened_at, closed_at,
-              current_disposition, current_next_stage, current_decision_json, last_run_id
-       FROM incidents
-       ORDER BY opened_at DESC`
+      `${INCIDENT_SELECT_WITH_ACTIVITY}
+       ORDER BY i.opened_at DESC`
     );
     return { incidents: dedupeIncidents(result.rows).map(incidentDto) };
   });
@@ -514,10 +546,8 @@ export function createWebServer(
     const { id } = request.params as { id: string };
     const [incidentResult, eventResult, alertResult] = await Promise.all([
       db.query<IncidentRow>(
-        `SELECT incident_id, title, service, severity, state, opened_at, closed_at,
-                current_disposition, current_next_stage, current_decision_json, last_run_id
-         FROM incidents
-         WHERE incident_id = $1`,
+        `${INCIDENT_SELECT_WITH_ACTIVITY}
+         WHERE i.incident_id = $1`,
         [id]
       ),
       db.query<IncidentEventRow>(
@@ -544,6 +574,39 @@ export function createWebServer(
       events: eventResult.rows.map(eventDto),
       alerts: alertResult.rows.map(alertDto),
     };
+  });
+
+  /**
+   * Markdown handoff document for an incident — the thing an operator or another agent picks up
+   * to continue the work. Served as text/markdown so it is equally usable from curl, from the
+   * dashboard's copy button, and as context for an LLM.
+   */
+  app.get('/api/incidents/:id/brief', async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const [incidentResult, eventResult] = await Promise.all([
+      db.query<IncidentRow>(
+        `${INCIDENT_SELECT_WITH_ACTIVITY}
+         WHERE i.incident_id = $1`,
+        [id]
+      ),
+      db.query<IncidentEventRow>(
+        `SELECT id, incident_id, run_id, stage, message, severity, evidence_json, created_at
+         FROM incident_events
+         WHERE incident_id = $1
+         ORDER BY created_at ASC, id ASC`,
+        [id]
+      ),
+    ]);
+    const row = incidentResult.rows[0];
+    if (!row) {
+      return reply.code(404).send({ error: 'incident_not_found' });
+    }
+
+    const markdown = buildIncidentBrief({
+      incident: incidentDto(row) as unknown as IncidentSummary,
+      events: eventResult.rows.map(eventDto) as unknown as TransitionEvent[],
+    });
+    return reply.type('text/markdown; charset=utf-8').send(markdown);
   });
 
   app.get('/api/alerts', async (request) => {
