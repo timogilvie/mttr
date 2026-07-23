@@ -1,6 +1,9 @@
 # Hokusai Monitoring Agent
 
-Five-stage monitoring agent that classifies and investigates incidents from CloudWatch health reports.
+Monitoring agent that classifies, investigates, decides on, verifies, and proposes mitigations for
+incidents from CloudWatch health reports. It is read-only: it never executes a change against
+production. Its tool layer has no write capability by construction, and the Mitigate stage produces
+*proposals for human approval*, not actions.
 
 ## Setup
 
@@ -70,7 +73,8 @@ pooler connection string. The migration command uses `DATABASE_URL`; runtime poo
 
 The first migration creates the continuous-monitoring foundation tables:
 `report_states`, `observation_states`, `runs`, `incidents`, `incident_events`, `alerts`, and
-`worker_heartbeats`.
+`worker_heartbeats`. Later migrations add `alarm_triggers` / `processed_sns_messages` and the
+`mitigation_proposals` table. Run `pnpm db:migrate` after pulling to apply new ones.
 
 Slack alert delivery is disabled unless `SLACK_WEBHOOK_URL` is set. When enabled, transition
 alerts are sent to that webhook and successful sends are stored in `alerts` using the configured
@@ -107,6 +111,32 @@ the sweep until a Verify pass proves recovery (`resolved`) or proves they were n
 re-verifies open incidents that have had no activity for `INCIDENT_SWEEP_STALE_AFTER_MS`, at most
 `INCIDENT_SWEEP_MAX_INCIDENTS` per tick. This is what advances an incident whose report text is
 stable. It requires `STATE_BACKEND=postgres`; the file backend has no incident table to sweep.
+
+## Mitigation proposals
+
+The Mitigate stage does **not** act. It turns a decided incident into a `MitigationProposal`: a
+specific recommended action (`rollback`, `restart`, `scale`, `credential_rotation`, …) against a
+named target, with the blast radius, reversibility, rollback plan, and a success signal expressed
+as the exact Verify checks that would confirm it worked. Proposals are built deterministically from
+the investigation's ranked causes and causal evidence; where the concrete target resource cannot be
+determined, that is stated as a precondition rather than guessed.
+
+Decide routes an incident to Mitigate when it is a `CONFIRMED_INCIDENT`, or a `POSSIBLE_INCIDENT`
+whose `mitigation_confidence` is `high` (the field the Investigate prompt computes from a
+corroborated causal chain, which nothing previously read). Outstanding evidence requirements do not
+suppress a proposal — they ride along on it as `evidence_gaps` and preconditions, and the incident
+stays open for the sweep. Verify is a second entry point: an incident it returns
+`VERIFIED_ACTIVE_INCIDENT` for also gets a proposal.
+
+Proposals are persisted to `mitigation_proposals` with an `outcome` lifecycle (`proposed` →
+`accepted` / `rejected` / `superseded` / `expired`); a new run supersedes an incident's previous
+outstanding proposal but never overwrites a human's accept/reject. They surface on the incident
+page, in the markdown handoff brief, and — when `SLACK_WEBHOOK_URL` is set — as a review-request
+Slack message that leads with the action and its blast radius. Nothing is executed; recording the
+outcome is what will make proposal precision measurable before any automation is ever considered.
+
+Restore remains a stub: it only means something once a proposal has actually been applied, which
+this pipeline does not do.
 
 A swept incident always records a Verify event, so its staleness clock resets and it will not be
 swept again until the threshold elapses. How decisively the sweep closes an incident depends on

@@ -4,14 +4,15 @@ import type {
   ClassificationResult,
   InvestigationResult,
   DecisionResult,
+  MitigationResult,
   VerificationResult,
 } from './types.js';
 import * as classifyStage from './stages/classify.js';
 import * as investigateStage from './stages/investigate.js';
 import * as decideStage from './stages/decide.js';
 import * as verifyStage from './stages/verify.js';
-import { mitigateStage } from './stages/stubs.js';
-import { sendSlackAlerts } from './alerts/slack.js';
+import * as mitigateStage from './stages/mitigate.js';
+import { sendMitigationProposalAlerts, sendSlackAlerts } from './alerts/slack.js';
 import { fetchReport } from './report/fetchReport.js';
 import { alarmSpecFromSns } from './report/alarmSpecFromSns.js';
 import {
@@ -1021,7 +1022,7 @@ export class Orchestrator {
       await this.sendTransitionAlerts(runId, transitions);
       await this.stateRepository.recordDecisions?.(runId, data);
       await this.stateRepository.recordIncidentEvents?.(runId, this.decisionEvents(data));
-      await this.runSelectedResponseStage(data, runId);
+      await this.runSelectedResponseStage(data, runId, investigation);
       return true;
     } else if (result.status === 'error') {
       console.error('[Orchestrator] Decide stage failed:', result.error);
@@ -1033,7 +1034,8 @@ export class Orchestrator {
 
   private async runSelectedResponseStage(
     decision: DecisionResult,
-    runId: string | undefined
+    runId: string | undefined,
+    investigation: InvestigationResult
   ): Promise<void> {
     if (decision.overall_next_stage === 'None') {
       console.log('[Orchestrator] Decide selected no downstream response stage');
@@ -1047,22 +1049,23 @@ export class Orchestrator {
       return;
     }
 
+    if (decision.overall_next_stage === 'Mitigate') {
+      await this.runMitigate(decision, investigation, runId);
+      return;
+    }
+
     const input: StageInput = {
       stage: decision.overall_next_stage,
       timestamp: new Date().toISOString(),
     };
-
-    const result =
-      decision.overall_next_stage === 'Mitigate'
-        ? await mitigateStage(input, decision)
-        : await verifyStage.run(input, this.config, decision);
+    const result = await verifyStage.run(input, this.config, decision);
 
     console.log(
       `[Orchestrator] ${result.stage} stage returned ${result.status}` +
         (result.data ? `: ${JSON.stringify(result.data)}` : '')
     );
 
-    if (result.stage === 'Verify' && result.status === 'success' && result.data) {
+    if (result.status === 'success' && result.data) {
       const verification = result.data as VerificationResult;
       await this.stateRepository.recordStageOutput?.(runId, {
         stage: 'Verify',
@@ -1075,20 +1078,81 @@ export class Orchestrator {
         runId,
         this.verificationEvents(verification)
       );
-      if (
-        'overall_next_stage' in verification &&
-        verification.overall_next_stage === 'Mitigate'
-      ) {
-        const mitigationInput: StageInput = {
-          stage: 'Mitigate',
-          timestamp: new Date().toISOString(),
-        };
-        const mitigation = await mitigateStage(mitigationInput, decision);
-        console.log(
-          `[Orchestrator] ${mitigation.stage} stage returned ${mitigation.status}` +
-            (mitigation.data ? `: ${JSON.stringify(mitigation.data)}` : '')
-        );
+
+      // Verify is the second door into Mitigate: an incident Decide sent to Verify can come back
+      // VERIFIED_ACTIVE_INCIDENT, which warrants a proposal. Scope the proposals to exactly the
+      // incidents Verify confirmed active rather than to everything in the decision batch.
+      const activeIncidentIds = verification.verifications
+        .filter((item) => item.status === 'VERIFIED_ACTIVE_INCIDENT')
+        .map((item) => item.incident_id);
+      if (activeIncidentIds.length > 0) {
+        await this.runMitigate(decision, investigation, runId, activeIncidentIds);
       }
     }
+  }
+
+  /**
+   * Produces mitigation *proposals* and records them. Nothing here executes a change: the tool
+   * layer is read-only, and a proposal's job is to reach a human with enough structure to be
+   * approved or rejected quickly.
+   */
+  private async runMitigate(
+    decision: DecisionResult,
+    investigation: InvestigationResult,
+    runId: string | undefined,
+    incidentIds?: string[]
+  ): Promise<void> {
+    const result = await mitigateStage.run(
+      { stage: 'Mitigate', timestamp: new Date().toISOString() },
+      decision,
+      investigation,
+      {
+        ...(incidentIds ? { incidentIds } : {}),
+        region: this.config.aws.region,
+      }
+    );
+
+    if (result.status !== 'success' || !result.data) {
+      console.error('[Orchestrator] Mitigate stage failed:', result.error);
+      return;
+    }
+
+    const mitigation = result.data as MitigationResult;
+    console.log(`[Orchestrator] Mitigate stage completed: ${mitigation.summary}`);
+    if (mitigation.proposals.length === 0) {
+      return;
+    }
+
+    // Proposals get their own table (with an outcome lifecycle), so unlike the other stages there
+    // is no raw-JSON column on `runs` to write; the incident_events row below is the run linkage.
+    await this.stateRepository.recordMitigationProposals?.(runId, mitigation);
+    await this.stateRepository.recordIncidentEvents?.(
+      runId,
+      this.mitigationEvents(mitigation)
+    );
+
+    try {
+      await sendMitigationProposalAlerts(
+        this.config,
+        this.stateRepository,
+        runId,
+        mitigation.proposals
+      );
+    } catch (error) {
+      console.error('[Orchestrator] Mitigation proposal alert delivery failed:', error);
+    }
+  }
+
+  private mitigationEvents(mitigation: MitigationResult): IncidentEventInput[] {
+    return mitigation.proposals.map((proposal) => ({
+      incidentId: proposal.incident_id,
+      title: proposal.title,
+      stage: 'Mitigate' as const,
+      message: `${proposal.action_kind.toUpperCase()} proposed: ${proposal.action}`,
+      service: proposal.target.kind === 'unknown' ? null : proposal.target.identifier,
+      evidence: {
+        proposal,
+      },
+    }));
   }
 }

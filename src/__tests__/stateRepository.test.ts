@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { QueryResult, QueryResultRow } from 'pg';
-import type { ClassificationResult, DecisionResult, VerificationResult } from '../types.js';
+import type {
+  ClassificationResult,
+  DecisionResult,
+  MitigationResult,
+  VerificationResult,
+} from '../types.js';
 import type { DatabaseClient } from '../db/postgres.js';
 import { MIGRATIONS, runMigrations } from '../db/migrations.js';
 import {
@@ -56,6 +61,7 @@ class FakeStateDatabase implements DatabaseClient {
   alerts = new Map<string, Record<string, unknown>>();
   workerHeartbeats = new Map<string, Record<string, unknown>>();
   incidentEvents: Array<Record<string, unknown>> = [];
+  mitigationProposals: Array<Record<string, unknown>> = [];
   processedSnsMessages = new Set<string>();
   alarmTriggers: Array<Record<string, unknown>> = [];
   queries: string[] = [];
@@ -300,6 +306,32 @@ class FakeStateDatabase implements DatabaseClient {
         message: params[3],
         severity: params[4],
         evidence_json: JSON.parse(String(params[5])),
+      });
+      return result<T>([]);
+    }
+
+    if (normalized.startsWith('UPDATE mitigation_proposals')) {
+      const incidentId = String(params[0]);
+      for (const row of this.mitigationProposals) {
+        if (row['incident_id'] === incidentId && row['outcome'] === 'proposed') {
+          row['outcome'] = 'superseded';
+        }
+      }
+      return result<T>([]);
+    }
+
+    if (normalized.startsWith('INSERT INTO mitigation_proposals')) {
+      this.mitigationProposals.push({
+        incident_id: params[0],
+        run_id: params[1],
+        action: params[2],
+        action_kind: params[3],
+        target_kind: params[4],
+        target_identifier: params[5],
+        proposal_confidence: params[6],
+        reversibility: params[7],
+        outcome: 'proposed',
+        proposal_json: JSON.parse(String(params[8])),
       });
       return result<T>([]);
     }
@@ -730,6 +762,80 @@ describe('Postgres state repository', () => {
       incident_id: 'INC-001',
       disposition: 'VERIFY',
     });
+  });
+
+  it('records a mitigation proposal and supersedes the incident\'s previous outstanding one', async () => {
+    const db = new FakeStateDatabase();
+    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
+    const runId = await repository.startRun('2026-06-08T10:00:00Z');
+
+    const proposal = (action: string): MitigationResult['proposals'][number] => ({
+      incident_id: 'INC-1',
+      title: 'High detector errors',
+      action,
+      action_kind: 'credential_rotation',
+      target: { kind: 'lambda_function', identifier: 'hokusai-detector' },
+      addresses_cause: 'Downstream auth failure.',
+      cause_confidence: 0.86,
+      evidence_refs: [],
+      proposal_confidence: 'high',
+      evidence_gaps: [],
+      preconditions: [],
+      rollback_plan: [],
+      blast_radius: 'x',
+      reversibility: 'manual',
+      success_signal: { description: 'x', checks: [] },
+      requires_human_approval: true,
+    });
+
+    await repository.recordMitigationProposals(runId, {
+      summary: 'first',
+      proposals: [proposal('first action')],
+    });
+    await repository.recordMitigationProposals(runId, {
+      summary: 'second',
+      proposals: [proposal('second action')],
+    });
+
+    const outcomes = db.mitigationProposals.map((row) => ({
+      action: row['action'],
+      outcome: row['outcome'],
+    }));
+    expect(outcomes).toEqual([
+      { action: 'first action', outcome: 'superseded' },
+      { action: 'second action', outcome: 'proposed' },
+    ]);
+  });
+
+  it('does not record mitigation proposals without a run id', async () => {
+    const db = new FakeStateDatabase();
+    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
+
+    await repository.recordMitigationProposals(undefined, {
+      summary: 'x',
+      proposals: [
+        {
+          incident_id: 'INC-1',
+          title: 't',
+          action: 'a',
+          action_kind: 'restart',
+          target: { kind: 'ecs_service', identifier: 's' },
+          addresses_cause: 'c',
+          cause_confidence: null,
+          evidence_refs: [],
+          proposal_confidence: 'low',
+          evidence_gaps: [],
+          preconditions: [],
+          rollback_plan: [],
+          blast_radius: 'x',
+          reversibility: 'trivial',
+          success_signal: { description: 'x', checks: [] },
+          requires_human_approval: true,
+        },
+      ],
+    });
+
+    expect(db.mitigationProposals).toHaveLength(0);
   });
 
   it('persists decision transition events with alert metadata', async () => {
@@ -1189,9 +1295,22 @@ describe('database migrations', () => {
       'worker_heartbeats',
       'alarm_triggers',
       'processed_sns_messages',
+      'mitigation_proposals',
     ]) {
       expect(sql).toContain(`CREATE TABLE IF NOT EXISTS ${table}`);
     }
+  });
+
+  it('adds the mitigation proposals migration with an outcome lifecycle', () => {
+    const migration = MIGRATIONS.find((item) => item.id === 3);
+
+    expect(migration?.name).toBe('mitigation_proposals');
+    expect(migration?.sql).toContain('incident_id text NOT NULL REFERENCES incidents(incident_id)');
+    expect(migration?.sql).toContain(
+      "outcome text NOT NULL DEFAULT 'proposed'"
+    );
+    expect(migration?.sql).toContain("CHECK (outcome IN ('proposed', 'accepted', 'rejected', 'superseded', 'expired'))");
+    expect(migration?.sql).toContain('proposal_json jsonb NOT NULL');
   });
 
   it('adds alarm trigger queue migration with run provenance fields', () => {

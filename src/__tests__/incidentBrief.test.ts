@@ -149,6 +149,43 @@ describe('incident brief', () => {
     expect(brief).not.toContain('**State**: resolved');
   });
 
+  it('includes the proposed mitigation, flagged as needing approval', () => {
+    const brief = buildIncidentBrief({
+      incident: incident(),
+      events: events(),
+      now: NOW,
+      proposal: {
+        incident_id: 'finding-3',
+        title: 'High detector errors',
+        action: 'Rotate the detector RPC credential and redeploy.',
+        action_kind: 'credential_rotation',
+        target: { kind: 'lambda_function', identifier: 'hokusai-detector' },
+        addresses_cause: 'Downstream auth failure.',
+        cause_confidence: 0.86,
+        evidence_refs: [],
+        proposal_confidence: 'high',
+        evidence_gaps: [],
+        preconditions: ['Confirm which credential the call uses.'],
+        rollback_plan: ['Keep the old credential valid until confirmed.'],
+        blast_radius: 'Every consumer of the credential.',
+        reversibility: 'manual',
+        success_signal: { description: 'Errors clear.', checks: [] },
+        requires_human_approval: true,
+      },
+    });
+
+    expect(brief).toContain('## Proposed mitigation (needs human approval — not executed)');
+    expect(brief).toContain('Rotate the detector RPC credential and redeploy.');
+    expect(brief).toContain('**Reversibility**: manual');
+    expect(brief).toContain('Confirm which credential the call uses.');
+  });
+
+  it('omits the proposal section when there is no proposal', () => {
+    const brief = buildIncidentBrief({ incident: incident(), events: events(), now: NOW });
+
+    expect(brief).not.toContain('Proposed mitigation');
+  });
+
   it('omits sections it has no content for', () => {
     const brief = buildIncidentBrief({
       incident: incident(),

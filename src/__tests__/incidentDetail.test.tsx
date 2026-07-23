@@ -256,6 +256,94 @@ describe('incident detail', () => {
     expect(html).toContain('Absence from a report is not evidence of a fix.');
   });
 
+  it('renders the current mitigation proposal and states nothing was executed', () => {
+    const html = renderToStaticMarkup(
+      <IncidentDetail
+        data={detail({
+          mitigationProposals: [
+            {
+              id: 'prop-1',
+              incidentId: 'finding-abc123',
+              runId: 'run-1',
+              createdAt: new Date().toISOString(),
+              outcome: 'proposed',
+              outcomeAt: null,
+              outcomeNote: null,
+              proposal: {
+                incident_id: 'finding-abc123',
+                title: 'High 4xx',
+                action: 'Roll data-pipeline-api back to the last known-good release.',
+                action_kind: 'rollback',
+                target: { kind: 'ecs_service', identifier: 'data-pipeline-api' },
+                addresses_cause: 'A bad deploy introduced the 5xx responses.',
+                cause_confidence: 0.82,
+                evidence_refs: ['5xx started at the deploy timestamp.'],
+                proposal_confidence: 'high',
+                evidence_gaps: [],
+                preconditions: ['Confirm the last known-good release.'],
+                rollback_plan: ['Redeploy the current release if the rollback regresses.'],
+                blast_radius: 'data-pipeline-api is redeployed; in-flight requests may fail.',
+                reversibility: 'manual',
+                success_signal: {
+                  description: 'The 5xx signal clears and stays clear.',
+                  checks: [{ tool: 'find_alarms', target: 'api-5xx' }],
+                },
+                requires_human_approval: true,
+              },
+            },
+          ],
+        })}
+      />
+    );
+
+    expect(html).toContain('Proposed Mitigation');
+    expect(html).toContain('needs human approval');
+    expect(html).toContain('Roll data-pipeline-api back to the last known-good release.');
+    expect(html).toContain('Nothing has been executed');
+    expect(html).toContain('Confirm the last known-good release.');
+    expect(html).toContain('in-flight requests may fail');
+  });
+
+  it('does not render a proposal panel once the proposal is superseded', () => {
+    const html = renderToStaticMarkup(
+      <IncidentDetail
+        data={detail({
+          mitigationProposals: [
+            {
+              id: 'prop-old',
+              incidentId: 'finding-abc123',
+              runId: 'run-1',
+              createdAt: new Date().toISOString(),
+              outcome: 'superseded',
+              outcomeAt: new Date().toISOString(),
+              outcomeNote: null,
+              proposal: {
+                incident_id: 'finding-abc123',
+                title: 'High 4xx',
+                action: 'Old action.',
+                action_kind: 'restart',
+                target: { kind: 'ecs_service', identifier: 'data-pipeline-api' },
+                addresses_cause: 'x',
+                cause_confidence: null,
+                evidence_refs: [],
+                proposal_confidence: 'low',
+                evidence_gaps: [],
+                preconditions: [],
+                rollback_plan: [],
+                blast_radius: 'x',
+                reversibility: 'trivial',
+                success_signal: { description: 'x', checks: [] },
+                requires_human_approval: true,
+              },
+            },
+          ],
+        })}
+      />
+    );
+
+    expect(html).not.toContain('Proposed Mitigation');
+  });
+
   it('renders an observability-gap timeline', () => {
     const html = renderToStaticMarkup(
       <IncidentDetail

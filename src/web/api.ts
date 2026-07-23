@@ -15,6 +15,7 @@ import {
 } from '../state/incidentStates.js';
 import { buildIncidentBrief } from './dashboard/incidentBrief.js';
 import type { IncidentSummary, TransitionEvent } from './dashboard/statusTypes.js';
+import { parseMitigationProposal } from '../validation/mitigationSchema.js';
 import type { Severity } from '../types.js';
 import { ALARM_PIPELINE_COUNTER_METRICS, emitCounter } from '../util/metrics.js';
 import { alarmIdentityFromSns } from '../report/alarmSpecFromSns.js';
@@ -120,6 +121,17 @@ interface WorkerHeartbeatRow {
   metadata_json: unknown;
 }
 
+interface MitigationProposalRow {
+  id: string;
+  incident_id: string;
+  run_id: string | null;
+  created_at: Date | string;
+  outcome: string;
+  outcome_at: Date | string | null;
+  outcome_note: string | null;
+  proposal_json: unknown;
+}
+
 interface WebhookDependencies {
   fetchSigningCert?: (url: string, signal: AbortSignal) => Promise<string>;
   confirmSubscriptionGet?: (url: string, signal: AbortSignal) => Promise<void>;
@@ -211,6 +223,19 @@ function incidentCounts(rows: IncidentRow[]): Partial<Record<Severity, number>> 
     counts[row.severity] = (counts[row.severity] ?? 0) + 1;
   }
   return counts;
+}
+
+function mitigationProposalDto(row: MitigationProposalRow): JsonRecord {
+  return {
+    id: row.id,
+    incidentId: row.incident_id,
+    runId: row.run_id,
+    createdAt: toIso(row.created_at),
+    outcome: row.outcome,
+    outcomeAt: toIso(row.outcome_at),
+    outcomeNote: row.outcome_note,
+    proposal: row.proposal_json ?? null,
+  };
 }
 
 function eventDto(row: IncidentEventRow): JsonRecord {
@@ -544,7 +569,7 @@ export function createWebServer(
 
   app.get('/api/incidents/:id', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const [incidentResult, eventResult, alertResult] = await Promise.all([
+    const [incidentResult, eventResult, alertResult, proposalResult] = await Promise.all([
       db.query<IncidentRow>(
         `${INCIDENT_SELECT_WITH_ACTIVITY}
          WHERE i.incident_id = $1`,
@@ -564,6 +589,13 @@ export function createWebServer(
          ORDER BY sent_at DESC, id DESC`,
         [id]
       ),
+      db.query<MitigationProposalRow>(
+        `SELECT id, incident_id, run_id, created_at, outcome, outcome_at, outcome_note, proposal_json
+         FROM mitigation_proposals
+         WHERE incident_id = $1
+         ORDER BY created_at DESC, id DESC`,
+        [id]
+      ),
     ]);
     const row = incidentResult.rows[0];
     if (!row) {
@@ -573,6 +605,7 @@ export function createWebServer(
       incident: incidentDto(row),
       events: eventResult.rows.map(eventDto),
       alerts: alertResult.rows.map(alertDto),
+      mitigationProposals: proposalResult.rows.map(mitigationProposalDto),
     };
   });
 
@@ -583,7 +616,7 @@ export function createWebServer(
    */
   app.get('/api/incidents/:id/brief', async (request, reply) => {
     const { id } = request.params as { id: string };
-    const [incidentResult, eventResult] = await Promise.all([
+    const [incidentResult, eventResult, proposalResult] = await Promise.all([
       db.query<IncidentRow>(
         `${INCIDENT_SELECT_WITH_ACTIVITY}
          WHERE i.incident_id = $1`,
@@ -596,15 +629,25 @@ export function createWebServer(
          ORDER BY created_at ASC, id ASC`,
         [id]
       ),
+      db.query<MitigationProposalRow>(
+        `SELECT id, incident_id, run_id, created_at, outcome, outcome_at, outcome_note, proposal_json
+         FROM mitigation_proposals
+         WHERE incident_id = $1 AND outcome = 'proposed'
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1`,
+        [id]
+      ),
     ]);
     const row = incidentResult.rows[0];
     if (!row) {
       return reply.code(404).send({ error: 'incident_not_found' });
     }
 
+    const proposal = parseMitigationProposal(proposalResult.rows[0]?.proposal_json);
     const markdown = buildIncidentBrief({
       incident: incidentDto(row) as unknown as IncidentSummary,
       events: eventResult.rows.map(eventDto) as unknown as TransitionEvent[],
+      ...(proposal ? { proposal } : {}),
     });
     return reply.type('text/markdown; charset=utf-8').send(markdown);
   });

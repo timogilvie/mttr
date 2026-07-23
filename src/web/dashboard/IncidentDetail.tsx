@@ -1,6 +1,11 @@
 import { useState } from 'react';
 import type { ReactElement } from 'react';
-import type { AlertSummary, IncidentDetailResponse, TransitionEvent } from './statusTypes.js';
+import type {
+  AlertSummary,
+  IncidentDetailResponse,
+  MitigationProposalSummary,
+  TransitionEvent,
+} from './statusTypes.js';
 import {
   evidenceList,
   evidenceText,
@@ -154,6 +159,79 @@ function OperatorReadoutPanel({
   );
 }
 
+/**
+ * The current mitigation *proposal*. It leads with a plain statement that nothing was executed,
+ * because the whole point of the stage is that a human decides — the panel is a decision aid, not
+ * a report that something happened.
+ */
+function MitigationProposalPanel({
+  proposals,
+}: {
+  proposals: MitigationProposalSummary[];
+}): ReactElement | null {
+  const current = proposals.find((row) => row.outcome === 'proposed' && row.proposal);
+  const proposal = current?.proposal;
+  if (!proposal) {
+    return null;
+  }
+
+  const confidence =
+    proposal.cause_confidence === null
+      ? proposal.proposal_confidence
+      : `${proposal.proposal_confidence} · cause ${proposal.cause_confidence.toFixed(2)}`;
+
+  return (
+    <section className={`operator-readout readout-${proposal.action_kind === 'no_action' ? 'stale' : 'red'}`}>
+      <div className="readout-lede">
+        <p className="eyebrow">Proposed Mitigation · needs human approval</p>
+        <h2>{proposal.action}</h2>
+        <p>
+          Nothing has been executed — this agent cannot make changes. Review and act out of band.
+        </p>
+        <p className="readout-meta">
+          {proposal.action_kind} · {proposal.reversibility} to reverse · confidence {confidence}
+        </p>
+      </div>
+      <div className="readout-grid">
+        <div>
+          <span>Target</span>
+          <p>
+            {proposal.target.kind}: <code>{proposal.target.identifier}</code>
+          </p>
+        </div>
+        <div>
+          <span>Addresses</span>
+          <p>{proposal.addresses_cause}</p>
+        </div>
+        <div>
+          <span>Blast Radius</span>
+          <p>{proposal.blast_radius}</p>
+        </div>
+        <div>
+          <span>Check First</span>
+          {proposal.preconditions.length === 0 ? (
+            <p>No preconditions recorded.</p>
+          ) : (
+            <EvidenceBullets items={proposal.preconditions} />
+          )}
+        </div>
+        <div>
+          <span>Rollback</span>
+          {proposal.rollback_plan.length === 0 ? (
+            <p>No rollback recorded.</p>
+          ) : (
+            <EvidenceBullets items={proposal.rollback_plan} />
+          )}
+        </div>
+        <div>
+          <span>Success Signal</span>
+          <p>{proposal.success_signal.description}</p>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function StagePanel({
   title,
   events,
@@ -237,6 +315,7 @@ function AlertHistory({ alerts }: { alerts: AlertSummary[] }): ReactElement {
 
 export function IncidentDetail({ data }: { data: IncidentDetailResponse }): ReactElement {
   const { incident, events, alerts } = data;
+  const mitigationProposals = data.mitigationProposals ?? [];
   const readyForMitigation =
     incident.currentDisposition === 'MITIGATE' || incident.currentNextStage === 'Mitigate';
 
@@ -284,6 +363,8 @@ export function IncidentDetail({ data }: { data: IncidentDetailResponse }): Reac
       </section>
 
       <OperatorReadoutPanel incident={incident} events={events} />
+
+      <MitigationProposalPanel proposals={mitigationProposals} />
 
       <section className="content-grid">
         <StagePanel title="Classification" events={stageEvents(events, 'Classify')} />
