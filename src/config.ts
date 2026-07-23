@@ -36,6 +36,16 @@ export interface Config {
   };
   monitoring: {
     intervalMs: number;
+    /**
+     * Re-verification of open incidents on ticks where the health report is unchanged. Without
+     * it the pipeline only advances when the report text changes, so an open incident can sit
+     * untouched indefinitely.
+     */
+    sweep: {
+      enabled: boolean;
+      staleAfterMs: number;
+      maxIncidents: number;
+    };
   };
   state: {
     backend: 'file' | 'postgres';
@@ -218,6 +228,11 @@ export function loadConfig(): Config {
     },
     monitoring: {
       intervalMs: getEnvNumber('MONITOR_INTERVAL_MS', 900000),
+      sweep: {
+        enabled: getEnvBoolean('INCIDENT_SWEEP_ENABLED', true),
+        staleAfterMs: getEnvPositiveNumber('INCIDENT_SWEEP_STALE_AFTER_MS', 21600000),
+        maxIncidents: getEnvPositiveNumber('INCIDENT_SWEEP_MAX_INCIDENTS', 3),
+      },
     },
     state: {
       backend: stateBackend,

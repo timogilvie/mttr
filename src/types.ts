@@ -93,6 +93,11 @@ export interface InvestigationPlan {
 export interface Incident {
   incident_id: string;
   title: string;
+  /**
+   * Stable identifier for the underlying monitored signal (see `state/signalKey.ts`). Titles are
+   * LLM prose and drift between reports; this is what incident identity is keyed on.
+   */
+  signal_key?: string | undefined;
   classification: IncidentClassification;
   severity: Severity;
   confidence: number;
@@ -107,6 +112,8 @@ export interface Incident {
 
 export interface Finding {
   title: string;
+  /** See `Incident.signal_key`. */
+  signal_key?: string | undefined;
   classification: IncidentClassification;
   severity: Severity;
   confidence: number;

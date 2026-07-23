@@ -121,7 +121,10 @@ const mockConfig: Config = {
   },
   healthReport: { s3Uri: 's3://test/report.md' },
   aws: { region: 'us-east-1', maxAttempts: 5 },
-  monitoring: { intervalMs: 5000 },
+  monitoring: {
+    intervalMs: 5000,
+    sweep: { enabled: false, staleAfterMs: 21600000, maxIncidents: 3 },
+  },
   state: { backend: 'file', path: '.test-mttr-state.json' },
   database: {
     ssl: false,

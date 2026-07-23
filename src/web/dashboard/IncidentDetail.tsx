@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import type { ReactElement } from 'react';
 import type { AlertSummary, IncidentDetailResponse, TransitionEvent } from './statusTypes.js';
 import {
@@ -7,6 +8,8 @@ import {
   transitionType,
   verificationChecks,
 } from './evidenceView.js';
+import { deriveOperatorReadout, stageEvents } from './operatorReadout.js';
+import type { OperatorReadout } from './operatorReadout.js';
 import { formatAge } from './statusView.js';
 
 function severityClass(value: string | null): string {
@@ -15,14 +18,6 @@ function severityClass(value: string | null): string {
 
 function display(value: string | null | undefined): string {
   return value && value.trim() !== '' ? value : 'none';
-}
-
-function stageEvents(events: TransitionEvent[], stage: string): TransitionEvent[] {
-  return events.filter((event) => event.stage === stage);
-}
-
-function latestStageEvent(events: TransitionEvent[], stage: string): TransitionEvent | null {
-  return [...events].reverse().find((event) => event.stage === stage) ?? null;
 }
 
 function eventMetadata(event: TransitionEvent): string {
@@ -36,223 +31,6 @@ function eventMetadata(event: TransitionEvent): string {
     .join(' · ');
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
-
-function evidenceRecord(event: TransitionEvent | null): Record<string, unknown> {
-  return event?.evidence ?? {};
-}
-
-function compactText(value: unknown): string | null {
-  return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
-}
-
-function objectSummary(value: Record<string, unknown>): string | null {
-  const parts = [
-    compactText(value['action']),
-    compactText(value['description']),
-    compactText(value['data']),
-    compactText(value['reason']),
-    compactText(value['tool_hint']),
-    compactText(value['suggested_query_or_source']),
-    compactText(value['cause']),
-    compactText(value['expected_signal']),
-  ].filter((part): part is string => Boolean(part));
-  return parts.length > 0 ? parts.join(' — ') : null;
-}
-
-function evidenceRows(event: TransitionEvent | null, keys: string[]): string[] {
-  const rows: string[] = [];
-  const evidence = evidenceRecord(event);
-
-  for (const key of keys) {
-    const value = evidence[key];
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        const text = compactText(item) ?? (isRecord(item) ? objectSummary(item) : null);
-        if (text) {
-          rows.push(text);
-        }
-      }
-    } else {
-      const text = compactText(value);
-      if (text) {
-        rows.push(text);
-      }
-    }
-  }
-
-  return [...new Set(rows)];
-}
-
-function evidenceField(event: TransitionEvent | null, key: string): string | null {
-  return compactText(evidenceRecord(event)[key]);
-}
-
-function checkRows(event: TransitionEvent | null): string[] {
-  if (!event) {
-    return [];
-  }
-  return verificationChecks(event).map((check) => {
-    const status = compactText(check['status']) ?? 'unknown';
-    const tool = compactText(check['tool']) ?? 'check';
-    const target = compactText(check['target']) ?? 'target';
-    return `${status}: ${tool} ${target}`;
-  });
-}
-
-function currentness(events: TransitionEvent[]): string | null {
-  for (const event of [...events].reverse()) {
-    const semantics = event.evidence?.['semantics'];
-    if (isRecord(semantics)) {
-      const value = compactText(semantics['currentness']);
-      if (value) {
-        return value;
-      }
-    }
-  }
-  return null;
-}
-
-interface OperatorReadout {
-  tone: 'green' | 'yellow' | 'red' | 'stale';
-  headline: string;
-  why: string;
-  closeGate: string;
-  nextActions: string[];
-  evidence: string[];
-}
-
-function deriveOperatorReadout(
-  incident: IncidentDetailResponse['incident'],
-  events: TransitionEvent[]
-): OperatorReadout {
-  const latestInvestigation = latestStageEvent(events, 'Investigate');
-  const latestDecision = latestStageEvent(events, 'Decide');
-  const latestVerification = latestStageEvent(events, 'Verify');
-  const latestStatus = evidenceField(latestVerification, 'status');
-  const latestDisposition =
-    incident.currentDisposition ?? evidenceField(latestDecision, 'disposition');
-  const latestNextStage =
-    incident.currentNextStage ?? evidenceField(latestDecision, 'next_stage');
-  const closed = Boolean(incident.closedAt) || incident.state === 'resolved' || incident.state === 'closed';
-  const readyForMitigation =
-    latestDisposition === 'MITIGATE' ||
-    latestNextStage === 'Mitigate' ||
-    latestStatus === 'VERIFIED_ACTIVE_INCIDENT';
-  const current = currentness(events);
-  const rationale =
-    evidenceField(latestVerification, 'rationale') ??
-    evidenceField(latestDecision, 'rationale') ??
-    latestInvestigation?.message ??
-    latestDecision?.message ??
-    'No decision rationale was recorded.';
-
-  const nextActions = [
-    ...evidenceRows(latestDecision, ['follow_up_actions']),
-    ...evidenceRows(latestInvestigation, [
-      'unresolved_evidence_requirements',
-      'additional_data_needed',
-      'recommended_next_investigation_steps',
-      'unknowns',
-    ]),
-  ].slice(0, 6);
-  const evidence = [
-    ...evidenceRows(latestInvestigation, [
-      'confirmed_facts',
-      'supporting_evidence',
-      'contradicting_evidence',
-    ]),
-    ...evidenceRows(latestDecision, ['evidence_to_pass']),
-    ...checkRows(latestVerification),
-  ].slice(0, 8);
-
-  if (closed) {
-    return {
-      tone: 'green',
-      headline: 'Closed',
-      why: latestVerification?.message ?? latestDecision?.message ?? 'A closure transition was recorded.',
-      closeGate: `Closed ${formatAge(incident.closedAt)}.`,
-      nextActions,
-      evidence,
-    };
-  }
-
-  if (readyForMitigation) {
-    return {
-      tone: 'red',
-      headline: 'Action needed',
-      why: rationale,
-      closeGate:
-        'Close after mitigation or recovery evidence moves Verify to recovered, non-incident, or observability-only.',
-      nextActions:
-        nextActions.length > 0
-          ? nextActions
-          : ['Review the latest run output and choose the mitigation or recovery check.'],
-      evidence,
-    };
-  }
-
-  if (latestNextStage === 'Investigate' || latestStatus === 'STILL_INCONCLUSIVE') {
-    return {
-      tone: 'yellow',
-      headline: 'Still open',
-      why: rationale,
-      closeGate:
-        'Needs more evidence before closure. A future decision must choose CLOSE_TRANSIENT or CLOSE_NON_INCIDENT, or Verify must prove recovery.',
-      nextActions:
-        nextActions.length > 0
-          ? nextActions
-          : ['Open the source run and inspect Investigation and Decision JSON for unresolved evidence.'],
-      evidence,
-    };
-  }
-
-  if (latestNextStage === 'Verify' || latestDisposition === 'VERIFY') {
-    return {
-      tone: 'yellow',
-      headline: 'Waiting on verification',
-      why: rationale,
-      closeGate:
-        'Verify must pass the current health checks before this can close as recovered or non-incident.',
-      nextActions:
-        nextActions.length > 0
-          ? nextActions
-          : ['Run or wait for Verify to check the current alarm, metric, log, or service signal.'],
-      evidence,
-    };
-  }
-
-  if (latestDisposition === 'OPEN_OBSERVABILITY_FOLLOWUP') {
-    return {
-      tone: 'stale',
-      headline: 'Observability follow-up',
-      why: rationale,
-      closeGate:
-        'This is not ready for incident mitigation; close it by fixing or explicitly accepting the telemetry gap.',
-      nextActions:
-        nextActions.length > 0
-          ? nextActions
-          : ['Identify the missing metric/log source and create an instrumentation follow-up.'],
-      evidence,
-    };
-  }
-
-  return {
-    tone: current === 'ACTIVE' ? 'yellow' : 'stale',
-    headline: current === 'ACTIVE' ? 'Active signal' : 'Needs review',
-    why: rationale,
-    closeGate:
-      'No closure transition has been recorded. Look for the latest Decision and Verify events to see the blocking condition.',
-    nextActions:
-      nextActions.length > 0
-        ? nextActions
-        : ['Open the source run for raw stage output and check the latest Decision/Verify status.'],
-    evidence,
-  };
-}
-
 function EvidenceBullets({ items }: { items: string[] }): ReactElement | null {
   if (items.length === 0) {
     return null;
@@ -263,6 +41,56 @@ function EvidenceBullets({ items }: { items: string[] }): ReactElement | null {
         <li key={item}>{item}</li>
       ))}
     </ul>
+  );
+}
+
+/**
+ * Ranked root-cause hypotheses with their confidence scores. The Investigate stage has always
+ * produced these; until now the page dropped them, which is why an incident whose cause was
+ * identified at 0.86 confidence still read as unexplained.
+ */
+function LikelyCauses({ readout }: { readout: OperatorReadout }): ReactElement | null {
+  if (readout.likelyCauses.length === 0) {
+    return null;
+  }
+  return (
+    <ol className="cause-list">
+      {readout.likelyCauses.slice(0, 3).map((cause) => (
+        <li key={cause.cause}>
+          <strong>{cause.cause}</strong>
+          {cause.confidence === null ? null : (
+            <span className="confidence">confidence {cause.confidence.toFixed(2)}</span>
+          )}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+/** Copies the markdown handoff brief, falling back to opening it when the clipboard is blocked. */
+function HandoffButton({ incidentId }: { incidentId: string }): ReactElement {
+  const [label, setLabel] = useState('Copy handoff');
+  const briefUrl = `/api/incidents/${encodeURIComponent(incidentId)}/brief`;
+
+  const copy = (): void => {
+    void fetch(briefUrl)
+      .then(async (response) => await response.text())
+      .then(async (markdown) => {
+        await navigator.clipboard.writeText(markdown);
+        setLabel('Copied');
+      })
+      .catch(() => {
+        window.open(briefUrl, '_blank');
+      });
+  };
+
+  return (
+    <div className="handoff">
+      <button type="button" onClick={copy}>
+        {label}
+      </button>
+      <a href={briefUrl}>view brief</a>
+    </div>
   );
 }
 
@@ -280,8 +108,18 @@ function OperatorReadoutPanel({
         <p className="eyebrow">Operator Readout</p>
         <h2>{readout.headline}</h2>
         <p>{readout.why}</p>
+        <p className="readout-meta">Last activity {formatAge(readout.lastActivityAt)}</p>
+        <HandoffButton incidentId={incident.incidentId} />
       </div>
       <div className="readout-grid">
+        <div>
+          <span>Likely Causes</span>
+          {readout.likelyCauses.length === 0 ? (
+            <p>No root-cause hypothesis was recorded.</p>
+          ) : (
+            <LikelyCauses readout={readout} />
+          )}
+        </div>
         <div>
           <span>Closure Gate</span>
           <p>{readout.closeGate}</p>
@@ -289,6 +127,23 @@ function OperatorReadoutPanel({
         <div>
           <span>Next Checks</span>
           <EvidenceBullets items={readout.nextActions} />
+        </div>
+        <div>
+          <span>Open Evidence Gaps</span>
+          {readout.evidenceRequirements.length === 0 ? (
+            <p>No outstanding evidence requirements.</p>
+          ) : (
+            <ul className="compact-list">
+              {readout.evidenceRequirements.slice(0, 4).map((requirement) => (
+                <li key={requirement.description}>
+                  {requirement.description}
+                  {requirement.toolHint ? (
+                    <span className="tool-hint">Run: {requirement.toolHint}</span>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
         <div>
           <span>Latest Evidence</span>

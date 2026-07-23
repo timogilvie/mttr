@@ -70,6 +70,49 @@ Significant degradation. User impact likely.
 CRITICAL:
 Service unavailable, no healthy tasks, sustained 5xx errors, or major confirmed customer impact.
 
+## **Signal Keys**
+
+Every incident and finding must carry a \`signal_key\`: a stable identifier for the **monitored
+signal**, not a description of this occurrence. The agent uses it to recognise that today's
+"Low Request Count in mlflow" and yesterday's "No requests on mlflow service" are the same
+ongoing condition rather than two separate incidents.
+
+Format: \`<service>:<signal-type>\`, lowercase, hyphen-separated, no spaces.
+
+Choose \`<signal-type>\` from this vocabulary whenever one applies:
+
+* \`alb-5xx\`, \`alb-4xx\`, \`alb-request-count\`, \`alb-target-response-time\`
+* \`ecs-task-count\`, \`ecs-cpu\`, \`ecs-memory\`, \`ecs-task-restarts\`
+* \`lambda-errors\`, \`lambda-invocations\`, \`lambda-throttles\`, \`lambda-duration\`
+* \`log-errors\`, \`log-warnings\`, \`log-exceptions\`
+* \`custom-metric:<namespace>-<metric-name>\`
+* \`metric-missing:<what-is-missing>\` — for absent datapoints or liveness gaps
+* \`other:<short-slug>\` — only when nothing above fits
+
+If the signal is a named CloudWatch alarm, use \`alarm:<exact-alarm-name>\` alone, with no service
+prefix. Alarm names are already unique.
+
+Rules:
+
+* The same underlying condition MUST produce the same signal_key in every report.
+* Never include magnitudes, counts, dates, or severity words. \`high\`, \`low\`, \`single\`, \`no\`,
+  \`zero\`, \`spike\` and similar words are forbidden inside a signal_key.
+* Two different signals on the same service get different keys
+  (\`mlflow:alb-request-count\` and \`mlflow:alb-4xx\` are distinct).
+* The same signal at different magnitudes gets ONE key
+  ("No requests", "Low traffic" and "Request count dropped" are all \`mlflow:alb-request-count\`).
+
+Examples:
+
+* "High 4xx rate in data-pipeline-api" → \`data-pipeline-api:alb-4xx\`
+* "Single 4xx Error in data-pipeline-api" → \`data-pipeline-api:alb-4xx\`
+* "Customer 5xx Errors Detected" (auth-service) → \`auth-service:alb-5xx\`
+* "Warnings in mlflow logs" → \`mlflow:log-warnings\`
+* "No detector liveness datapoints for deltaone-anomaly-detection" →
+  \`deltaone-anomaly-detection:metric-missing:detector-liveness\`
+* "Active alarm ... hokusai-deltaone-detector-errors-development" →
+  \`alarm:hokusai-deltaone-detector-errors-development\`
+
 ## **Classification Rules**
 
 * Prefer evidence over speculation.
@@ -96,6 +139,7 @@ Return valid JSON only. Do not include markdown.
 {
 "incident_id": "",
 "title": "",
+"signal_key": "",
 "classification": "",
 "severity": "LOW",
 "confidence": 0.0,
@@ -120,6 +164,7 @@ Return valid JSON only. Do not include markdown.
 "findings": [
 {
 "title": "",
+"signal_key": "",
 "classification": "",
 "severity": "LOW",
 "confidence": 0.0,

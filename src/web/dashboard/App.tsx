@@ -1,6 +1,11 @@
 import { useEffect, useState } from 'react';
 import type { ReactElement } from 'react';
-import type { IncidentDetailResponse, RunDetailResponse, StatusResponse } from './statusTypes.js';
+import type {
+  IncidentDetailResponse,
+  IncidentSummary,
+  RunDetailResponse,
+  StatusResponse,
+} from './statusTypes.js';
 import { formatAge, severityTotal, summarizeStatus } from './statusView.js';
 import { IncidentDetail } from './IncidentDetail.js';
 import { RunDetail } from './RunDetail.js';
@@ -20,6 +25,7 @@ const EMPTY_STATUS: StatusResponse = {
   stale: { worker: true, report: true },
   openIncidentCounts: {},
   openIncidents: [],
+  absentUnverifiedIncidents: [],
   recentTransitions: [],
 };
 
@@ -31,11 +37,30 @@ function display(value: string | null | undefined): string {
   return value && value.trim() !== '' ? value : 'none';
 }
 
+function IncidentRow({ incident }: { incident: IncidentSummary }): ReactElement {
+  return (
+    <li>
+      <div>
+        <strong>
+          <a href={`/incidents/${encodeURIComponent(incident.incidentId)}`}>{incident.title}</a>
+        </strong>
+        <small>
+          {display(incident.service)} · {incident.state} ·{' '}
+          {display(incident.currentNextStage)} · last activity{' '}
+          {formatAge(incident.lastActivityAt ?? incident.openedAt)}
+        </small>
+      </div>
+      <span className={severityClass(incident.severity)}>{incident.severity}</span>
+    </li>
+  );
+}
+
 export function Dashboard({ status }: { status: StatusResponse }): ReactElement {
   const summary = summarizeStatus(status);
   const latestTransition = status.recentTransitions[0] ?? null;
   const lastRunAge = formatAge(status.lastRun?.startedAt ?? null);
   const heartbeatAge = formatAge(status.workerHeartbeat?.lastSeenAt ?? null);
+  const absentUnverified = status.absentUnverifiedIncidents ?? [];
 
   return (
     <main className="shell">
@@ -90,20 +115,7 @@ export function Dashboard({ status }: { status: StatusResponse }): ReactElement 
           ) : (
             <ul className="incident-list">
               {status.openIncidents.map((incident) => (
-                <li key={incident.incidentId}>
-                  <div>
-                    <strong>
-                      <a href={`/incidents/${encodeURIComponent(incident.incidentId)}`}>
-                        {incident.title}
-                      </a>
-                    </strong>
-                    <small>
-                      {display(incident.service)} · {incident.state} ·{' '}
-                      {display(incident.currentNextStage)}
-                    </small>
-                  </div>
-                  <span className={severityClass(incident.severity)}>{incident.severity}</span>
-                </li>
+                <IncidentRow key={incident.incidentId} incident={incident} />
               ))}
             </ul>
           )}
@@ -136,6 +148,26 @@ export function Dashboard({ status }: { status: StatusResponse }): ReactElement 
             </ol>
           )}
         </section>
+      </section>
+
+      <section className="panel">
+        <div className="panel-title">
+          <h2>Absent — Not Verified</h2>
+          <span>{absentUnverified.length}</span>
+        </div>
+        <p className="panel-note">
+          These stopped appearing in the health report, but nothing confirmed they recovered.
+          They stay here until a Verify pass proves recovery or proves they were never incidents.
+        </p>
+        {absentUnverified.length === 0 ? (
+          <p className="empty">Nothing waiting on verification.</p>
+        ) : (
+          <ul className="incident-list">
+            {absentUnverified.map((incident) => (
+              <IncidentRow key={incident.incidentId} incident={incident} />
+            ))}
+          </ul>
+        )}
       </section>
 
       <section className="run-strip">

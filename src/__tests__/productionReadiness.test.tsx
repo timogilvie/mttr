@@ -140,7 +140,10 @@ function config(): Config {
     },
     healthReport: { s3Uri: 's3://ops/health-report.md' },
     aws: { region: 'us-east-1', maxAttempts: 1 },
-    monitoring: { intervalMs: 900000 },
+    monitoring: {
+    intervalMs: 900000,
+    sweep: { enabled: false, staleAfterMs: 21600000, maxIncidents: 3 },
+  },
     state: { backend: 'postgres', path: '.mttr-state.json' },
     database: { ssl: true, maxConnections: 2, idleTimeoutMs: 1000 },
     alerts: {

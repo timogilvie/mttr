@@ -24,6 +24,7 @@ import {
   transitionsFromDecision,
   transitionsFromVerification,
 } from './transitions.js';
+import { ABSENT_UNVERIFIED_STATE, TERMINAL_INCIDENT_STATES_SQL } from './incidentStates.js';
 
 type RunStatus = 'running' | 'success' | 'skipped' | 'error';
 export type TriggerSource = 'scheduled' | 'alarm';
@@ -65,6 +66,26 @@ export interface AlarmTriggerEnqueueResult {
   duplicate: boolean;
   enqueued: boolean;
   id?: string;
+}
+
+/**
+ * An open incident nothing has touched in a while. The scheduled loop only ran Classify when the
+ * health report content changed, so an incident whose report text is stable could sit untouched
+ * indefinitely; these rows are what the sweep re-verifies. `evidenceToPass` and `followUpActions`
+ * are carried over from the stored decision because Verify scrapes them for the alarm names and
+ * service checks it should re-run.
+ */
+export interface StaleIncidentRow {
+  incidentId: string;
+  title: string;
+  service: string | null;
+  severity: Severity;
+  state: string;
+  lastActivityAt: string | null;
+  currentDisposition: DecisionDisposition | null;
+  currentNextStage: DecisionNextStage | null;
+  evidenceToPass: string[];
+  followUpActions: string[];
 }
 
 export interface RecoveryIncidentCandidate {
@@ -145,6 +166,8 @@ export interface AgentStateRepository {
   ): Promise<IncidentTransition[]>;
   hasAlert?(dedupeKey: string): Promise<boolean>;
   recordAlertSent?(alert: AlertRecordInput): Promise<void>;
+  /** Open incidents with no activity for `olderThanMs`, oldest first (stale-incident sweep). */
+  findStaleIncidents?(olderThanMs: number, limit: number): Promise<StaleIncidentRow[]>;
   close?(): Promise<void>;
 
   // Alarm trigger queue (T5) — optional; only implemented for the Postgres backend.
@@ -238,6 +261,11 @@ export class FileAgentStateRepository implements AgentStateRepository {
     this.sentAlertKeys.add(alert.dedupeKey);
   }
 
+  async findStaleIncidents(_olderThanMs: number, _limit: number): Promise<StaleIncidentRow[]> {
+    // The file backend keeps no incident table, so there is nothing to sweep.
+    return [];
+  }
+
   async reclaimStaleClaimedTriggers(_olderThanMs: number): Promise<number> {
     return 0;
   }
@@ -321,26 +349,39 @@ interface IncidentSnapshotRow {
   closed_at: Date | string | null;
 }
 
+interface StaleIncidentQueryRow {
+  incident_id: string;
+  title: string;
+  service: string | null;
+  severity: Severity;
+  state: string;
+  current_disposition: DecisionDisposition | null;
+  current_next_stage: DecisionNextStage | null;
+  current_decision_json: unknown;
+  last_activity_at: Date | string | null;
+}
+
 function toIso(value: Date | string): string {
   return value instanceof Date ? value.toISOString() : value;
+}
+
+function decisionStringList(decision: unknown, key: string): string[] {
+  if (!decision || typeof decision !== 'object' || Array.isArray(decision)) {
+    return [];
+  }
+  const value = (decision as Record<string, unknown>)[key];
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is string => typeof item === 'string' && item.trim() !== '');
 }
 
 function primaryService(observation: ObservationState): string | null {
   return observation.affectedServices[0] ?? null;
 }
 
-function incidentStateFor(kind: 'new' | 'changed' | 'recurring' | 'resolved'): string {
-  if (kind === 'resolved') {
-    return 'resolved';
-  }
-  if (kind === 'changed') {
-    return 'changed';
-  }
-  return 'open';
-}
-
-function observedAt(observation: ObservationState): string {
-  return observation.resolvedAt ?? observation.lastChangedAt;
+function incidentStateFor(kind: 'new' | 'changed' | 'recurring'): string {
+  return kind === 'changed' ? 'changed' : 'open';
 }
 
 const REDACTED = '[REDACTED]';
@@ -738,8 +779,22 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
     ];
 
     for (const { kind, observation } of observations) {
-      const state = incidentStateFor(kind);
-      const closedAt = kind === 'resolved' ? observedAt(observation) : null;
+      if (kind === 'resolved') {
+        // The observation vanished from the report. That is absence, not recovery: park the
+        // incident in `absent_unverified` with closed_at still null so the stale-incident sweep
+        // picks it up and Verify decides whether it really recovered. Incidents a Decide/Verify
+        // outcome already closed are left alone rather than resurrected.
+        await this.client.query(
+          `UPDATE incidents
+           SET state = $2,
+               last_run_id = $3
+           WHERE incident_id = $1
+             AND state NOT IN (${TERMINAL_INCIDENT_STATES_SQL})`,
+          [observation.key, ABSENT_UNVERIFIED_STATE, runId]
+        );
+        continue;
+      }
+
       await this.client.query(
         `INSERT INTO incidents (
            incident_id, title, service, severity, state, opened_at, closed_at, last_run_id
@@ -757,9 +812,10 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
           observation.title,
           primaryService(observation),
           observation.severity,
-          state,
+          incidentStateFor(kind),
           observation.firstSeen,
-          closedAt,
+          // A present observation is by definition not closed; clear any prior closure.
+          null,
           runId,
         ]
       );
@@ -956,6 +1012,41 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
     );
   }
 
+  async findStaleIncidents(olderThanMs: number, limit: number): Promise<StaleIncidentRow[]> {
+    const result = await this.client.query<StaleIncidentQueryRow>(
+      `WITH activity AS (
+         SELECT incident_id, max(created_at) AS last_event_at
+         FROM incident_events
+         GROUP BY incident_id
+       )
+       SELECT i.incident_id, i.title, i.service, i.severity, i.state,
+              i.current_disposition, i.current_next_stage, i.current_decision_json,
+              GREATEST(i.opened_at, COALESCE(a.last_event_at, i.opened_at)) AS last_activity_at
+       FROM incidents i
+       LEFT JOIN activity a ON a.incident_id = i.incident_id
+       WHERE i.closed_at IS NULL
+         AND i.state NOT IN (${TERMINAL_INCIDENT_STATES_SQL})
+         AND GREATEST(i.opened_at, COALESCE(a.last_event_at, i.opened_at))
+             < now() - make_interval(secs => $1::double precision / 1000)
+       ORDER BY last_activity_at ASC, i.incident_id
+       LIMIT $2`,
+      [olderThanMs, limit]
+    );
+
+    return result.rows.map((row) => ({
+      incidentId: row.incident_id,
+      title: row.title,
+      service: row.service,
+      severity: row.severity,
+      state: row.state,
+      lastActivityAt: row.last_activity_at ? toIso(row.last_activity_at) : null,
+      currentDisposition: row.current_disposition,
+      currentNextStage: row.current_next_stage,
+      evidenceToPass: decisionStringList(row.current_decision_json, 'evidence_to_pass'),
+      followUpActions: decisionStringList(row.current_decision_json, 'follow_up_actions'),
+    }));
+  }
+
   async reclaimStaleClaimedTriggers(olderThanMs: number): Promise<number> {
     const result = await this.client.query(
       `UPDATE alarm_triggers
@@ -1112,7 +1203,7 @@ export class PostgresAgentStateRepository implements AgentStateRepository {
            AND at.status = 'done'
            AND at.run_id IS NOT NULL
            AND i.closed_at IS NULL
-           AND i.state NOT IN ('resolved', 'closed')
+           AND i.state NOT IN (${TERMINAL_INCIDENT_STATES_SQL})
            AND (
              ($1::text IS NOT NULL AND at.spec_key = $1)
              OR at.alarm_name = $2

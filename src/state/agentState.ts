@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { ClassificationResult, Finding, Incident, Severity } from '../types.js';
+import { deriveSignalKey } from './signalKey.js';
 
 type ObservationType = 'incident' | 'finding';
 type ObservationStatus = 'active' | 'resolved';
@@ -78,7 +79,24 @@ function normalizeServices(services: string[]): string[] {
   return [...services].map(normalizeText).sort();
 }
 
+/**
+ * Identity for an observation across reports.
+ *
+ * Prefers the signal key (`state/signalKey.ts`) — a name for the monitored signal rather than for
+ * this occurrence of it. That deliberately drops `type`, `title` and `classification` from the
+ * hash: the same condition must keep one identity when the model rewords the title, re-grades an
+ * incident as a finding, or picks a different taxonomy bucket.
+ *
+ * Falls back to the legacy title hash when neither an alarm nor a declared `signal_key` is
+ * available, so a Classify response that omits the field degrades to the previous behaviour
+ * instead of collapsing unrelated observations together.
+ */
 export function canonicalObservationKey(type: ObservationType, item: Incident | Finding): string {
+  const signalKey = deriveSignalKey(item);
+  if (signalKey) {
+    return stableHash({ version: 2, signalKey: signalKey.key });
+  }
+
   return stableHash({
     type,
     title: normalizeText(item.title),

@@ -39,6 +39,8 @@ export interface IncidentSummary {
   state: string;
   openedAt: string | null;
   closedAt: string | null;
+  /** Newest stage event for this incident; how an operator spots a stalled investigation. */
+  lastActivityAt?: string | null;
   currentDisposition: string | null;
   currentNextStage: string | null;
   lastRunId: string | null;
@@ -75,6 +77,12 @@ export interface StatusResponse {
   };
   openIncidentCounts: Partial<Record<Severity, number>>;
   openIncidents: IncidentSummary[];
+  /**
+   * Incidents whose signal stopped appearing in the health report without anything verifying
+   * recovery. Deliberately separate from `openIncidents`: they are not proven fixed, so they
+   * must not vanish, but they are also not evidence that something is currently broken.
+   */
+  absentUnverifiedIncidents?: IncidentSummary[];
   recentTransitions: TransitionEvent[];
 }
 

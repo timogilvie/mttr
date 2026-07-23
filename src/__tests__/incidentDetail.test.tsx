@@ -191,6 +191,69 @@ describe('incident detail', () => {
     expect(html).toContain('Check the downstream RPC/API credentials');
     expect(html).toContain('670 detector errors observed');
     expect(html).toContain('RPC block-number call');
+    // The evidence gap is shown once, with the tool call that would close it.
+    expect(html).toContain('Open Evidence Gaps');
+    expect(html).toContain('Run: Query detector Lambda logs for authorization errors');
+  });
+
+  it('surfaces the investigation root-cause hypotheses and their confidence', () => {
+    const html = renderToStaticMarkup(
+      <IncidentDetail
+        data={detail({
+          events: [
+            {
+              id: 'investigate-3',
+              incidentId: 'finding-abc123',
+              runId: 'run-7',
+              stage: 'Investigate',
+              message: 'POSSIBLE_INCIDENT: High detector errors',
+              severity: 'MEDIUM',
+              evidence: {
+                likely_causes: [
+                  {
+                    cause: 'Transient downstream auth failure on the detector RPC call path.',
+                    confidence: 0.86,
+                    evidence: ['659 repeated 403 errors'],
+                  },
+                ],
+              },
+              createdAt: new Date().toISOString(),
+            },
+          ],
+        })}
+      />
+    );
+
+    expect(html).toContain('Likely Causes');
+    expect(html).toContain('Transient downstream auth failure on the detector RPC call path.');
+    expect(html).toContain('confidence 0.86');
+  });
+
+  it('offers the markdown handoff brief and shows how stale the incident is', () => {
+    const html = renderToStaticMarkup(<IncidentDetail data={detail()} />);
+
+    expect(html).toContain('Copy handoff');
+    expect(html).toContain('href="/api/incidents/finding-abc123/brief"');
+    expect(html).toContain('Last activity');
+  });
+
+  it('describes an absent incident as unverified rather than resolved', () => {
+    const html = renderToStaticMarkup(
+      <IncidentDetail
+        data={detail({
+          incident: {
+            ...detail().incident,
+            state: 'absent_unverified',
+            closedAt: null,
+            currentDisposition: null,
+            currentNextStage: null,
+          },
+        })}
+      />
+    );
+
+    expect(html).toContain('Absent, not verified');
+    expect(html).toContain('Absence from a report is not evidence of a fix.');
   });
 
   it('renders an observability-gap timeline', () => {

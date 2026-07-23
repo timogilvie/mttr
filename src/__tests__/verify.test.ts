@@ -44,6 +44,7 @@ const config: Config = {
   },
   monitoring: {
     intervalMs: 1000,
+    sweep: { enabled: false, staleAfterMs: 21600000, maxIncidents: 3 },
   },
   state: {
     backend: 'file',

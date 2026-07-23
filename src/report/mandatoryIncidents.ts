@@ -10,6 +10,12 @@ import type {
 export interface MandatoryIncidentSpec {
   key: string;
   title: string;
+  /**
+   * Deterministic signal key for the incident this spec builds (see `state/signalKey.ts`). These
+   * are parsed from report structure rather than authored by the LLM, so they are the most stable
+   * identity available and take precedence over any `signal_key` Classify produced.
+   */
+  signalKey?: string;
   classification: IncidentClassification;
   severity: Severity;
   confidence: number;
@@ -82,6 +88,7 @@ function buildIncident(spec: MandatoryIncidentSpec, index: number): Incident {
   return {
     incident_id: `mandatory-${spec.key}-${index}`,
     title: spec.title,
+    ...(spec.signalKey ? { signal_key: spec.signalKey } : {}),
     classification: spec.classification,
     severity: spec.severity,
     confidence: spec.confidence,
@@ -248,13 +255,20 @@ function enrichIncidentWithSpec(incident: Incident, spec: MandatoryIncidentSpec)
     incident.signals.cloudwatch_metrics,
     spec.cloudwatchMetrics
   );
+  // The spec's signal key is parsed from report structure, so it overrides whatever Classify
+  // authored — that is what keeps an LLM-worded incident and its report-derived twin on one
+  // identity across runs.
+  const signalKey = spec.signalKey ?? incident.signal_key;
+  const metricsUnchanged = cloudwatchMetrics === incident.signals.cloudwatch_metrics;
+  const signalKeyUnchanged = signalKey === incident.signal_key;
 
-  if (cloudwatchMetrics === incident.signals.cloudwatch_metrics) {
+  if (metricsUnchanged && signalKeyUnchanged) {
     return incident;
   }
 
   return {
     ...incident,
+    ...(signalKey ? { signal_key: signalKey } : {}),
     signals: {
       ...incident.signals,
       cloudwatch_metrics: cloudwatchMetrics,
@@ -272,6 +286,7 @@ export function buildActiveAlarmSpec({
 
   return {
     key: `active-alarm-${alarmName.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`,
+    signalKey: `alarm:${alarmName}`,
     title: `Active alarm for ${service}: ${alarmName}`,
     classification: 'UNKNOWN',
     severity: taskHealthAlarm ? 'CRITICAL' : 'HIGH',
@@ -318,6 +333,7 @@ function extractUnavailableEcsServiceSpecs(report: string): MandatoryIncidentSpe
     return [
       {
         key: `ecs-service-unavailable-${affectedService.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`,
+        signalKey: `${affectedService}:ecs-task-count`,
         title: `ECS service unavailable for ${service}`,
         classification: 'UNKNOWN' as const,
         severity: 'CRITICAL' as const,
@@ -373,6 +389,7 @@ function extractAlb5xxSpecs(report: string): MandatoryIncidentSpec[] {
       const rate = requests && requests > 0 ? ` (${Math.round((fiveXx / requests) * 100)}% of ${requests} requests)` : '';
       specs.push({
         key: `alb-5xx-${service.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}-${target.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`,
+        signalKey: `${service}:alb-5xx`,
         title: `ALB 5xx responses for ${service}`,
         classification: 'APPLICATION_ERROR',
         severity: severityFor5xx(requests, fiveXx),
@@ -426,6 +443,7 @@ function extractMissingDetectorSpecs(report: string): MandatoryIncidentSpec[] {
     .filter(({ body }) => /No datapoints from the detector's liveness metric/i.test(body))
     .map(({ service }) => ({
       key: `missing-detector-liveness-${service.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`,
+      signalKey: `${service}:metric-missing:detector-liveness`,
       title: `No detector liveness datapoints for ${service}`,
       classification: 'OBSERVABILITY_FAILURE' as const,
       severity: 'HIGH' as const,

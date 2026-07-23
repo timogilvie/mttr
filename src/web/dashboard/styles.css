@@ -210,9 +210,78 @@ select {
   line-height: 1.45;
 }
 
+.readout-meta {
+  margin-top: 8px !important;
+  color: #617176 !important;
+  font-size: 12px !important;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.handoff {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.handoff button {
+  padding: 6px 12px;
+  border: 1px solid #b9c4c8;
+  border-radius: 4px;
+  background: #ffffff;
+  color: #172023;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.handoff button:hover {
+  border-color: #6d7c82;
+}
+
+.handoff a {
+  color: #617176;
+  font-size: 13px;
+}
+
+.cause-list {
+  margin: 0;
+  padding-left: 18px;
+  color: #455257;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.cause-list li + li {
+  margin-top: 6px;
+}
+
+.cause-list .confidence {
+  display: block;
+  color: #617176;
+  font-size: 12px;
+}
+
+.tool-hint {
+  display: block;
+  margin-top: 4px;
+  color: #617176;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  word-break: break-word;
+}
+
+.panel-note {
+  margin: 0 0 12px;
+  color: #617176;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 .readout-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
 }
 

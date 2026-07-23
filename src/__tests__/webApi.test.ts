@@ -55,7 +55,10 @@ const baseConfig: Config = {
   },
   healthReport: { s3Uri: 's3://test/report.md' },
   aws: { region: 'us-east-1', maxAttempts: 5 },
-  monitoring: { intervalMs: 900000 },
+  monitoring: {
+    intervalMs: 900000,
+    sweep: { enabled: false, staleAfterMs: 21600000, maxIncidents: 3 },
+  },
   state: { backend: 'postgres', path: '.mttr-state.json' },
   database: { ssl: false, maxConnections: 4, idleTimeoutMs: 30000 },
   alerts: {
@@ -258,9 +261,21 @@ class FakeApiDatabase implements DatabaseClient {
     if (normalized.includes('count(*)::text')) {
       return result<T>([{ severity: 'HIGH', count: '1' } as unknown as T]);
     }
-    if (normalized.includes('FROM incidents') && normalized.includes('WHERE incident_id = $1')) {
+    if (normalized.includes('FROM incidents') && normalized.includes('incident_id = $1')) {
       return result<T>(
         this.incidents.filter((row) => row.incident_id === params[0]) as unknown as T[]
+      );
+    }
+    if (normalized.includes('FROM incidents') && normalized.includes("state = 'absent_unverified'")) {
+      return result<T>(
+        this.incidents.filter((row) => row.state === 'absent_unverified') as unknown as T[]
+      );
+    }
+    if (normalized.includes('FROM incidents') && normalized.includes('state NOT IN')) {
+      return result<T>(
+        this.incidents.filter(
+          (row) => !['resolved', 'closed', 'absent_unverified'].includes(String(row.state))
+        ) as unknown as T[]
       );
     }
     if (normalized.includes('FROM incidents')) {
@@ -447,6 +462,60 @@ describe('web API', () => {
         },
       ],
     });
+  });
+
+  it('keeps absent-but-unverified incidents out of the open list and the severity roll-up', async () => {
+    const db = new FakeApiDatabase();
+    const [seeded] = db.incidents;
+    if (!seeded) {
+      throw new Error('Expected fake database to seed an incident');
+    }
+    db.incidents = [
+      seeded,
+      {
+        ...seeded,
+        incident_id: 'INC-ABSENT',
+        title: 'No requests on mlflow',
+        service: 'mlflow',
+        severity: 'CRITICAL',
+        state: 'absent_unverified',
+        closed_at: null,
+      },
+    ];
+    const { app } = appFor(baseConfig, db);
+
+    const response = await app.inject({ method: 'GET', url: '/api/status' });
+    const body = response.json();
+
+    expect(response.statusCode).toBe(200);
+    expect(body.openIncidents).toHaveLength(1);
+    expect(body.openIncidents[0]).toMatchObject({ incidentId: 'INC-001' });
+    // A CRITICAL incident that merely stopped being reported must not turn the board red.
+    expect(body.openIncidentCounts).not.toMatchObject({ CRITICAL: 1 });
+    expect(body.absentUnverifiedIncidents).toMatchObject([
+      { incidentId: 'INC-ABSENT', state: 'absent_unverified' },
+    ]);
+  });
+
+  it('returns a markdown handoff brief for an incident', async () => {
+    const { app } = appFor();
+
+    const response = await app.inject({ method: 'GET', url: '/api/incidents/INC-001/brief' });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toContain('text/markdown');
+    expect(response.body).toContain('# High 4xx');
+    expect(response.body).toContain('- **Incident ID**: `INC-001`');
+    expect(response.body).toContain('## Closure gate');
+  });
+
+  it('404s the handoff brief for an unknown incident', async () => {
+    const { app } = appFor();
+
+    const response = await app.inject({ method: 'GET', url: '/api/incidents/nope/brief' });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toMatchObject({ error: 'incident_not_found' });
   });
 
   it('returns run list with trigger provenance', async () => {

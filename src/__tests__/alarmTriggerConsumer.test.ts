@@ -48,7 +48,10 @@ function buildConfig(
     },
     healthReport: { s3Uri: 's3://test/report.md' },
     aws: { region: 'us-east-1', maxAttempts: 1 },
-    monitoring: { intervalMs: 900000 },
+    monitoring: {
+    intervalMs: 900000,
+    sweep: { enabled: false, staleAfterMs: 21600000, maxIncidents: 3 },
+  },
     state: { backend: 'postgres', path: '.test-state.json' },
     database: { ssl: false, maxConnections: 1, idleTimeoutMs: 1 },
     alerts: { slack: { channel: 'slack', timeoutMs: 1 } },

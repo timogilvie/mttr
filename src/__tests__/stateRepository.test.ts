@@ -264,6 +264,17 @@ class FakeStateDatabase implements DatabaseClient {
       return result<T>([]);
     }
 
+    // Absent-observation parking: UPDATE incidents SET state, last_run_id WHERE not terminal.
+    if (normalized.startsWith('UPDATE incidents') && normalized.includes('state NOT IN')) {
+      const id = String(params[0]);
+      const existing = this.incidents.get(id);
+      const currentState = existing?.['state'];
+      if (existing && currentState !== 'resolved' && currentState !== 'closed') {
+        this.incidents.set(id, { ...existing, state: params[1], last_run_id: params[2] });
+      }
+      return result<T>([]);
+    }
+
     if (normalized.startsWith('UPDATE incidents')) {
       const id = String(params[0]);
       const existing = this.incidents.get(id);
@@ -644,11 +655,43 @@ describe('Postgres state repository', () => {
 
     await repository.recordReconciliation(runId, resolved);
 
+    // Disappearing from the report is absence, not recovery: the incident is parked for
+    // verification rather than closed, and closed_at stays null.
     const resolvedIncident = db.incidents.get(String(incident?.['incident_id']));
     expect(resolvedIncident).toMatchObject({
-      state: 'resolved',
-      closed_at: '2026-06-08T10:15:00Z',
+      state: 'absent_unverified',
+      closed_at: null,
       last_run_id: runId,
+    });
+  });
+
+  it('leaves incidents a verification already closed alone when their observation goes absent', async () => {
+    const db = new FakeStateDatabase();
+    const repository = new PostgresAgentStateRepository(db, 's3://bucket/report.md');
+    const runId = await repository.startRun('2026-06-08T10:00:00Z');
+    const state = await repository.load();
+    const first = reconcileObservations(state, classification(), '2026-06-08T10:00:00Z');
+    await repository.recordReconciliation(runId, first);
+
+    const incidentId = String([...db.incidents.values()][0]?.['incident_id']);
+    db.incidents.set(incidentId, {
+      ...db.incidents.get(incidentId),
+      state: 'closed',
+      closed_at: '2026-06-08T10:05:00Z',
+    });
+
+    const clearState = await repository.load();
+    clearState.observations = state.observations;
+    const resolved = reconcileObservations(
+      clearState,
+      { summary: 'clear', overall_severity: 'NONE', incidents: [], findings: [] },
+      '2026-06-08T10:15:00Z'
+    );
+    await repository.recordReconciliation(runId, resolved);
+
+    expect(db.incidents.get(incidentId)).toMatchObject({
+      state: 'closed',
+      closed_at: '2026-06-08T10:05:00Z',
     });
   });
 

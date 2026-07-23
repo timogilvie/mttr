@@ -33,6 +33,7 @@ import {
   type IncidentEventInput,
   type AgentStateRepository,
   type RecoveryIncidentCandidate,
+  type StaleIncidentRow,
 } from './state/repository.js';
 import type { IncidentTransition } from './state/transitions.js';
 import {
@@ -740,10 +741,20 @@ export class Orchestrator {
           `[Orchestrator] Report unchanged (${reportFingerprint.slice(0, 12)}); ` +
             'skipping Classify and Investigate'
         );
-        await finishRun({
-          status: 'skipped',
-          summary: 'Report unchanged; skipped Classify and Investigate.',
-        });
+        // The report being unchanged says nothing about whether open incidents are still real,
+        // so spend the tick re-verifying the ones nothing has touched in a while.
+        const swept = await this.runStaleIncidentSweep(runId);
+        await finishRun(
+          swept > 0
+            ? {
+                status: 'success',
+                summary: `Report unchanged; re-verified ${swept} stale incident(s).`,
+              }
+            : {
+                status: 'skipped',
+                summary: 'Report unchanged; skipped Classify and Investigate.',
+              }
+        );
         return;
       }
 
@@ -801,6 +812,110 @@ export class Orchestrator {
     } finally {
       this.classifyInFlight = false;
     }
+  }
+
+  /**
+   * Re-verifies open incidents that nothing has touched for `monitoring.sweep.staleAfterMs`.
+   *
+   * Classify is gated on the health report's content hash, so on a stable report the pipeline used
+   * to do nothing at all — an incident could stay open for weeks with its last event being an
+   * inconclusive Verify. This runs the same Verify stage against a decision synthesized from each
+   * incident's stored decision, which is what actually produces the closure evidence
+   * (VERIFIED_RECOVERED_TRANSIENT / VERIFIED_NON_INCIDENT) or proves the incident is still live.
+   *
+   * Bounded by `maxIncidents` per tick; because a swept incident records a fresh event, its
+   * staleness clock resets and it will not be swept again until the threshold elapses.
+   *
+   * @returns how many incidents were verified.
+   */
+  private async runStaleIncidentSweep(runId: string | undefined): Promise<number> {
+    const sweep = this.config.monitoring.sweep;
+    if (!sweep.enabled || !this.stateRepository.findStaleIncidents) {
+      return 0;
+    }
+
+    let stale: StaleIncidentRow[];
+    try {
+      stale = await this.stateRepository.findStaleIncidents(
+        sweep.staleAfterMs,
+        sweep.maxIncidents
+      );
+    } catch (error) {
+      console.error('[Orchestrator] Stale incident lookup failed:', error);
+      return 0;
+    }
+
+    if (stale.length === 0) {
+      return 0;
+    }
+
+    console.log(
+      `[Orchestrator] Sweeping ${stale.length} stale incident(s): ` +
+        stale.map((row) => `${row.incidentId} (${row.state})`).join(', ')
+    );
+
+    const decision = this.sweepDecision(stale);
+    try {
+      const result = await verifyStage.run(
+        { stage: 'Verify', timestamp: new Date().toISOString() },
+        this.config,
+        decision
+      );
+      if (result.status !== 'success' || !result.data) {
+        console.error('[Orchestrator] Stale incident sweep verify failed:', result.error);
+        return 0;
+      }
+
+      const verification = result.data as VerificationResult;
+      await this.stateRepository.recordStageOutput?.(runId, {
+        stage: 'Verify',
+        data: verification,
+      });
+      const transitions =
+        (await this.stateRepository.recordVerificationTransitions?.(runId, verification)) ?? [];
+      await this.sendTransitionAlerts(runId, transitions);
+      await this.stateRepository.recordIncidentEvents?.(
+        runId,
+        this.verificationEvents(verification)
+      );
+      console.log(
+        `[Orchestrator] Stale incident sweep completed with ${verification.overall_status}`
+      );
+      return verification.verifications.length;
+    } catch (error) {
+      console.error('[Orchestrator] Stale incident sweep failed:', error);
+      return 0;
+    }
+  }
+
+  /**
+   * Synthesizes the `DecisionResult` the Verify stage consumes from stored incident rows. The
+   * stored decision's `evidence_to_pass` / `follow_up_actions` are carried over verbatim because
+   * Verify scrapes them (see `extractAlarmNames`) to decide which alarms and services to check —
+   * dropping them would leave the sweep with nothing concrete to verify.
+   */
+  private sweepDecision(stale: StaleIncidentRow[]): DecisionResult {
+    return {
+      summary: `Scheduled re-verification of ${stale.length} stale incident(s).`,
+      overall_next_stage: 'Verify',
+      handoff_notes: [
+        'Health report content was unchanged; these incidents were re-verified because nothing ' +
+          'had advanced them within the staleness threshold.',
+      ],
+      decisions: stale.map((row) => ({
+        incident_id: row.incidentId,
+        title: row.title,
+        disposition: 'VERIFY' as const,
+        next_stage: 'Verify' as const,
+        severity: row.severity,
+        affected_services: row.service ? [row.service] : [],
+        rationale:
+          `Stale ${row.state} incident with no activity since ${row.lastActivityAt ?? 'unknown'}; ` +
+          're-checking current health signals before it is left open or closed.',
+        evidence_to_pass: row.evidenceToPass,
+        follow_up_actions: row.followUpActions,
+      })),
+    };
   }
 
   private logObservationReconciliation(reconciliation: ObservationReconciliation): void {
