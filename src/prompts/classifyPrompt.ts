@@ -92,6 +92,11 @@ Choose \`<signal-type>\` from this vocabulary whenever one applies:
 If the signal is a named CloudWatch alarm, use \`alarm:<exact-alarm-name>\` alone, with no service
 prefix. Alarm names are already unique.
 
+For an incident **or a finding** tied to a named CloudWatch alarm or a specific CloudWatch metric,
+also include that identity in \`signals\`. This is required even if the report attributes the same
+shared signal to multiple services: use the exact same alarm name or metric namespace/name/dimensions
+for every related item. Do not infer an alarm or metric identity that the report does not state.
+
 Rules:
 
 * The same underlying condition MUST produce the same signal_key in every report.
@@ -170,6 +175,11 @@ Return valid JSON only. Do not include markdown.
 "confidence": 0.0,
 "affected_services": [],
 "evidence": [],
+"signals": {
+"alarms": [],
+"metrics": [],
+"logs": []
+},
 "reason_not_incident": ""
 }
 ]

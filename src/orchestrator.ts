@@ -28,6 +28,7 @@ import {
   type AgentState,
   type ObservationReconciliation,
 } from './state/agentState.js';
+import { collapseExactCloudWatchDuplicates } from './state/correlation.js';
 import {
   createAgentStateRepository,
   type AlarmTriggerRow,
@@ -480,7 +481,9 @@ export class Orchestrator {
     reconciliation: ObservationReconciliation;
     actionable: boolean;
   }> {
-    const classification = canonicalizeClassificationIncidents(classificationInput);
+    const classification = canonicalizeClassificationIncidents(
+      collapseExactCloudWatchDuplicates(classificationInput)
+    );
     // Only the complete-report path may pass `partial: false` (default). Partial classifications
     // (e.g. the alarm-triggered batch, which only synthesizes incidents for the alarms in flight)
     // must NOT auto-resolve unrelated active observations that happen to be absent from this

@@ -101,6 +101,12 @@ report-derived incidents get a deterministic one that overrides it. This is what
 condition from re-entering as a new incident every time the model rewords its title. When no
 signal key is available the agent falls back to the previous title-based hash.
 
+Before Investigate, the agent also collapses items that carry the same exact CloudWatch alarm name
+or the same fully-qualified CloudWatch metric (namespace, metric name, and dimensions). This shares
+one investigation across a known shared signal even when the health report attributes it to several
+services. It never groups by similar titles, service names, or model-authored duplicate semantics;
+those remain candidate correlations for operator review.
+
 **Lifecycle.** An observation disappearing from the health report moves its incident to
 `absent_unverified`, not `resolved`: the report generator going quiet is not evidence that
 anything was fixed. Those incidents are listed separately on the dashboard and stay eligible for

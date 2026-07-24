@@ -1503,7 +1503,7 @@ async function gatherStandardEvidence(
     const shouldQuery5xx = needs5xxDrilldown(item.classification, text);
     const shouldQueryWarnings = needsWarningDrilldown(text);
     const shouldQueryObservability = needsObservabilityDrilldown(item.classification, text);
-    const cloudwatchMetrics = 'signals' in item ? item.signals.cloudwatch_metrics ?? [] : [];
+    const cloudwatchMetrics = item.signals?.cloudwatch_metrics ?? [];
     const knownMetricKeys = new Set(cloudwatchMetrics.map(metricKey));
 
     const errorMetricEvidence: string[] = [];
