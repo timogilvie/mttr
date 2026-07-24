@@ -119,6 +119,12 @@ export interface Finding {
   confidence: number;
   affected_services: string[];
   evidence: string[];
+  /**
+   * Optional concrete CloudWatch identity for a finding. Findings historically did not carry
+   * signals, but an exact alarm or metric identity lets the pipeline safely correlate a finding
+   * with an incident without relying on title similarity or an LLM judgement.
+   */
+  signals?: IncidentSignals | undefined;
   semantics?: IncidentSemantics | undefined;
   reason_not_incident: string;
 }

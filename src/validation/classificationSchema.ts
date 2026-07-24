@@ -119,6 +119,7 @@ const FindingSchema = z.object({
   confidence: z.number().min(0).max(1),
   affected_services: z.array(z.string()),
   evidence: z.array(z.string()),
+  signals: IncidentSignalsSchema.optional(),
   semantics: IncidentSemanticsSchema.optional(),
   reason_not_incident: z.string(),
 });
